@@ -1,0 +1,8 @@
+# Project runtime dependencies (minimal)
+# Generated/updated to include packages used by data ingestion and graph creation
+pandas>=2.0
+networkx>=3.0
+matplotlib>=3.5
+scipy>=1.10
+numpy>=1.24
+pyarrow>=14.0  # Para soporte de parquet (formato eficiente para DataFrames)

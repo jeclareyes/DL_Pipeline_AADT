@@ -1,0 +1,39 @@
+
+"""
+Explanation:
+
+multiday: true indicates that the case involves multiple days or hours, requiring special handling of OD matrices.
+od_format: sparse specifies that the OD matrices are stored in a sparse format, which is efficient for large datasets with many zero entries.
+source: interim indicates that the data source is an intermediate processed format, as opposed to raw or external data.
+case: specifies the particular case being configured.
+save_graph and save_image set to false indicate that the graph and image representations of the network should not be saved during processing.
+
+"""
+
+
+# Linköping Case
+case: Linköping
+source: interim  # or 'external' / 'raw'
+save_graph: false
+save_image: false
+od_format: sparse
+multiday: true
+---
+
+"""
+# SiouxFalls Case
+case: SiouxFalls
+source: raw  # or 'external' / 'raw'
+save_graph: false
+save_image: false
+od_format: sparse
+multiday: false
+---
+"""
+# Example Multiday Case
+# case: CityName
+# source: raw
+# save_graph: false
+# save_image: false
+# od_format: sparse
+# multiday: true  # Set to true for cases with multi-day/hourly OD matrices
