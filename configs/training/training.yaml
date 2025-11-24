@@ -11,4 +11,8 @@ input_routes:
   od_matrix: ${data.root}/${dataset}/${dataset}_od_matrix.npz
   link_df : ${data.root}/${dataset}/${dataset}_link_data.parquet
 
-
+# Hiperparámetros de entrenamiento para training_pipeline.py
+epochs: 100
+batch_size: 1
+lr: 0.001 # Nota: en tu código usas cfg.training.lr, asegúrate que la clave coincida
+# Si usas weight_decay u otros en el código, agrégalos aquí también.

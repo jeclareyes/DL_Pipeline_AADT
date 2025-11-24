@@ -15,16 +15,16 @@ from data_ingestion.data_processing import DataManager, _read_yaml_defaults
 from data_ingestion.data_loader import DataLoader
 from data_ingestion.data_saver import DataSaver
 
-# Read YAML defaults from configs/linkoping.yaml if present
+# Read YAML defaults from configs/Linköping.yaml if present
 script_dir = Path(__file__).resolve().parent
-yaml_file = script_dir.parents[1] / 'configs' / 'linkoping.yaml'
+yaml_file = script_dir.parents[1] / 'configs' / 'Linköping.yaml'
 yaml_defaults = _read_yaml_defaults(yaml_file) if yaml_file.exists() else {}
 
 
 def run_pipeline(case: str, source: str, multiday: bool, save_graph_pickle: bool, save_graph_image: bool):
     # This function does not provide default parameter values; all defaults
     # must be provided by the caller (typically resolved from YAML). The
-    # pipeline always prefers values from `configs/linkoping.yaml` when the
+    # pipeline always prefers values from `configs/Linköping.yaml` when the
     # caller passes None for an argument.
     # Resolve parameters against YAML defaults here to ensure a single place
     # decides final values.
@@ -38,7 +38,7 @@ def run_pipeline(case: str, source: str, multiday: bool, save_graph_pickle: bool
 
     # After resolving, case must be defined
     if case is None:
-        raise ValueError('A `case` must be provided either via arguments or configs/linkoping.yaml')
+        raise ValueError('A `case` must be provided either via arguments or configs/Linköping.yaml')
 
     print(f"Running pipeline for case={case} source={source} multiday={multiday}")
     data_root = None

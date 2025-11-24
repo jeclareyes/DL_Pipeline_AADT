@@ -1,5 +1,29 @@
-# File: `configs/model/Cyclic_Model.yaml`
-# Configuration for CyclicODModel (fields correspond to cyclic_model.py constructor)
-hidden_dim: 256
-feature_dim: 64
-num_structures: 8
+# configs/model/Cyclic_Model.yaml
+
+# 1. Apunta a tu clase existente
+_target_: src.components.models.Cyclic_Model.cyclic_model.CyclicODModel
+
+# 2. Hiperparámetros (Ya los tienes, Hydra los pasa automáticamente)
+hidden_dim: 64
+feature_dim: 32
+dropout: 0.1
+cost_function_type: 'bpr'
+
+# 3. Datos Dinámicos (Indica que son obligatorios pero se pasan desde Python)
+num_links: ???
+num_od_pairs: ???
+t0: ???
+capacity: ???
+route_masks: ???
+od_pair_indices: ???
+num_link_groups: ???
+link_group: ???
+
+# Pesos de Loss (Para usarlos en el pipeline)
+loss_weights:
+  w_flow: 1.0
+  w_od: 1.0
+  w_reg: 0.01
+
+# Aquí inyectamos la configuración de VDF seleccionada (bpr, conical, etc.)
+vdf_config: ${vdf}

@@ -28,13 +28,13 @@ import json
 
 AVAILABLE_MODELS = {
     'cyclic_model': {
-        'script': 'src/models/Cyclic_Model/train_cyclic_model.py',
+        'script': 'src/models/Cyclic_Model/train_cyclic_model_deprecated.py',
         'module': 'models.Cyclic_Model.train_cyclic_model',
         'description': 'Modelo original de asignación cíclica',
         'class': 'CyclicODModel'
     },
     'cyclic_model_ultra': {
-        'script': 'src/models/Cyclic_Model/train_cyclic_model.py',
+        'script': 'src/models/Cyclic_Model/train_cyclic_model_deprecated.py',
         'module': 'models.Cyclic_Model.train_cyclic_model',
         'description': 'Modelo mejorado con arquitectura avanzada',
         'class': 'CyclicODModelUltra'
@@ -385,20 +385,20 @@ if __name__ == '__main__':
         epilog="""
 Ejemplos:
   # Entrenar con configuración de Linköping (modelo especificado en YAML)
-  python src/train/run_training.py --config configs/linkoping.yaml
+  python src/train/run_training.py --config configs/Linköping.yaml
 
   # Entrenar con un modelo específico
-  python src/train/run_training.py --config configs/linkoping.yaml --model cyclic_model_ultra
+  python src/train/run_training.py --config configs/Linköping.yaml --model cyclic_model_ultra
 
   # Test rápido con 10 épocas
-  python src/train/run_training.py --config configs/linkoping.yaml --epochs 10
+  python src/train/run_training.py --config configs/Linköping.yaml --epochs 10
 
   # Listar modelos disponibles
   python src/train/run_training.py --list-models
         """
     )
 
-    parser.add_argument('--config', type=str, default='configs/linkoping.yaml',
+    parser.add_argument('--config', type=str, default='configs/Linköping.yaml',
                        help='Ruta al archivo de configuración YAML')
     parser.add_argument('--model', type=str, default=None,
                        help='Tipo de modelo a entrenar (sobrescribe YAML)')
@@ -429,5 +429,5 @@ Ejemplos:
     sys.exit(exitcode)
 
 """
-python src/train/run_training.py --config configs/linkoping.yaml --model cyclic_model_ultra --epochs 100
+python src/train/run_training.py --config configs/Linköping.yaml --model cyclic_model_ultra --epochs 100
 """

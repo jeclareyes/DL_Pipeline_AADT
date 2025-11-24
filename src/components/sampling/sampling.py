@@ -378,7 +378,7 @@ def create_partial_data_masks(
 # =============================================================================
 
 def main():
-    """Ejecuta el muestreo de datos parciales usando configuración de linkoping.yaml."""
+    """Ejecuta el muestreo de datos parciales usando configuración de Linköping.yaml."""
 
     # Configurar logging
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -388,7 +388,7 @@ def main():
     project_root = Path(__file__).resolve().parent.parent
 
     # Cargar configuración
-    config_path = Path('C:/Users/jecla/Documents/Barcelona_GNN/configs/linkoping.yaml')
+    config_path = Path('C:/Users/jecla/Documents/Barcelona_GNN/configs/Linköping.yaml')
     if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
 

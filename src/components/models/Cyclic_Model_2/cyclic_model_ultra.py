@@ -512,9 +512,9 @@ class UltraCyclicODModel(nn.Module):
 
 
 # -----------------------------------------------------------------------------
-# Compatibilidad con `train_cyclic_model.py`
+# Compatibilidad con `train_cyclic_model_deprecated.py`
 # -----------------------------------------------------------------------------
-# `train_cyclic_model.py` espera poder hacer:
+# `train_cyclic_model_deprecated.py` espera poder hacer:
 # from src.models.Cyclic_Model.cyclic_model_ultra import CyclicODModelUltra, PartialDataLoss
 # y luego instanciar `CyclicODModelUltra(..., cost_function_type=..., dropout=...)`
 # y usar `PartialDataLoss(w_flow=..., w_od=..., w_reg=...)`.
@@ -593,7 +593,7 @@ class PartialDataLoss(nn.Module):
 class CyclicODModelUltra(UltraCyclicODModel):
     """
     Envoltorio de compatibilidad que acepta el argumento `cost_function_type`
-    (que es pasado desde `train_cyclic_model.py`) pero lo ignora o lo almacena
+    (que es pasado desde `train_cyclic_model_deprecated.py`) pero lo ignora o lo almacena
     para posibles usos futuros. Mantiene la misma firma que `CyclicODModel`.
     """
 

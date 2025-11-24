@@ -1,34 +1,30 @@
 """
 Modelo Deep Learning para Traffic Assignment con Datos Parciales.
+(Versión Modularizada con Hydra)
 
 Este modelo extiende la arquitectura cyclic para trabajar con:
 - Demandas OD parcialmente conocidas
 - Flujos de enlaces parcialmente observados
 
-El modelo aprende a:
-1. Completar demandas OD faltantes
-2. Estimar flujos en enlaces no observados
-3. Respetar restricciones de equilibrio de tráfico
-
 Arquitectura:
 - ODEncoder: Codifica flujos observados a espacio latente
 - GraphMatcher: Alinea espacio latente con estructura de red
 - ODDecoder: Decodifica a demandas OD completas
-- AssignmentValidator: Valida equilibrio mediante SUE con función de costo
+- AssignmentValidator: Valida equilibrio mediante SUE con función de costo inyectada dinámicamente
 
-Funciones de costo soportadas:
-- BPR (Bureau of Public Roads)
-- Cónica (futuro)
-- Akçelik (futuro)
+Funciones de costo:
+- Se definen en src/components/vdf/ y se inyectan vía configuración.
 """
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Optional
+import hydra
+from omegaconf import DictConfig
+from typing import Dict, Optional, Any
 
 
 # =============================================================================
-# COMPONENTES DEL MODELO
+# COMPONENTES DE RED NEURONAL (Encoder/Decoder/Matcher)
 # =============================================================================
 
 class ODEncoder(nn.Module):
@@ -49,12 +45,6 @@ class ODEncoder(nn.Module):
         )
 
     def forward(self, flows: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            flows: [batch_size, num_links] o [num_links]
-        Returns:
-            Embedding latente [batch_size, feature_dim] o [feature_dim]
-        """
         return self.network(flows)
 
 
@@ -76,12 +66,6 @@ class ODDecoder(nn.Module):
         )
 
     def forward(self, g_x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            g_x: [batch_size, feature_dim] o [feature_dim]
-        Returns:
-            Demandas OD [batch_size, num_od_pairs] o [num_od_pairs]
-        """
         return self.network(g_x)
 
 
@@ -143,13 +127,6 @@ class GraphMatcher(nn.Module):
         self.update_count += 1
 
     def forward(self, h_x: torch.Tensor, h_y: torch.Tensor = None) -> torch.Tensor:
-        """
-        Args:
-            h_x: Embedding de entrada [batch_size, feature_dim]
-            h_y: Embedding de referencia (opcional, solo training) [batch_size, feature_dim]
-        Returns:
-            Embedding transformado [batch_size, feature_dim]
-        """
         # Actualizar matrices solo en entrenamiento con referencia
         if self.training and h_y is not None:
             with torch.no_grad():
@@ -165,185 +142,46 @@ class GraphMatcher(nn.Module):
 
 
 # =============================================================================
-# FUNCIONES DE COSTO (Modular)
-# =============================================================================
-
-class CostFunction(nn.Module):
-    """Clase base para funciones de costo."""
-
-    def forward(self, link_flows: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            link_flows: [batch_size, num_links]
-        Returns:
-            Costos: [batch_size, num_links]
-        """
-        raise NotImplementedError
-
-
-class BPRCostFunction(nn.Module):
-    """
-    Función de costo BPR (Bureau of Public Roads).
-
-    BPR: t(x) = t0 * [1 + alpha * (x/c)^beta]
-    """
-
-    def __init__(self, t0: torch.Tensor, capacity: torch.Tensor,
-                 num_link_groups: int, link_group: torch.Tensor,
-                 learnable_params: bool = True):
-        """
-        Args:
-            t0: Tiempos de flujo libre [num_links]
-            capacity: Capacidades de enlaces [num_links]
-            num_link_groups: Número de grupos de enlaces
-            link_group: Asignación de enlaces a grupos [num_links]
-            learnable_params: Si True, alpha y beta son aprendibles
-        """
-        super().__init__()
-        self.register_buffer('t0', t0)
-        self.register_buffer('capacity', capacity)
-        self.register_buffer('link_group', link_group.to(torch.long))
-        self.learnable_params = learnable_params
-
-        if learnable_params:
-            # Parámetros aprendibles por grupo
-            self.alpha_raw = nn.Parameter(torch.full((num_link_groups,), 0.15))
-            self.beta_raw = nn.Parameter(torch.full((num_link_groups,), 4.0))
-        else:
-            # Parámetros fijos
-            self.register_buffer('alpha_raw', torch.full((num_link_groups,), 0.15))
-            self.register_buffer('beta_raw', torch.full((num_link_groups,), 4.0))
-
-    def get_alpha(self) -> torch.Tensor:
-        """Obtiene valores de alpha con restricciones."""
-        if self.learnable_params:
-            return torch.clamp(F.softplus(self.alpha_raw), min=0.01, max=2.0)
-        else:
-            return self.alpha_raw
-
-    def get_beta(self) -> torch.Tensor:
-        """Obtiene valores de beta con restricciones."""
-        if self.learnable_params:
-            return torch.clamp(1.0 + F.softplus(self.beta_raw), min=1.1, max=10.0)
-        else:
-            return self.beta_raw
-
-    def forward(self, link_flows: torch.Tensor) -> torch.Tensor:
-        """
-        Calcula costos BPR.
-
-        Args:
-            link_flows: [batch_size, num_links] o [num_links]
-        Returns:
-            Costos: [batch_size, num_links] o [num_links]
-        """
-        alpha = self.get_alpha()
-        beta = self.get_beta()
-
-        alpha_links = alpha[self.link_group]
-        beta_links = beta[self.link_group]
-
-        # Evitar divisiones por cero y valores extremos
-        flow_ratio = torch.clamp(link_flows / (self.capacity + 1e-9), max=5.0)
-        bpr_cost = self.t0 * (1 + alpha_links * flow_ratio ** beta_links)
-
-        return bpr_cost
-
-
-class ConicCostFunction(CostFunction):
-    """
-    Función de costo Cónica (para implementación futura).
-
-    Placeholder para función de costo más realista que BPR.
-    """
-
-    def __init__(self, *args, **kwargs):
-        super().__init__()
-        raise NotImplementedError("Conic cost function pendiente de implementación")
-
-
-class AkcelikCostFunction(CostFunction):
-    """
-    Función de costo Akçelik (para implementación futura).
-
-    Placeholder para función de costo con capacidad limitada.
-    """
-
-    def __init__(self, *args, **kwargs):
-        super().__init__()
-        raise NotImplementedError("Akçelik cost function pendiente de implementación")
-
-
-def get_cost_function(cost_type: str, **kwargs) -> CostFunction:
-    """
-    Factory para crear funciones de costo.
-
-    Args:
-        cost_type: 'bpr', 'conic', 'akcelik'
-        **kwargs: Argumentos para la función de costo
-
-    Returns:
-        Instancia de CostFunction
-    """
-    cost_functions = {
-        'bpr': BPRCostFunction,
-        'conic': ConicCostFunction,
-        'akcelik': AkcelikCostFunction
-    }
-
-    if cost_type.lower() not in cost_functions:
-        raise ValueError(f"Unknown cost function: {cost_type}. "
-                        f"Available: {list(cost_functions.keys())}")
-
-    return cost_functions[cost_type.lower()](**kwargs)
-
-
-# =============================================================================
-# ASSIGNMENT VALIDATOR
+# ASSIGNMENT VALIDATOR (Con Inyección de VDF)
 # =============================================================================
 
 class AssignmentValidator(nn.Module):
     """
     Valida asignación mediante Stochastic User Equilibrium (SUE).
+    La función de costo se inyecta dinámicamente vía Hydra.
     """
 
     def __init__(self, num_links: int, t0: torch.Tensor, capacity: torch.Tensor,
                  route_masks: torch.Tensor, od_pair_indices: torch.Tensor,
                  num_od_pairs: int, num_link_groups: int, link_group: torch.Tensor,
-                 cost_function_type: str = 'bpr',
+                 vdf_config: DictConfig,  # <-- CAMBIO: Recibe config, no string
                  max_iters: int = 10, convergence_threshold: float = 1e-4):
         """
         Args:
-            num_links: Número de enlaces
-            t0: Tiempos de flujo libre [num_links]
-            capacity: Capacidades [num_links]
-            route_masks: Máscaras de rutas [num_od, num_routes, num_links]
-            od_pair_indices: Índices de pares OD por ruta [num_routes]
-            num_od_pairs: Número de pares OD
-            num_link_groups: Número de grupos de enlaces
-            link_group: Asignación de enlaces a grupos [num_links]
-            cost_function_type: Tipo de función de costo ('bpr', 'conic', 'akcelik')
-            max_iters: Iteraciones máximas de SUE
-            convergence_threshold: Umbral de convergencia
+            vdf_config: Configuración de Hydra para instanciar la VDF.
         """
         super().__init__()
         self.max_iters = max_iters
         self.convergence_threshold = convergence_threshold
         self.register_buffer('t0', t0)
 
-        # Crear función de costo (modular)
-        self.cost_function = get_cost_function(
-            cost_function_type,
+        # ---------------------------------------------------------------------
+        # INSTANCIACIÓN DINÁMICA DE LA VDF
+        # ---------------------------------------------------------------------
+        # Hydra mira el _target_ en vdf_config e instancia la clase correspondiente
+        # pasándole los argumentos que requiere (t0, capacity, etc.)
+        self.cost_function = hydra.utils.instantiate(
+            vdf_config,
             t0=t0,
             capacity=capacity,
             num_link_groups=num_link_groups,
             link_group=link_group,
-            learnable_params=True
+            _recursive_=False  # Importante para pasar tensores
         )
 
         # Capa de asignación estocástica
         self.assignment_layer = StochasticAssignmentLayer(
-            route_masks=route_masks,  # Asegúrate que este sea [OD, K, L]
+            route_masks=route_masks,
             mu=1.0
         )
 
@@ -352,16 +190,8 @@ class AssignmentValidator(nn.Module):
     def forward(self, estimated_demands: torch.Tensor, warmup: bool = False) -> tuple:
         """
         Ejecuta SUE iterativo.
-
-        Args:
-            estimated_demands: [batch_size, num_od_pairs] o [num_od_pairs]
-            warmup: Si True, solo una iteración (flujo libre)
-
-        Returns:
-            (flows, alpha, beta, convergence_info)
         """
         batch_size = estimated_demands.shape[0] if estimated_demands.dim() == 2 else 1
-        device = estimated_demands.device
 
         if estimated_demands.dim() == 1:
             estimated_demands = estimated_demands.unsqueeze(0)
@@ -406,13 +236,16 @@ class AssignmentValidator(nn.Module):
             convergence_info = {"converged": converged, "iterations": actual_iters}
             self.last_convergence_iter.data = torch.tensor(float(actual_iters))
 
-        # Obtener parámetros aprendidos de la función de costo
-        if isinstance(self.cost_function, BPRCostFunction):
+        # Obtener parámetros aprendidos de la función de costo (si existen)
+        # Usamos Duck Typing: si tiene el método get_alpha, lo llamamos.
+        learned_alpha = None
+        learned_beta = None
+
+        if hasattr(self.cost_function, 'get_alpha'):
             learned_alpha = self.cost_function.get_alpha()
+
+        if hasattr(self.cost_function, 'get_beta'):
             learned_beta = self.cost_function.get_beta()
-        else:
-            learned_alpha = None
-            learned_beta = None
 
         return reconstructed_flows, learned_alpha, learned_beta, convergence_info
 
@@ -420,81 +253,35 @@ class AssignmentValidator(nn.Module):
 class StochasticAssignmentLayer(nn.Module):
     """
     Capa de Asignación Estocástica Vectorizada (3D).
-
-    Maneja las dimensiones: [Batch, OD_Pairs, Rutas_K, Links]
-    sin necesidad de aplanar índices.
     """
 
     def __init__(self, route_masks: torch.Tensor, mu: float = 1.0):
-        """
-        Args:
-            route_masks: Tensor de forma [num_od, num_routes (K), num_links].
-                         (1 si la ruta pasa por el link, 0 si no).
-            mu: Parámetro inicial de dispersión (logit).
-        """
         super().__init__()
-        # Registramos como buffer para que sea parte del estado pero no se entrene (fijo)
         self.register_buffer('route_masks', route_masks.float())
-
-        # Parámetro mu aprendible
         self.mu_raw = nn.Parameter(torch.tensor(float(mu)))
 
     @property
     def mu(self):
-        """Garantiza que mu sea positivo y esté en un rango razonable."""
         return torch.clamp(F.softplus(self.mu_raw), min=0.1, max=10.0)
 
     def forward(self, link_costs: torch.Tensor, demands: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            link_costs: [batch_size, num_links]
-            demands:    [batch_size, num_od_pairs]
-
-        Returns:
-            link_flows: [batch_size, num_links]
-        """
-        # Dimensiones para referencia en comentarios:
-        # b: batch_size
-        # o: num_od_pairs
-        # k: num_routes (K rutas por par OD)
-        # l: num_links
-
-        # 1. Calcular Costo de cada Ruta (Vectorizado)
-        # Multiplicamos los costos de los links por la máscara de rutas.
-        # Operación: Sumar costo de links 'l' para cada ruta 'k' del par 'o'.
-        # Entrada: link_costs [b, l], route_masks [o, k, l]
-        # Salida:  route_costs [b, o, k]
+        # 1. Costo de Ruta
         route_costs = torch.einsum('bl,okl->bok', link_costs, self.route_masks)
 
-        # 2. Estabilización Numérica
-        # Restamos el mínimo costo dentro de las K opciones de cada par OD
-        # para evitar explosión exponencial en el siguiente paso.
-        # keepdim=True mantiene la dimensión k como 1 para broadcasting
+        # 2. Estabilización
         min_costs, _ = torch.min(route_costs, dim=2, keepdim=True)
         stable_costs = route_costs - min_costs.detach()
-
-        # Clamp opcional para seguridad extrema
         stable_costs = torch.clamp(stable_costs, max=50.0)
 
-        # 3. Modelo Logit (Softmax sobre la dimensión K)
-        # Calculamos la utilidad (exponencial negativa del costo)
-        exp_utility = torch.exp(-self.mu * stable_costs)  # [b, o, k]
+        # 3. Logit
+        exp_utility = torch.exp(-self.mu * stable_costs)
+        sum_utility = torch.sum(exp_utility, dim=2, keepdim=True)
+        route_probs = exp_utility / (sum_utility + 1e-9)
 
-        # Suma de utilidades por par OD (denominador)
-        sum_utility = torch.sum(exp_utility, dim=2, keepdim=True)  # [b, o, 1]
+        # 4. Asignar Demanda
+        route_flows = route_probs * demands.unsqueeze(2)
 
-        # Probabilidad de elegir la ruta k
-        route_probs = exp_utility / (sum_utility + 1e-9)  # [b, o, k]
-
-        # 4. Asignar Demanda a Rutas
-        # Multiplicamos la probabilidad de la ruta por la demanda total del par OD
-        # demands se expande de [b, o] a [b, o, 1] para multiplicar
-        route_flows = route_probs * demands.unsqueeze(2)  # [b, o, k]
-
-        # 5. Proyectar Flujos de Ruta a Flujos de Link
-        # Sumamos todo el tráfico que pasa por cada link 'l'.
-        # Operación: route_flows [b, o, k] * route_masks [o, k, l] -> Sumar sobre o, k
-        # Salida: link_flows [b, l]
+        # 5. Proyectar a Links
         link_flows = torch.einsum('bok,okl->bl', route_flows, self.route_masks)
 
         return link_flows
@@ -507,20 +294,9 @@ class StochasticAssignmentLayer(nn.Module):
 class PartialDataLoss(nn.Module):
     """
     Función de pérdida para entrenamiento con datos parciales.
-
-    Componentes:
-    1. Pérdida de flujos observados (MSE)
-    2. Pérdida de demandas OD conocidas (MSE)
-    3. Regularización de parámetros BPR
     """
 
     def __init__(self, w_flow: float = 1.0, w_od: float = 1.0, w_reg: float = 0.01):
-        """
-        Args:
-            w_flow: Peso de pérdida de flujos
-            w_od: Peso de pérdida de OD
-            w_reg: Peso de regularización
-        """
         super().__init__()
         self.register_buffer('w_flow', torch.tensor(w_flow))
         self.register_buffer('w_od', torch.tensor(w_od))
@@ -536,22 +312,7 @@ class PartialDataLoss(nn.Module):
                 od_mask: torch.Tensor,
                 learned_alpha: Optional[torch.Tensor] = None,
                 learned_beta: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
-        """
-        Calcula pérdida total.
 
-        Args:
-            predicted_flows: Flujos predichos [batch_size, num_links]
-            true_flows: Flujos verdaderos [batch_size, num_links]
-            flow_mask: Máscara de flujos conocidos [batch_size, num_links] (1=conocido, 0=desconocido)
-            predicted_od: Demandas OD predichas [batch_size, num_od_pairs]
-            true_od: Demandas OD verdaderas [batch_size, num_od_pairs]
-            od_mask: Máscara de OD conocidas [batch_size, num_od_pairs] (1=conocido, 0=desconocido)
-            learned_alpha: Parámetros alpha aprendidos (opcional)
-            learned_beta: Parámetros beta aprendidos (opcional)
-
-        Returns:
-            Dict con pérdidas individuales y total
-        """
         # Pérdida de flujos (solo enlaces observados)
         if flow_mask.any():
             masked_pred_flows = predicted_flows * flow_mask
@@ -572,10 +333,10 @@ class PartialDataLoss(nn.Module):
             l_od = torch.tensor(0.0, device=predicted_od.device)
             od_coverage = 0.0
 
-        # Regularización de parámetros BPR
+        # Regularización de parámetros BPR (si existen)
         l_reg = torch.tensor(0.0, device=predicted_flows.device)
         if learned_alpha is not None and learned_beta is not None:
-            # Regularizar hacia valores típicos de BPR
+            # Regularizar hacia valores típicos
             l_reg = (torch.norm(learned_alpha - 0.15, p=2) +
                      torch.norm(learned_beta - 4.0, p=2))
 
@@ -603,12 +364,7 @@ class PartialDataLoss(nn.Module):
 class CyclicODModel(nn.Module):
     """
     Modelo principal para Traffic Assignment con datos parciales.
-
-    Pipeline:
-    1. Encoder: flujos observados -> espacio latente
-    2. GraphMatcher: alineación estructural
-    3. Decoder: espacio latente -> demandas OD completas
-    4. Validator: SUE con función de costo -> flujos validados
+    Modularizado para recibir configuración de VDF.
     """
 
     def __init__(self,
@@ -623,33 +379,20 @@ class CyclicODModel(nn.Module):
                  od_pair_indices: torch.Tensor,
                  num_link_groups: int,
                  link_group: torch.Tensor,
-                 cost_function_type: str = 'bpr',
+                 vdf_config: DictConfig,  # <-- CAMBIO CLAVE
                  dropout: float = 0.1):
-        """
-        Args:
-            num_links: Número de enlaces
-            num_od_pairs: Número de pares OD
-            hidden_dim: Dimensión oculta
-            feature_dim: Dimensión del espacio latente
-            num_structures: Número de estructuras en GraphMatcher
-            t0: Tiempos de flujo libre
-            capacity: Capacidades de enlaces
-            route_masks: Máscaras de rutas
-            od_pair_indices: Índices de pares OD
-            num_link_groups: Número de grupos de enlaces
-            link_group: Asignación de enlaces a grupos
-            cost_function_type: Tipo de función de costo ('bpr', 'conic', 'akcelik')
-            dropout: Tasa de dropout
-        """
+
         super().__init__()
 
         self.encoder = ODEncoder(num_links, hidden_dim, feature_dim, dropout)
         self.decoder = ODDecoder(num_od_pairs, hidden_dim, feature_dim, dropout)
         self.graph_matcher = GraphMatcher(feature_dim, num_structures)
+
+        # Pasamos la config de VDF al validador
         self.validator = AssignmentValidator(
             num_links, t0, capacity, route_masks, od_pair_indices,
             num_od_pairs, num_link_groups, link_group,
-            cost_function_type=cost_function_type
+            vdf_config=vdf_config
         )
 
     def forward(self,
@@ -657,18 +400,7 @@ class CyclicODModel(nn.Module):
                 flow_mask: torch.Tensor,
                 true_od_demand: Optional[torch.Tensor] = None,
                 warmup: bool = False) -> Dict[str, torch.Tensor]:
-        """
-        Forward pass del modelo.
 
-        Args:
-            observed_flows: Flujos observados [batch_size, num_links] o [num_links]
-            flow_mask: Máscara de flujos conocidos [batch_size, num_links] o [num_links]
-            true_od_demand: Demandas OD verdaderas (opcional, para training)
-            warmup: Si True, solo una iteración de SUE
-
-        Returns:
-            Dict con predicciones y metadata
-        """
         is_batched = observed_flows.dim() == 2
         if not is_batched:
             observed_flows = observed_flows.unsqueeze(0)
@@ -676,32 +408,28 @@ class CyclicODModel(nn.Module):
             if true_od_demand is not None:
                 true_od_demand = true_od_demand.unsqueeze(0)
 
-        # Aplicar máscara a flujos de entrada (poner 0 en desconocidos)
         masked_flows = observed_flows * flow_mask
 
-        # 1. Codificar flujos observados
+        # 1. Codificar
         h_x = self.encoder(masked_flows)
 
-        # 2. Generar referencia h_y (solo en training con ground truth)
+        # 2. Referencia (training)
         h_y = None
         if self.training and true_od_demand is not None:
             with torch.no_grad():
-                # Simular flujos "ideales" a partir de OD verdadera
                 true_flows, _, _, _ = self.validator(true_od_demand, warmup=True)
-                # Usar mismo encoder para mantener espacio latente compartido
                 h_y = self.encoder(true_flows)
 
-        # 3. Graph matching
+        # 3. Matching
         g_x = self.graph_matcher(h_x, h_y)
 
-        # 4. Decodificar a demandas OD
+        # 4. Decodificar
         estimated_demand = self.decoder(g_x)
 
-        # 5. Validar con SUE
+        # 5. Validar
         reconstructed_flows, learned_alpha, learned_beta, convergence_info = self.validator(
             estimated_demand, warmup=warmup)
 
-        # Desempaquetar si no era batched
         if not is_batched:
             estimated_demand = estimated_demand.squeeze(0)
             reconstructed_flows = reconstructed_flows.squeeze(0)
@@ -713,4 +441,3 @@ class CyclicODModel(nn.Module):
             "learned_beta": learned_beta,
             "convergence_info": convergence_info
         }
-

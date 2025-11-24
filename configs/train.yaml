@@ -1,6 +1,0 @@
-Tipo de Configuración,Contenido Típico
-Parámetros del Bucle,"epochs, batch_size, validation_frequency"
-Optimizador,"type: Adam, learning_rate: 1e-3, weight_decay: 1e-5"
-Scheduler,"type: ReduceLROnPlateau, factor: 0.5, patience: 10"
-Checkpointing,"save_best_model: True, metric_to_monitor: val_loss"
-Hardware,device: cuda o device: cpu

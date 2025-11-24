@@ -22,3 +22,5 @@ venv/
 /src/data_ingestion/outputs/
 /src/components/models/data/
 /src/train/outputs/
+/generate_tree.py
+/project_tree_direct.txt

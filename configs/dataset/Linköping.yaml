@@ -1,17 +1,18 @@
+# @package _global_
 # Configuration for Linköping
 # =============================================================================
 
 # DATA
 # =============================================================================
 data:
-  network_name: "Linköping"
+  dataset: "Linköping"
   base_path: "data/processed/Linköping"
 
   # Input files
   graph_file: "Linköping_graph.pkl"
   link_data_file: "Linköping_link_data.parquet"
   od_matrix_file: "Linköping_od_matrix.npz"
-  routing_cache_file: "routing_cache/kshortest_paths.pkl"
+  routing_cache_file: "routing_cache/${data.dataset}_kshortest_paths.pkl"
 
   # Volume year to use for training
   volume_year: 2022  # Options: 2018, 2019, 2022, 2023

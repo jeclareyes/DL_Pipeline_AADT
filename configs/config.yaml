@@ -3,15 +3,28 @@
 defaults:
   - _self_ # Permit overrides in this file
 
-  # Mapping: Folder - File (without -yaml)
-  - dataset: generic_dataset
-  - dataset_preprocessing: generic_dataset_preprocessing
+  # 1. Dataset (Ahora buscará en configs/dataset/Linköping.yaml)
+  - dataset: Linköping
+
+
+  # 2. Data Processing (Rutas anidadas según tu estructura)
   - data_ingestion/data_processing: data_processing
-  - model: generic_model
-  - training: generic_training
-  - training_sampling: generic_training_sampling
-  - training_vdf: generic_training_vdf
-  - testing: generic_testing
+  - data_ingestion/data_preprocessing: preprocessing_from_pkl
+
+  # 3. Model (Busca en configs/model/Cyclic_Model.yaml)
+  - model: Cyclic_Model
+
+  # 4. Training (Busca en configs/training/training.yaml)
+  - training: training
+
+  # 5. Sampling (Busca en configs/sampling/sampling.yaml)
+  - sampling: sampling
+
+  # 6. Testing (Busca en configs/testing/testing.yaml)
+  - testing: testing
+
+  # 7. VDF (Busca en configs/vdf/bpr.yaml)
+  - vdf: bpr
 
 # Global project variables
 project_name: "DL_Pipeline_AADT"

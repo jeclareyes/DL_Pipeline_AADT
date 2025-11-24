@@ -1,5 +1,0 @@
-Tipo de Configuración,Contenido Típico
-Modelo (CyclicODModel),"hidden_layers: [64, 128, 64], activation: ReLU, dropout_rate: 0.1"
-Datos/Características,"input_features: ['travel_time', 'demand'], output_dim: 1"
-Ajustes de la Red Vial,"Parámetros específicos del problema de asignación de tráfico (por ejemplo, rutas o factores de congestión)."
-Parámetros de Pérdida,"loss_type: PartialDataLoss, loss_weight: 0.5"

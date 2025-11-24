@@ -1,10 +1,45 @@
-from .base import BaseVDF
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from .base import BaseCostFunction  # Asegúrate de tener esta base
 
-class BPRFunction(BaseVDF):
-    def __init__(self, alpha, beta):
-        self.alpha = alpha
-        self.beta = beta
+class BPRCostFunction(BaseCostFunction):
+    """
+    Función de costo BPR modularizada.
+    """
+    def __init__(self, t0, capacity, num_link_groups, link_group, learnable_params=True):
+        super().__init__()
+        # Registramos buffers (no se entrenan, son datos)
+        self.register_buffer('t0', t0)
+        self.register_buffer('capacity', capacity)
+        self.register_buffer('link_group', link_group.to(torch.long))
+        self.learnable_params = learnable_params
 
-    def calculate(self, flow, capacity):
-        # Fórmula BPR estándar
-        return 1 + self.alpha * ((flow / capacity) ** self.beta)
+        if learnable_params:
+            # Parámetros aprendibles por grupo
+            self.alpha_raw = nn.Parameter(torch.full((num_link_groups,), 0.15))
+            self.beta_raw = nn.Parameter(torch.full((num_link_groups,), 4.0))
+        else:
+            self.register_buffer('alpha_raw', torch.full((num_link_groups,), 0.15))
+            self.register_buffer('beta_raw', torch.full((num_link_groups,), 4.0))
+
+    def get_alpha(self):
+        if self.learnable_params:
+            return torch.clamp(F.softplus(self.alpha_raw), min=0.01, max=2.0)
+        return self.alpha_raw
+
+    def get_beta(self):
+        if self.learnable_params:
+            return torch.clamp(1.0 + F.softplus(self.beta_raw), min=1.1, max=10.0)
+        return self.beta_raw
+
+    def forward(self, link_flows):
+        alpha = self.get_alpha()
+        beta = self.get_beta()
+
+        alpha_links = alpha[self.link_group]
+        beta_links = beta[self.link_group]
+
+        # Evitar divisiones por cero y explosiones numéricas
+        flow_ratio = torch.clamp(link_flows / (self.capacity + 1e-9), max=5.0)
+        return self.t0 * (1 + alpha_links * flow_ratio ** beta_links)
