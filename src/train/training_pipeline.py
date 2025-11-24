@@ -12,6 +12,15 @@ from src.utils.traffic_dataset import TrafficDataset
 # Tu motor de sampling existente
 from src.components.sampling.engine import SamplingEngine
 
+import os
+import sys
+import io
+
+# Parche para Windows: Forzar salida UTF-8 para soportar emojis en logs
+if os.name == 'nt':
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+
 
 def run_pipeline(cfg: DictConfig):
     print(f"🚀 [HYDRA] Iniciando Pipeline. Modelo: {cfg.model._target_}")

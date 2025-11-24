@@ -1,28 +1,27 @@
-# filepath: configs/sampling/sampling.yaml
+# @package _global_
+# configs/sampling/sampling.yaml
 
-dataset: Linköping
-
-# Root for processed data
-data:
-  root: data/processed
-
+# Definimos input_routes a nivel global para que las interpolaciones funcionen
 input_routes:
-  general_route: ${data.root}/${dataset}
+  # Usamos la ruta base que ya cargó Linköping.yaml
+  general_route: ${data.base_path}
 
-  graph_route: ${input_routes.general_route}/${dataset}_graph.pkl
-  od_matrix_route: ${input_routes.general_route}/${dataset}_od_matrix.npz
-  link_data_route: ${input_routes.general_route}/${dataset}_link_data.parquet # optional
+  # Rutas derivadas
+  graph_route: ${input_routes.general_route}/${data.dataset}_graph.pkl
+  od_matrix_route: ${input_routes.general_route}/${data.dataset}_od_matrix.npz
+  link_data_route: ${input_routes.general_route}/${data.dataset}_link_data.parquet
 
+# Parámetros de sampling (quedarán en cfg.sampling)
 sampling:
   flow_rate: 0.8
   od_rate: 1.0
   sampling_basis: link_wise_based
   output_dir: outputs/masks
   output_filename: sampled_flow_mask.npy
+  # Estrategia por defecto dentro del bloque sampling
+  strategy: spatial_LHS
 
-strategy: spatial_LHS # Options: random_sampling, spatial_LHS
-
+# Estrategias disponibles (nivel global o referenciadas por el engine)
 sampling_strategies_routes:
   random_sampling: src.components.sampling.strategies.random_sampler:RandomStrategy
   spatial_LHS: src.components.sampling.strategies.spatial_LHS:SpatialLHSStrategy
-

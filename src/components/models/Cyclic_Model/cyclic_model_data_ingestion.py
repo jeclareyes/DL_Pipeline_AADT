@@ -218,28 +218,77 @@ class LinkopingDataLoader:
         return link_data
 
     def _load_routes(self) -> Dict:
-        """Carga rutas precalculadas."""
+        """Carga rutas precalculadas y las convierte a tensores si es necesario."""
         routes_file = self.config.data.routing_cache_file
         routes_path = self.base_path / routes_file
 
         # Verificar si existe
         if not routes_path.exists():
-            logger.warning(f"   ⚠️ Archivo de rutas no encontrado: {routes_path}")
-            logger.warning(f"   ⚠️ Buscando alternativas...")
-            # Buscar en routing_cache directamente
+            # Buscar alternativas
             alt_path = self.base_path / 'routing_cache' / 'kshortest_paths.pkl'
             if alt_path.exists():
                 routes_path = alt_path
+            else:
+                # Intento final con nombre genérico en la raíz
+                routes_path = self.base_path / 'kshortest_paths.pkl'
 
         logger.info(f"   📍 Cargando rutas: {routes_path}")
 
+        if not routes_path.exists():
+            raise FileNotFoundError(f"No se encontró el archivo de rutas en {routes_path}")
+
         with open(routes_path, 'rb') as f:
-            routes_data = pickle.load(f)
+            raw_data = pickle.load(f)
+
+        # --- DETECCIÓN Y CONVERSIÓN DE FORMATO ---
+        # Si es el formato crudo {(u,v): [[path1], [path2]]}
+        first_key = next(iter(raw_data))
+        if isinstance(first_key, tuple):
+            logger.info("      ⚠️ Formato crudo detectado (diccionario). Convirtiendo a tensores...")
+
+            # Necesitamos mapear los Node IDs a Índices 0..N para los tensores
+            node_list = sorted(list(self.graph.nodes()))
+            node_to_idx = {n: i for i, n in enumerate(node_list)}
+
+            od_pairs_list = []
+            routes_tensor_list = []
+
+            k_paths = self.config.network.k_paths
+            # Calculamos longitud máxima real o usamos la del config
+            max_len = 0
+            for paths in raw_data.values():
+                for p in paths:
+                    max_len = max(max_len, len(p))
+
+            # Usamos -1 como padding para permitir que el nodo 0 exista
+            num_od = len(raw_data)
+            routes_tensor = np.full((num_od, k_paths, max_len), -1, dtype=np.int32)
+            od_pairs_array = np.zeros((num_od, 2), dtype=object)  # Object para permitir IDs string si los hay
+
+            for i, ((u, v), paths) in enumerate(raw_data.items()):
+                od_pairs_array[i] = [u, v]
+
+                # Procesar hasta k rutas
+                for k, path in enumerate(paths):
+                    if k >= k_paths: break
+
+                    # Convertir IDs de nodos a índices
+                    try:
+                        path_indices = [node_to_idx[n] for n in path]
+                        length = len(path_indices)
+                        routes_tensor[i, k, :length] = path_indices
+                    except KeyError as e:
+                        logger.warning(f"Nodo {e} en ruta {u}->{v} no existe en el grafo.")
+
+            routes_data = {
+                'routes': routes_tensor,
+                'od_pairs': od_pairs_array
+            }
+        else:
+            # Ya es el formato procesado
+            routes_data = raw_data
 
         logger.info(f"      ✓ Routes shape: {routes_data['routes'].shape}")
-        # logger.info(f"      ✓ Max route length: {routes_data['max_route_length']}")
-        # logger.info(f"      ✓ Num routes per OD: {routes_data['num_routes']}")
-
         return routes_data
 
     def _validate_data(self):
@@ -439,7 +488,10 @@ class LinkopingDataLoader:
         for od_idx in range(num_od_pairs):
             for k in range(k_paths):
                 route = routes[od_idx, k]
-                route = route[route > 0] # Filtrar padding
+
+                # --- CAMBIO IMPORTANTE AQUÍ ---
+                # Filtramos el padding (-1) en lugar de >0 para permitir el nodo 0
+                route = route[route != -1]
 
                 if len(route) < 2:
                     continue
@@ -448,9 +500,11 @@ class LinkopingDataLoader:
                     node_idx_from = int(route[i])
                     node_idx_to = int(route[i + 1])
 
+                    # Validación de índices
                     if node_idx_from >= len(node_list) or node_idx_to >= len(node_list):
                         continue
 
+                    # Como ya convertimos a índices en _load_routes, accedemos directo
                     node_from = node_list[node_idx_from]
                     node_to = node_list[node_idx_to]
                     edge = (node_from, node_to)
@@ -463,17 +517,18 @@ class LinkopingDataLoader:
                         edges_not_found += 1
 
         # OD pair indices
-        if isinstance(od_pairs, list):
-            node_to_idx = {node: idx for idx, node in enumerate(node_list)}
-            od_pair_indices = []
-            for origin_id, dest_id in od_pairs:
-                if origin_id in node_to_idx and dest_id in node_to_idx:
-                    od_pair_indices.append([node_to_idx[origin_id], node_to_idx[dest_id]])
-                else:
-                    od_pair_indices.append([-1, -1])
-            od_pair_indices = np.array(od_pair_indices, dtype=np.int64)
-        else:
-            od_pair_indices = od_pairs.astype(np.int64)
+        # Mapeamos los IDs originales (en od_pairs) a sus índices
+        node_to_idx = {node: idx for idx, node in enumerate(node_list)}
+        od_pair_indices = []
+
+        for i in range(len(od_pairs)):
+            origin_id, dest_id = od_pairs[i]
+            if origin_id in node_to_idx and dest_id in node_to_idx:
+                od_pair_indices.append([node_to_idx[origin_id], node_to_idx[dest_id]])
+            else:
+                od_pair_indices.append([-1, -1])
+
+        od_pair_indices = np.array(od_pair_indices, dtype=np.int64)
 
         return route_masks, od_pair_indices
 
