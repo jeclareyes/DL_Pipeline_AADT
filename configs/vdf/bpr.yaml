@@ -1,0 +1,5 @@
+# Apuntamos a la nueva ubicación modular
+_target_: src.components.vdf.bpr.BPRCostFunction
+
+# Parámetro opcional que controla la clase
+learnable_params: true
