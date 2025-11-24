@@ -12,7 +12,7 @@ Date: November 2025
 import numpy as np
 import pandas as pd
 import networkx as nx
-from typing import Tuple, Optional, Dict, Any, List, Union
+from typing import Tuple, Optional, List, Union
 import logging
 from scipy.stats import qmc
 from scipy.spatial import cKDTree
@@ -25,7 +25,7 @@ project_root = Path(__file__).resolve().parents[2]
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
-from src.models.Graph_Matcher.cyclic_model_data_ingestion import LinkopingDataLoader
+from src.components.models.Cyclic_Model.cyclic_model_data_ingestion import LinkopingDataLoader
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +57,7 @@ def _group_consecutive_links(
 
     # Si no hay datos de flujo, no podemos agrupar fiablemente
     if subset['flow'].isnull().all():
-        logger.warning("   ⚠️ No se detectaron datos de flujo (Volume_YYYY) para agrupar. Usando link-wise.")
+        logger.warning("   WARNING: No se detectaron datos de flujo (Volume_YYYY) para agrupar. Usando link-wise.")
         return [[idx] for idx in valid_indices]
 
     # Diccionario de adyacencia optimizado para búsqueda rápida:
@@ -232,7 +232,7 @@ def _sample_flows(
     num_samples = int(num_groups * rate)
 
     if num_samples == 0:
-        logger.warning("   ⚠️ Flow rate resulted in 0 samples.")
+        logger.warning("   WARNING: Flow rate resulted in 0 samples.")
         return np.zeros_like(train_flow_mask)
 
     logger.info(f"      Sampling Logic: {basis} | Strategy: {strategy}")
@@ -340,7 +340,7 @@ def create_partial_data_masks(
             - 'link_wise_based': Muestrea links individuales.
             - 'traffic_counts_based': Agrupa links consecutivos con mismo flujo.
     """
-    logger.info(f"\n   📊 Creando máscaras de muestreo (Year: {volume_year})")
+    logger.info(f"\n   Creando máscaras de muestreo (Year: {volume_year})")
 
     # 1. Extraer datos del grafo a estructura tabular interna
     # Esto desacopla la lógica compleja de sampling de la estructura de grafo
@@ -396,7 +396,7 @@ def main():
         config = yaml.safe_load(f)
 
     print("="*80)
-    print("🎯 EJECUCIÓN STANDALONE: Sampling Module")
+    print("EJECUCIÓN STANDALONE: Sampling Module")
     print("="*80)
     print(f"   Config: {config_path}")
     print(f"   Network: {config['data']['network_name']}")

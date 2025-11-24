@@ -1,7 +1,7 @@
 """
 Generador de matriz Origen-Destino (OD) desde archivos TNTP.
 
-Copiado desde src/data_ingestion/od_matrix_generator.py para alojarlo en processing_modules.
+Copiado desde src/data_ingestion/_od_matrix_generator.py para alojarlo en processing_modules.
 """
 import numpy as np
 import pandas as pd

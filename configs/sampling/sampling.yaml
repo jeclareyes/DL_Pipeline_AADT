@@ -1,0 +1,28 @@
+# filepath: configs/sampling/sampling.yaml
+
+dataset: Linköping
+
+# Root for processed data
+data:
+  root: data/processed
+
+input_routes:
+  general_route: ${data.root}/${dataset}
+
+  graph_route: ${input_routes.general_route}/${dataset}_graph.pkl
+  od_matrix_route: ${input_routes.general_route}/${dataset}_od_matrix.npz
+  link_data_route: ${input_routes.general_route}/${dataset}_link_data.parquet # optional
+
+sampling:
+  flow_rate: 0.8
+  od_rate: 1.0
+  sampling_basis: link_wise_based
+  output_dir: outputs/masks
+  output_filename: sampled_flow_mask.npy
+
+strategy: spatial_LHS # Options: random_sampling, spatial_LHS
+
+sampling_strategies_routes:
+  random_sampling: src.components.sampling.strategies.random_sampler:RandomStrategy
+  spatial_LHS: src.components.sampling.strategies.spatial_LHS:SpatialLHSStrategy
+

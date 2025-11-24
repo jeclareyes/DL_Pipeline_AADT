@@ -26,9 +26,9 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 # Dynamic model import will be done later based on config
-# from src.models.Graph_Matcher.cyclic_model import CyclicODModel, PartialDataLoss
-from src.models.Graph_Matcher.cyclic_model_data_ingestion import LinkopingDataLoader
-from src.models.traditional_TA.frank_wolfe_congestion import FrankWolfeAssignmentCongestion
+# from src.models.Cyclic_Model.cyclic_model import CyclicODModel, PartialDataLoss
+from src.components.models.Cyclic_Model.cyclic_model_data_ingestion import LinkopingDataLoader
+from src.components.models.traditional_TA.frank_wolfe_congestion import FrankWolfeAssignmentCongestion
 import networkx as nx
 from scipy import sparse
 
@@ -533,10 +533,10 @@ def main():
     model_type = args.model if args.model else config['model'].get('type', 'cyclic_model')
     print(f"   Modelo seleccionado: {model_type}")
     if model_type == 'cyclic_model':
-        from src.models.Graph_Matcher.cyclic_model import CyclicODModel, PartialDataLoss
+        from src.components.models.Cyclic_Model.cyclic_model import CyclicODModel, PartialDataLoss
         ModelClass = CyclicODModel
     elif model_type == 'cyclic_model_ultra':
-        from src.models.Graph_Matcher.cyclic_model_ultra import CyclicODModelUltra, PartialDataLoss
+        from src.components.models.Cyclic_Model_2.cyclic_model_ultra import CyclicODModelUltra, PartialDataLoss
         ModelClass = CyclicODModelUltra
     else:
         raise ValueError(f"Modelo desconocido: {model_type}")

@@ -575,7 +575,7 @@ class LinkopingDataLoader:
         random_seed = self.config['data']['random_seed']
 
         # Import here to avoid circular import
-        from src.train.sampling import create_partial_data_masks
+        from src.components.sampling.sampling import create_partial_data_masks
 
         # Use the generalized sampling function
         sampled_flow_mask, sampled_od_mask = create_partial_data_masks(

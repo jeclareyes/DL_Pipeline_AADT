@@ -28,14 +28,14 @@ import json
 
 AVAILABLE_MODELS = {
     'cyclic_model': {
-        'script': 'src/models/Graph_Matcher/train_cyclic_model.py',
-        'module': 'models.Graph_Matcher.train_cyclic_model',
+        'script': 'src/models/Cyclic_Model/train_cyclic_model.py',
+        'module': 'models.Cyclic_Model.train_cyclic_model',
         'description': 'Modelo original de asignación cíclica',
         'class': 'CyclicODModel'
     },
     'cyclic_model_ultra': {
-        'script': 'src/models/Graph_Matcher/train_cyclic_model.py',
-        'module': 'models.Graph_Matcher.train_cyclic_model',
+        'script': 'src/models/Cyclic_Model/train_cyclic_model.py',
+        'module': 'models.Cyclic_Model.train_cyclic_model',
         'description': 'Modelo mejorado con arquitectura avanzada',
         'class': 'CyclicODModelUltra'
     }

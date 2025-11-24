@@ -16,7 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from src.models.traditional_TA.traffic_assignment import main as run_traffic_assignment
+from src.components.models.traditional_TA.traffic_assignment import main as run_traffic_assignment
 
 
 if __name__ == '__main__':

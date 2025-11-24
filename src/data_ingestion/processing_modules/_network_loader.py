@@ -1,7 +1,7 @@
 """
 TNTP network loader moved to processing_modules to separate concerns.
 """
-# ... reuse content from original network_loader.py but adjust PROJECT_ROOT resolution
+# ... reuse content from original _network_loader.py but adjust PROJECT_ROOT resolution
 import pandas as pd
 from pathlib import Path
 import warnings

@@ -89,7 +89,7 @@ class FlowReader:
         if network_path is None:
             network_path = PROJECT_ROOT / 'data' / 'raw' / 'Barcelona_net.tntp'
         # lazy import to avoid circular dependency
-        from .network_loader import load_network_df
+        from ._network_loader import load_network_df
         self.network_df = load_network_df(network_path)
         self.network_df.rename(columns={'init_node': 'from_node', 'term_node': 'to_node'}, inplace=True)
         self.combined_df = pd.merge(self.flow_df, self.network_df, on=['from_node', 'to_node'], how='left', indicator=True)

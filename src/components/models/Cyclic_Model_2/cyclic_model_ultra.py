@@ -515,7 +515,7 @@ class UltraCyclicODModel(nn.Module):
 # Compatibilidad con `train_cyclic_model.py`
 # -----------------------------------------------------------------------------
 # `train_cyclic_model.py` espera poder hacer:
-# from src.models.Graph_Matcher.cyclic_model_ultra import CyclicODModelUltra, PartialDataLoss
+# from src.models.Cyclic_Model.cyclic_model_ultra import CyclicODModelUltra, PartialDataLoss
 # y luego instanciar `CyclicODModelUltra(..., cost_function_type=..., dropout=...)`
 # y usar `PartialDataLoss(w_flow=..., w_od=..., w_reg=...)`.
 # Para mantener compatibilidad, añadimos pequeñas "shims" (envoltorios) que

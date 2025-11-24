@@ -1,0 +1,2 @@
+dataset: Linköping
+pickle_data_path: ${paths.data_raw}/Linköping/pickle/Linköping_Pickle_Data.pkl

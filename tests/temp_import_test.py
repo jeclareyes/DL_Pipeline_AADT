@@ -5,7 +5,7 @@ print('SYS.PATH SAMPLE:')
 for p in sys.path[:6]:
     print('  ', p)
 try:
-    m = importlib.import_module('src.models.Graph_Matcher.cyclic_model_ultra')
+    m = importlib.import_module('src.models.Cyclic_Model.cyclic_model_ultra')
     print('MODULE_LOADED', getattr(m,'__file__',None))
     print('HAS_CyclicODModelUltra', 'CyclicODModelUltra' in dir(m))
     print('HAS_PartialDataLoss', 'PartialDataLoss' in dir(m))

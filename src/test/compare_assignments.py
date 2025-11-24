@@ -68,7 +68,7 @@ def compare_assignments():
         use_cache=True,
         k_paths=10,
         save_comparison=True,
-        comparison_path='../models/data/processed/comparison_nocongestion.csv'
+        comparison_path='../components/models/data/processed/comparison_nocongestion.csv'
     )
 
     time_no_cong = time.time() - start_time_no_cong
@@ -93,7 +93,7 @@ def compare_assignments():
         use_cache=False,  # Menos efectivo con costos dinámicos
         k_paths=10,
         save_comparison=True,
-        comparison_path='../models/data/processed/comparison_congestion.csv'
+        comparison_path='../components/models/data/processed/comparison_congestion.csv'
     )
 
     time_cong = time.time() - start_time_cong
@@ -219,7 +219,7 @@ def compare_assignments():
     print("="*80)
 
     # Guardar comparación de flujos
-    output_path = Path('../models/data/processed/flow_comparison_nocong_vs_cong.csv')
+    output_path = Path('../components/models/data/processed/flow_comparison_nocong_vs_cong.csv')
     output_path.parent.mkdir(parents=True, exist_ok=True)
     df_flows.to_csv(output_path, index=False)
     print(f"   ✓ Comparación de flujos guardada: {output_path}")
@@ -255,7 +255,7 @@ def compare_assignments():
         }
     }
 
-    summary_path = Path('../models/data/processed/comparison_summary.json')
+    summary_path = Path('../components/models/data/processed/comparison_summary.json')
     with open(summary_path, 'w') as f:
         json.dump(summary, f, indent=2)
     print(f"   ✓ Resumen JSON guardado: {summary_path}")

@@ -1,0 +1,35 @@
+# File: configs/data_ingestion/data_processing/data_processing.yaml
+# =============================================================================
+dataset: Linköping
+
+multiday_od: true
+random_seed: 42
+volume_year: 2022
+
+data:
+  root: data # Define la raíz donde se encuentra la carpeta 'raw'
+
+# Top-level data namespace expected by the code
+input_routes:
+  general_route: ${data.root}/raw/${dataset}
+  flow_route: ${input_routes.general_route}/${dataset}_flow.tntp
+  network_route: ${input_routes.general_route}/${dataset}_net.tntp   # fixed typo
+  node_route: ${input_routes.general_route}/${dataset}_node.tntp
+  routes_route: ${input_routes.general_route}/${dataset}_routes.tntp
+  trips_route: ${input_routes.general_route}/${dataset}_trips.tntp
+
+output_routes:
+  root: ${hydra:runtime.cwd}/data
+  processed_route: ${output_routes.root}/processed/${dataset}
+  routing_cache_route: ${output_routes.root}/processed/${dataset}/routing_cache/${dataset}_kshortest_paths.pkl
+
+route_calculation:
+  k_paths: 10
+  algorithm: yen_astar # Options: dijkstra, yen_astar, yen
+  execution_mode: parallel # Options: sequential, parallel
+  weight: free_flow_time
+  force_recompute: false
+  n_workers: 7
+  chunk_size: 100
+  # Opciones: 'rustworkx' (Rápido, Threads) | 'networkx' (Lento, Procesos)
+  engine: "networkx"

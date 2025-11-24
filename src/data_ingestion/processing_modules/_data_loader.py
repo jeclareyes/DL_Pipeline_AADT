@@ -15,25 +15,24 @@ from pathlib import Path
 import sys
 
 # Try relative imports (normal package usage). If the module is executed directly
-# (e.g. python data_loader.py), the relative imports fail with "attempted relative
+# (e.g. python _data_loader.py), the relative imports fail with "attempted relative
 # import with no known parent package". In that case, add 'src' to sys.path and
 # import using the package path.
 try:
-    from .processing_modules.network_loader import TNTPNetworkLoader
-    from .processing_modules.trips_reader import FlowReader
-    from .processing_modules.od_matrix_generator import ODMatrixGenerator, MultidayODMatrixGenerator
-    from .processing_modules.node_loader import TNTPNodeLoader
+    from src.data_ingestion.processing_modules._network_loader import TNTPNetworkLoader
+    from src.data_ingestion.processing_modules._trips_reader import FlowReader
+    from src.data_ingestion.processing_modules._od_matrix_generator import ODMatrixGenerator, MultidayODMatrixGenerator
+    from src.data_ingestion.processing_modules._node_loader import TNTPNodeLoader
 except Exception:
     # Add the 'src' directory (parent of this package) to sys.path so the package
     # can be imported when running this file as a script.
     src_dir = str(Path(__file__).resolve().parents[1])
     if src_dir not in sys.path:
         sys.path.insert(0, src_dir)
-    from data_ingestion.processing_modules.network_loader import TNTPNetworkLoader
-    from data_ingestion.processing_modules.trips_reader import FlowReader
-    from data_ingestion.processing_modules.od_matrix_generator import ODMatrixGenerator, MultidayODMatrixGenerator
-    from data_ingestion.processing_modules.node_loader import TNTPNodeLoader
-
+    from ._network_loader import TNTPNetworkLoader
+    from ._trips_reader import FlowReader
+    from ._od_matrix_generator import ODMatrixGenerator, MultidayODMatrixGenerator
+    from ._node_loader import TNTPNodeLoader
 
 class DataLoader:
     """Carga red, flujos, matriz OD y coordenadas y actualiza un DataManager.
@@ -44,20 +43,38 @@ class DataLoader:
     y `manager.node_coords_df` así como `manager.metadata`.
     """
 
-    def __init__(self, multiday: bool = False):
+    def __init__(self, routes, volume_year: int, multiday: bool = False, run_loads: bool = True):
+        # Diccionario de rutas de archivos TNTP
+        self.routes = routes
+        self.volume_year = volume_year
         self.multiday = multiday
 
-    def load_network(self, manager):
+        # Descomprensión de rutas de dónde buscar cada archivo TNTP
+        self.flow_route = self.routes['flow_route']
+        self.network_route = self.routes['network_route']
+        self.node_route = self.routes['node_route']
+        self.routes_route = self.routes['routes_route']
+        self.trips_route = self.routes['trips_route']
+
+        if run_loads:
+            self.flow_df =    self.load_flow(self.flow_route, year=self.volume_year)
+            self.network_df = self.load_network(self.network_route)
+            self.od_matrix =  self.load_od_matrix(self.trips_route)
+            self.node_df =    self.load_node_features(self.node_route)
+            # self.routes.add_aux_od_matrix() TODO se está quitando para que se corra este proceso en data_processing.py en vez
+
+    #%% Stages de carga de datos - Métodos Core
+
+    # 1. TNTP net - Carga de red de tráfico (DataFrame de enlaces)
+    def load_network(self, route):
         """
         Loads the TNTP network data, performs column normalization, and standardizes
         the 'from_node' and 'to_node' columns into canonical names and types.
         """
         # 1. Initial Data Loading
-        loader = TNTPNetworkLoader(manager.network_path)
+        loader = TNTPNetworkLoader(route)
         network_df, net_metadata = loader.load()
-        manager.network_df = network_df
-        manager.metadata['network'] = net_metadata
-        df = manager.network_df  # Use an alias for conciseness
+        df = network_df  # Use an alias for conciseness
 
         # --- Auxiliary Functions for Column Identification ---
         # Map all column names to lowercase for robust searching
@@ -117,9 +134,11 @@ class DataLoader:
                 df['from_node'] = df[possible[0]]
                 df['to_node'] = df[possible[1]]
 
-        return manager.network_df
+        return network_df
 
-    def load_flow(self, manager, year=None):
+    # 2. TNTP flows - Carga de flujos de red (DataFrame de traffic counts - ground truth )
+    # TODO hacer el año un parámetro
+    def load_flow(self, route, year=2022):
         """
         Loads the flow data, standardizes node columns, and selects the appropriate
         'volume' column based on the provided year parameter.
@@ -128,9 +147,9 @@ class DataLoader:
         :param year: The specific year (e.g., 2023) to select the volume column from.
         """
         # 1. Initial Data Loading
-        reader = FlowReader(manager.flow_path)
-        manager.flow_df = reader.load()
-        df = manager.flow_df  # Alias for conciseness
+        reader = FlowReader(route)
+        flow_df = reader.load()
+        df = flow_df  # Alias for conciseness
 
         # --- Auxiliary Functions and Column Identification ---
         # Map all column names to lowercase for robust searching
@@ -187,15 +206,16 @@ class DataLoader:
             selected_vol_col = all_vol_cols[-1]
 
         # 3b. Create the canonical 'volume' column from the selected source
-        if selected_vol_col:
+        """if selected_vol_col:
             # Rename the selected column to the canonical 'volume' name.
+            # TODO se está haciendo así para identificar fácil
             if selected_vol_col != 'volume':
                 df.rename(columns={selected_vol_col: 'volume'}, inplace=True)
 
         else:
             # If no volume column was found after all attempts, ensure 'volume' column exists and is zeroed out.
             if 'volume' not in df.columns:
-                df['volume'] = 0.0
+                df['volume'] = 0.0"""
 
         # 4. Final Type Conversions for Canonical Columns
 
@@ -215,16 +235,17 @@ class DataLoader:
             except Exception:
                 df['to_node'] = df['to_node'].astype(str)
 
-        # Convert 'volume' (Ensuring it is numeric and filling NaNs with 0.0)
+        """# Convert 'volume' (Ensuring it is numeric and filling NaNs with 0.0)
         if 'volume' in df.columns:
             try:
                 df['volume'] = pd.to_numeric(df['volume'], errors='coerce').fillna(0.0)
             except Exception:
                 # If all numeric conversion fails, do nothing (column remains as is, likely an issue with the data)
-                pass
+                pass"""
 
         # 5. Calculation and Assignment of Statistics
-        try:
+        # TODO FIX THIS
+        """try:
             # Attempt to get statistics directly from the reader object
             stats = reader.get_statistics()
         except Exception:
@@ -236,38 +257,31 @@ class DataLoader:
                 'total_volume': float(df['volume'].sum()) if 'volume' in df.columns else 0.0,
                 'avg_volume': float(df['volume'].mean()) if 'volume' in df.columns else 0.0,
                 'max_volume': float(df['volume'].max()) if 'volume' in df.columns else 0.0,
-            }
+            }"""
 
-        manager.metadata['flow'] = stats
-        return manager.flow_df
+        # manager.metadata['flow'] = stats TODO
+        return flow_df
 
-    def load_node_features(self, manager):
-        if manager.node_path is None:
+    # 4. TNTP node - Carga de nodos con sus coordenadas y sus tipos
+    def load_node_features(self, route):
+        if route is None:
             return pd.DataFrame()
-        loader = TNTPNodeLoader(manager.node_path)
-        manager.node_coords_df, node_metadata = loader.load()
-        manager.metadata['node_coordinates'] = node_metadata
-        return manager.node_coords_df
+        loader = TNTPNodeLoader(route)
+        node_coords_df, node_metadata = loader.load()
+        # .metadata['node_coordinates'] = node_metadata TODO lógica de metadata
+        return node_coords_df
 
-    def load_od_matrix(self, manager) -> sparse.spmatrix:
+    # 4. TNTP trips - Carga de matriz OD (sparse matrix) (carga en bruto hasta entregar una única matriz agregada
+    def load_od_matrix(self, route) -> sparse.spmatrix:
         if self.multiday:
-            loader = MultidayODMatrixGenerator(manager.od_path)
+            loader = MultidayODMatrixGenerator(route)
         else:
-            loader = ODMatrixGenerator(manager.od_path)
+            loader = ODMatrixGenerator(route)
 
         od_dataframe, od_metadata = loader.load()
-        manager.od_dataframe = od_dataframe
+        od_dataframe = od_dataframe
         # Convert to sparse matrix for od_matrix attribute
-        manager.od_matrix = loader.to_sparse_matrix()
-        manager.metadata['od_matrix'] = od_metadata
-        return manager.od_matrix
+        od_matrix = loader.to_sparse_matrix()
+        # metadata['od_matrix'] = od_metadata TODO lógica de metadata
+        return od_matrix
 
-    def load_all(self, manager):
-        """Convenience: ejecuta todas las cargas en orden y actualiza manager."""
-        self.load_network(manager)
-        self.load_flow(manager)
-        self.load_od_matrix(manager)
-        self.load_node_features(manager)
-        # Expandir matriz OD con nodos auxiliares (demanda NaN)
-        manager.add_aux_od_matrix()
-        return manager.network_df, manager.flow_df, manager.od_matrix, manager.node_coords_df

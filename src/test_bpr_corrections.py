@@ -13,7 +13,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from data_ingestion.data_processing import DataManager
-from src.models.traditional_TA.frank_wolfe_congestion import FrankWolfeAssignmentCongestion
+from src.components.models.traditional_TA import FrankWolfeAssignmentCongestion
 
 
 def test_bpr_corrections():

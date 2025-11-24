@@ -1,0 +1,35 @@
+# configs/config.yaml
+
+defaults:
+  - _self_ # Permit overrides in this file
+
+  # Mapping: Folder - File (without -yaml)
+  - dataset: generic_dataset
+  - dataset_preprocessing: generic_dataset_preprocessing
+  - data_ingestion/data_processing: data_processing
+  - model: generic_model
+  - training: generic_training
+  - training_sampling: generic_training_sampling
+  - training_vdf: generic_training_vdf
+  - testing: generic_testing
+
+# Global project variables
+project_name: "DL_Pipeline_AADT"
+
+# Flow Control (Orchestration)
+# Definition of the steps to be executed in the pipeline
+stages:
+  - preprocessing
+  - processing
+  - training
+  - testing
+
+# Base route (relative to project root) so modules know where to storage/read data
+paths:
+  root_dir: ${hydra:runtime.cwd}
+  logs: ${paths.root_dir}/logs
+  data_raw: ${paths.root_dir}/data/raw
+  data_interim: ${paths.root_dir}/data/interim
+  data_processed: ${paths.root_dir}/data/processed
+  trained_models: ${paths.root_dir}/models
+  outputs: ${paths.root_dir}/outputs

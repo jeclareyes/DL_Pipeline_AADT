@@ -20,5 +20,5 @@ venv/
 /drafts/
 /src/outputs/
 /src/data_ingestion/outputs/
-/src/models/data/
+/src/components/models/data/
 /src/train/outputs/

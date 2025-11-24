@@ -11,7 +11,7 @@ Uso como módulo:
     save_graph(G, 'data/processed/network_graph.gpickle')
 
 Uso desde línea de comandos:
-    python src/data_ingestion/graph_network_creator.py --path data/raw/Barcelona_net.tntp
+    python src/data_ingestion/_graph_network_creator.py --path data/raw/Barcelona_net.tntp
 """
 from pathlib import Path
 import argparse
@@ -25,7 +25,132 @@ import pandas as pd
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
-def build_graph_from_df(df: pd.DataFrame,
+def build_graph(link_df, node_df):
+    """Construye el grafo de NetworkX a partir del DataFrame unificado."""
+    if link_df is None:
+        raise RuntimeError("Debe cargar y fusionar la red y los flujos antes de construir el grafo.")
+
+    # Ensure canonical join columns exist
+    if 'from_node' not in link_df.columns or 'to_node' not in link_df.columns:
+        raise RuntimeError("unified_df no contiene columnas 'from_node'/'to_node' para construir el grafo")
+
+    link_df = link_df.copy()
+    link_df['from_node'] = link_df['from_node'].astype(str)
+    link_df['to_node'] = link_df['to_node'].astype(str)
+
+    # Análisis de depuración para identificar discrepancias en el número de links
+    print(f"Debug: DataFrame has {len(link_df)} rows.")
+    null_from = link_df['from_node'].isnull().sum()
+    null_to = link_df['to_node'].isnull().sum()
+    print(f"Debug: Null 'from_node': {null_from}, Null 'to_node': {null_to}")
+    self_loops = (link_df['from_node'] == link_df['to_node']).sum()
+    print(f"Debug: Self-loops (from_node == to_node): {self_loops}")
+    duplicates = link_df.duplicated(subset=['from_node', 'to_node']).sum()
+    print(f"Debug: Duplicate edges (same from_node, to_node): {duplicates}")
+    empty_from = (link_df['from_node'] == '').sum()
+    empty_to = (link_df['to_node'] == '').sum()
+    print(f"Debug: Empty 'from_node': {empty_from}, Empty 'to_node': {empty_to}")
+
+    if duplicates > 0:
+        print("ESTO AQUI YA NO PUEDE PASAR, PUES EL PROCESO DE DEDPLICACIÓN SE HA TRASLADO A OTRO SITIO")
+        dup_df = link_df[link_df.duplicated(subset=['from_node', 'to_node'], keep=False)]
+        print("Duplicate edges:")
+        print(dup_df.to_string())
+
+        # TODO: Implement better deduplication logic later
+        # For now, prefer rows where link_type != 99
+        if 'link_type' in link_df.columns:
+            # Sort so that link_type != 99 comes first (assuming 99 is the highest value)
+            link_df = link_df.sort_values(by='link_type', ascending=True)
+            # Drop duplicates, keeping the first (which will be non-99 if available)
+            link_df = link_df.drop_duplicates(subset=['from_node', 'to_node'], keep='first')
+            print(f"After deduplication (preferring link_type != 99): {len(link_df)} rows.")
+        else:
+            print("Warning: 'link_type' column not found, skipping deduplication preference.")
+
+    # Crear el grafo a partir del DataFrame
+    graph = nx.from_pandas_edgelist(link_df, 'from_node', 'to_node', edge_attr=True, create_using=nx.DiGraph())
+
+    # TODO this is new in case eliminate
+    # Ensure numeric weight attribute 'free_flow_time' exists on edges
+    sample_edge_info = []
+    for u, v, data in list(graph.edges(data=True))[:5]:
+        sample_edge_info.append((u, v, dict(data)))
+
+    # Normalize common attributes to numeric when possible
+    for u, v, data in graph.edges(data=True):
+        # Try to coerce existing 'free_flow_time' to float
+        if 'free_flow_time' in data:
+            try:
+                data['free_flow_time'] = float(data.get('free_flow_time', 1.0))
+            except Exception:
+                # fallback to 1.0
+                data['free_flow_time'] = 1.0
+        else:
+            # Try computing from length and speed if available
+            length = data.get('length') or data.get('dist') or data.get('distance')
+            speed = data.get('speed')
+            try:
+                if length is not None and speed is not None:
+                    # assume length in km and speed in km/h -> time in hours -> convert to seconds
+                    lf = float(length)
+                    sf = float(speed)
+                    if sf > 0:
+                        data['free_flow_time'] = lf / sf
+                    else:
+                        data['free_flow_time'] = 1.0
+                else:
+                    data['free_flow_time'] = 1.0
+            except Exception:
+                data['free_flow_time'] = 1.0
+
+    print(f"Debug: Sample edge attributes before coercion: {sample_edge_info}")
+    # ...rest of function continues
+
+    # Agregar atributos de nodos si están disponibles
+    if node_df is not None and not node_df.empty:
+        # node loader may produce column 'node' or 'node_id'
+        node_col = None
+        for candidate in ['node', 'node_id', 'Node', 'NODE']:
+            if candidate in node_df.columns:
+                node_col = candidate
+                break
+
+        if node_col is None:
+            # fallback: use first column
+            node_col = list(node_df.columns)[0]
+
+        for _, row in node_df.iterrows():
+            nid = row[node_col]
+            try:
+                node_id = str(int(nid))
+            except Exception:
+                node_id = str(nid)
+
+            if graph.has_node(node_id):
+                graph.nodes[node_id]['x'] = row.get('x', None)
+                graph.nodes[node_id]['y'] = row.get('y', None)
+                graph.nodes[node_id]['pos'] = (row.get('x', None), row.get('y', None))
+                graph.nodes[node_id]['type'] = row.get('type', None)
+            else:
+                # Node exists in node file but not in network - add it to graph
+                graph.add_node(node_id)
+                graph.nodes[node_id]['x'] = row.get('x', None)
+                graph.nodes[node_id]['y'] = row.get('y', None)
+                graph.nodes[node_id]['pos'] = (row.get('x', None), row.get('y', None))
+                graph.nodes[node_id]['type'] = row.get('type', None)
+
+    # Verificar que el número de links en el grafo coincida con el DataFrame
+    num_links_df = len(link_df)
+    num_links_graph = graph.number_of_edges()
+    if num_links_df != num_links_graph:
+        print(f"Warning: DataFrame has {num_links_df} links, but graph has {num_links_graph} edges.")
+    else:
+        print(f"Verification: Graph has {num_links_graph} edges, matching DataFrame.")
+
+    return graph
+
+def build_graph_from_df(link_df: pd.DataFrame,
                         from_col: str = 'init_node',
                         to_col: str = 'term_node',
                         exclude_cols: Optional[List[str]] = None) -> nx.DiGraph:
@@ -37,7 +162,7 @@ def build_graph_from_df(df: pd.DataFrame,
     if '_merge' not in exclude_cols:
         exclude_cols.append('_merge')
 
-    attr_cols = [col for col in df.columns
+    attr_cols = [col for col in link_df.columns
                  if col not in [from_col, to_col] + exclude_cols]
 
     print(f"   📊 Construyendo grafo desde DataFrame...")
@@ -45,7 +170,7 @@ def build_graph_from_df(df: pd.DataFrame,
     print(f"      - Atributos a guardar: {len(attr_cols)} columnas")
     print(f"      - Columnas excluidas: {exclude_cols}")
 
-    for _, row in df.iterrows():
+    for _, row in link_df.iterrows():
         u = int(row[from_col])
         v = int(row[to_col])
 
@@ -187,11 +312,11 @@ def main(path: Optional[str], out: Optional[str], show_labels: bool = False):
 
     print(f"Cargando DataFrame desde: {path_obj if path_obj else 'ruta por defecto'}")
     # load_network_df is colocated in processing_modules.network_loader; import relatively to avoid absolute package paths
-    from .network_loader import load_network_df
-    df = load_network_df(path_obj)
-    print(f"DataFrame cargado: {df.shape[0]} filas, {df.shape[1]} columnas")
+    from ._network_loader import load_network_df
+    link_df = load_network_df(path_obj)
+    print(f"DataFrame cargado: {link_df.shape[0]} filas, {link_df.shape[1]} columnas")
 
-    G = build_graph_from_df(df)
+    G = build_graph_from_df(link_df)
     print(f"Grafo creado: {G.number_of_nodes()} nodos, {G.number_of_edges()} aristas")
 
     out_path = Path(out) if out else Path('outputs/figures/network_graph.png')

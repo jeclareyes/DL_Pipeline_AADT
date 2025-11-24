@@ -39,9 +39,9 @@ def main():
 
     # 2. Verificar scripts
     print("\n2. SCRIPTS DE ENTRENAMIENTO")
-    all_ok &= check_file("../src/models/Graph_Matcher/cyclic_model.py", "Modelo")
-    all_ok &= check_file("../src/models/Graph_Matcher/cyclic_model_data_ingestion.py", "Data Loader")
-    all_ok &= check_file("../src/models/Graph_Matcher/train_cyclic_model.py", "Script de entrenamiento")
+    all_ok &= check_file("../src/components/models/Cyclic_Model/cyclic_model.py", "Modelo")
+    all_ok &= check_file("../src/components/models/Cyclic_Model/cyclic_model_data_ingestion.py", "Data Loader")
+    all_ok &= check_file("../src/components/models/Cyclic_Model/train_cyclic_model.py", "Script de entrenamiento")
 
     # 3. Verificar datos
     print("\n3. DATOS DE LINKÖPING")
@@ -181,7 +181,7 @@ def main():
         print("✅ VERIFICACIÓN COMPLETADA - TODO LISTO PARA ENTRENAMIENTO")
         print("=" * 80)
         print("\nPara iniciar el entrenamiento, ejecutar:")
-        print("   python src/models/Graph_Matcher/train_cyclic_model.py --config configs/linkoping.yaml")
+        print("   python src/models/Cyclic_Model/train_cyclic_model.py --config configs/linkoping.yaml")
         print("\nO usar el script rápido:")
         print("   train_linkoping.bat")
         return 0
