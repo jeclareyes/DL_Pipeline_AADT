@@ -1,18 +1,40 @@
+# configs/training/training.yaml
+# =============================================================================
 
-dataset: Linköping
-
-data:
-  root: data/processed # Define la raíz donde se encuentra la carpeta 'raw'
-
-# Top-level data namespace expected by the code
+# Input Routes para el entrenamiento
+# El código de entrenamiento espera encontrar esto en cfg.training.input_routes
 input_routes:
-  graph: ${data.root}/${dataset}/${dataset}_graph.pkl
-  route_cache: ${data.root}/${dataset}/routing_cache/${dataset}_kshortest_paths.pkl
-  od_matrix: ${data.root}/${dataset}/${dataset}_od_matrix.npz
-  link_df : ${data.root}/${dataset}/${dataset}_link_data.parquet
+  # Usamos ${data.base_path} que viene de Linköping.yaml
+  graph: ${data.base_path}/${data.graph_file}
+  route_cache: ${data.base_path}/${data.routing_cache_file}
+  od_matrix: ${data.base_path}/${data.od_matrix_file}
+  link_df: ${data.base_path}/${data.link_data_file}
 
-# Hiperparámetros de entrenamiento para training_pipeline.py
+# Hiperparámetros del Entrenamiento (Optimizador, Loops, etc.)
 epochs: 100
 batch_size: 1
-lr: 0.001 # Nota: en tu código usas cfg.training.lr, asegúrate que la clave coincida
-# Si usas weight_decay u otros en el código, agrégalos aquí también.
+lr: 0.001
+weight_decay: 1e-5
+
+# Configuración del Optimizador
+optimizer: "adam"
+grad_clip_norm: 1.0
+
+# Scheduler (Control de tasa de aprendizaje)
+scheduler: "reduce_on_plateau"
+scheduler_params:
+  factor: 0.5
+  patience: 10
+  min_lr: 1e-6
+
+# Early Stopping (Parada temprana si no mejora)
+early_stopping:
+  enabled: true
+  patience: 20
+  min_delta: 0.001
+
+# Configuración de Hardware
+device: "cuda"  # 'cuda', 'cpu', o 'auto'
+
+# Validación
+val_frequency: 5

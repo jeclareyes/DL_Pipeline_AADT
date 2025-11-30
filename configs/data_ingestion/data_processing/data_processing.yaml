@@ -1,35 +1,48 @@
 # File: configs/data_ingestion/data_processing/data_processing.yaml
 # =============================================================================
-dataset: Linköping
 
-multiday_od: true
+
+dataset: ${data.dataset}  # Nombre del dataset, viene de Linköping.yaml
+multiday_od: true # TODO esto depende del dataset, ¿debería ir en Linköping.yaml?
 random_seed: 42
-volume_year: 2022
-
-data:
-  root: data # Define la raíz donde se encuentra la carpeta 'raw'
+volume_year: 2022 # TODO esto depende del dataset, ¿debería ir en Linköping.yaml?
+                  # TODO Sin embargo,es el año que vamos a procesar. Todavía no se ha decido si dejar un solo año,
+                  # TODO o si dejar múltiples años y que sea en el proceso de sampling o training donde se filtre
 
 # Top-level data namespace expected by the code
+
+# TODO, estricamente estas rutas no cambian. Cambian sus nombres pero en función del nombre del dataset
+# TODO ¿deberían ir en config.yaml global directamente?
+
 input_routes:
-  general_route: ${data.root}/raw/${dataset}
-  flow_route: ${input_routes.general_route}/${dataset}_flow.tntp
-  network_route: ${input_routes.general_route}/${dataset}_net.tntp   # fixed typo
-  node_route: ${input_routes.general_route}/${dataset}_node.tntp
-  routes_route: ${input_routes.general_route}/${dataset}_routes.tntp
-  trips_route: ${input_routes.general_route}/${dataset}_trips.tntp
+  # CAMBIO CLAVE: Usamos ${paths.data_raw} (de config.yaml) y ${data.dataset} (de Linköping.yaml)
+  general_route: ${paths.data_raw}/${data.dataset}
+
+  # Referencias relativas dentro de este mismo bloque para limpieza
+  flow_route: ${.general_route}/${data.dataset}_flow.tntp
+  network_route: ${.general_route}/${data.dataset}_net.tntp
+  node_route: ${.general_route}/${data.dataset}_node.tntp
+  routes_route: ${.general_route}/${data.dataset}_routes.tntp
+  trips_route: ${.general_route}/${data.dataset}_trips.tntp
+
+# TODO ¿Deberían ir estas rutas de output en config.yaml global también?
 
 output_routes:
-  root: ${hydra:runtime.cwd}/data
-  processed_route: ${output_routes.root}/processed/${dataset}
-  routing_cache_route: ${output_routes.root}/processed/${dataset}/routing_cache/${dataset}_kshortest_paths.pkl
+  # Usamos ${paths.root_dir} para coherencia con config.yaml
+  root: ${paths.root_dir}/data
+
+  processed_route: ${.root}/processed/${data.dataset}
+  routing_cache_route: ${.root}/processed/${data.dataset}/routing_cache/${data.dataset}_kshortest_paths.pkl
+
+# TODO
 
 route_calculation:
   k_paths: 10
-  algorithm: yen_astar # Options: dijkstra, yen_astar, yen
-  execution_mode: parallel # Options: sequential, parallel
+  algorithm: yen_astar
+  parallel_mode: True # True | False
   weight: free_flow_time
-  force_recompute: false
-  n_workers: 7
+  force_recompute: true # True | False
+  n_workers: 8
   chunk_size: 100
-  # Opciones: 'rustworkx' (Rápido, Threads) | 'networkx' (Lento, Procesos)
-  engine: "networkx"
+  engine: "networkx" # 'networkx' | 'rustworkx'
+  export_as_dict: true # True | False

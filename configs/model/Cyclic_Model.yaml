@@ -1,15 +1,30 @@
 # configs/model/Cyclic_Model.yaml
+# =============================================================================
 
-# 1. Apunta a tu clase existente
+# 1. Target: Apunta a la clase Python exacta
 _target_: src.components.models.Cyclic_Model.cyclic_model.CyclicODModel
 
-# 2. Hiperparámetros (Ya los tienes, Hydra los pasa automáticamente)
-hidden_dim: 64
-feature_dim: 32
+# 2. Arquitectura (Hiperparámetros del modelo)
+hidden_dim: 128        # Ajustado a un valor estándar (antes tenías 64 en uno y 256 en otro)
+feature_dim: 64
+num_structures: 5
 dropout: 0.1
-cost_function_type: 'bpr'
 
-# 3. Datos Dinámicos (Indica que son obligatorios pero se pasan desde Python)
+# 3. Pesos de la Función de Pérdida (Loss Weights)
+# El modelo necesita saber cuánto pesan los diferentes objetivos
+loss_weights:
+  w_flow: 1.0
+  w_od: 1.0
+  w_reg: 0.01
+  w_physics: 0.5
+
+# 4. Configuración de la Función de Costo (VDF)
+# Inyectamos la configuración que viene del bloque 'vdf' (definido en config.yaml -> defaults)
+vdf_config: ${vdf}
+
+# 5. Datos Dinámicos
+# Estos valores se marcan como obligatorios (???) porque Python debe inyectarlos
+# al instanciar el modelo basándose en los datos cargados.
 num_links: ???
 num_od_pairs: ???
 t0: ???
@@ -18,12 +33,3 @@ route_masks: ???
 od_pair_indices: ???
 num_link_groups: ???
 link_group: ???
-
-# Pesos de Loss (Para usarlos en el pipeline)
-loss_weights:
-  w_flow: 1.0
-  w_od: 1.0
-  w_reg: 0.01
-
-# Aquí inyectamos la configuración de VDF seleccionada (bpr, conical, etc.)
-vdf_config: ${vdf}

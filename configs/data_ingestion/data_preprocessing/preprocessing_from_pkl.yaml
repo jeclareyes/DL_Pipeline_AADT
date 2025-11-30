@@ -1,2 +1,10 @@
-dataset: Linköping
-pickle_data_path: ${paths.data_raw}/Linköping/pickle/Linköping_Pickle_Data.pkl
+# configs/data_ingestion/data_preprocessing/preprocessing_from_pkl.yaml
+# =============================================================================
+
+# NOTA: Eliminamos 'dataset: Linköping' porque ya está definido globalmente.
+
+# Usamos las variables globales:
+# ${paths.data_raw} -> viene de config.yaml
+# ${data.dataset}   -> viene de configs/dataset/Linköping.yaml (o el que elijas)
+
+pickle_data_path: ${paths.data_raw}/${data.dataset}/pickle/${data.dataset}_Pickle_Data.pkl

@@ -61,7 +61,7 @@ class SamplingEngine:
         self.graph_route = Path(self.input_routes.get('graph_route')) if self.input_routes.get('graph_route') else None
 
         self.link_train_ratio = float(self.cfg.get('data_split', {}).get('link_train_ratio', 0.8))
-        self.strategy_name = self.cfg.get('strategy')
+        self.strategy_name = self.cfg.get('sampling', {}).get('strategy', self.cfg.get('strategy'))
 
         # mapping of strategy keys -> spec (module:Class or path to .py)
         self.strategy_map = self.cfg.get('sampling_strategies_routes', {})

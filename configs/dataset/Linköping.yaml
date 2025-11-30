@@ -1,191 +1,53 @@
 # @package _global_
-# Configuration for Linköping
+# configs/dataset/Linköping.yaml
+
 # =============================================================================
 
 # DATA
+# Responsabilidad: Definir la ubicación física de los archivos de este dataset.
 # =============================================================================
 data:
   dataset: "Linköping"
+  # Usamos la variable global paths.root_dir definida en config.yaml si es necesario,
+  # o una ruta relativa estándar.
   base_path: "data/processed/Linköping"
 
-  # Input files
+  # Nombres de archivo específicos para este dataset
   graph_file: "Linköping_graph.pkl"
   link_data_file: "Linköping_link_data.parquet"
   od_matrix_file: "Linköping_od_matrix.npz"
+
+  # Cache de rutas (usamos interpolación para ser consistentes)
   routing_cache_file: "routing_cache/${data.dataset}_kshortest_paths.pkl"
 
-  # Volume year to use for training
-  volume_year: 2022  # Options: 2018, 2019, 2022, 2023
-
-  # Data split
-  train_split: 0.8  # 80% for training, 20% for testing
+  # Configuración del escenario de datos
+  volume_year: 2022
+  train_split: 0.8
   random_seed: 42
 
 # PARTIAL DATA SAMPLING
+# (Opcional: Si este dataset requiere un sampling específico por defecto)
 # =============================================================================
 sampling:
-  # Fraction of observed flows for training
-  flow_rate: 0.8  # 30% of observed flows are used
-
-  # Fraction of known OD demands
-  od_rate: 1.0  # 20% of OD are known
-
-  # Sampling strategy
-  strategy: "random"  # Options: random, spatial_lhs
-
-  # Sampling basis
-  sampling_basis: "link_wise_based"  # Options: link_wise_based, traffic_counts_based
-
-  # Random seed for reproducibility
+  flow_rate: 0.8
+  od_rate: 1.0
+  strategy: "random"
+  sampling_basis: "link_wise_based"
   random_seed: 42
 
 # NETWORK
+# Parámetros físicos de la red (específicos de la topología de Linköping)
 # =============================================================================
 network:
-  # k-shortest routes
   k_paths: 10
   max_route_length: 130
+  cost_function: "bpr"
 
-  # Cost function
-  cost_function: "bpr"  # Options: bpr, conic, akcelik
-
-  # BPR parameters by link type (learnable)
+  # Parámetros iniciales de BPR (pueden ser específicos de la red)
   bpr_params:
     learn_alpha: true
     learn_beta: true
-    alpha_init: 0.15  # Initial value
-    beta_init: 4.0    # Initial value
+    alpha_init: 0.15
+    beta_init: 4.0
     alpha_bounds: [0.01, 1.0]
     beta_bounds: [1.0, 10.0]
-
-# ROUTING
-# =============================================================================
-routing:
-  # Route computation settings
-  route_source: compute
-  num_routes: 10
-  route_algorithm: "yen_astar"
-  execution_mode: "parallel"
-  use_route_cache: true
-  force_recompute: false
-
-  # Other pipeline settings
-  case: 'Linköping'
-  multiday: false
-  save_graph: true
-  save_image: false
-
-# MODEL
-# =============================================================================
-model:
-  # Type of model to use
-  # Options:
-  #   - cyclic_model: Modelo original de asignación cíclica
-  #   - cyclic_model_ultra: Modelo mejorado con arquitectura avanzada
-  type: "cyclic_model_ultra"
-
-  # Architecture parameters (shared by both models)
-  hidden_dim: 256      # Hidden dimension for neural networks
-  feature_dim: 128     # Feature dimension for embeddings
-  num_structures: 5    # Number of structures in GraphMatcher
-  dropout: 0.1         # Dropout rate for regularization
-
-  # Model-specific parameters for cyclic_model_ultra
-  ultra_params:
-    use_attention: true           # Use attention mechanism
-    num_attention_heads: 4        # Number of attention heads
-    use_residual_connections: true  # Use residual connections
-    layer_norm: true              # Use layer normalization
-
-  # Loss function weights
-  loss_weights:
-    w_flow: 1.0      # Weight for flow loss (MSE on link flows)
-    w_od: 1.0        # Weight for OD loss (MSE on OD demands)
-    w_reg: 0.01      # Weight for regularization (L2 on parameters)
-    w_physics: 0.5   # Weight for physical consistency (flow conservation)
-
-# TRAINING
-# =============================================================================
-training:
-  # Hyperparameters
-  epochs: 100
-  batch_size: 1
-  learning_rate: 0.001
-  weight_decay: 1e-5
-
-  # Optimizer
-  optimizer: "adam"  # Options: adam, sgd, adamw
-  scheduler: "reduce_on_plateau"  # Options: none, step, cosine, reduce_on_plateau
-
-  # Scheduler config
-  scheduler_params:
-    factor: 0.5
-    patience: 10
-    min_lr: 1e-6
-
-  # Gradient clipping
-  grad_clip_norm: 1.0
-
-  # Early stopping
-  early_stopping:
-    enabled: true
-    patience: 20
-    min_delta: 0.001
-
-  # Validation
-  val_frequency: 5  # Validate every N epochs
-
-  # Device
-  device: "cuda"  # Options: cuda, cpu, auto
-
-# OUTPUTS
-# =============================================================================
-outputs:
-  # Base directory
-  base_dir: "outputs"
-
-  # Subdirectories
-  models_dir: "models"
-  logs_dir: "logs"
-  tables_dir: "tables/Linköping"
-  figures_dir: "figures/Linköping"
-
-  # Checkpoints
-  save_best: true
-  save_final: true
-  save_checkpoints: true
-  checkpoint_frequency: 50  # Save every N epochs
-
-  # Logging
-  log_level: "INFO"
-  tensorboard: true
-  wandb: false  # Weights & Biases (requires configuration)
-
-# EVALUATION
-# =============================================================================
-evaluation:
-  # Comparison with Frank-Wolfe
-  compare_frank_wolfe: true
-  frank_wolfe_config:
-    max_iterations: 100
-    convergence_threshold: 0.01
-    use_cache: false
-
-  # Metrics to report
-  metrics:
-    - "mse"
-    - "mae"
-    - "mape"
-    - "r2"
-    - "correlation"
-
-  # Analysis by categories
-  analyze_by:
-    - "link_type"
-    - "volume_bins"
-    - "observed_status"  # Observed vs unobserved
-
-  # Export results
-  export_comparison_table: true
-  export_predictions: true
-  export_metrics_summary: true

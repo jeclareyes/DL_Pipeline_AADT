@@ -17,6 +17,9 @@ import hydra
 from hydra.utils import to_absolute_path
 from omegaconf import DictConfig, OmegaConf
 
+
+
+
 # Definición de PROYECT_ROOT para que siempre se ejecute desde la raíz del proyecto
 
 class DataManager:
@@ -35,7 +38,8 @@ class DataManager:
 
         #%% Cargando configuración desde Hydra
 
-        self.config = cfg if isinstance(cfg, DictConfig) else None
+        self.config = cfg # TODO se debe arreglar esto
+        # self.config = cfg if isinstance(cfg, DictConfig) else None
 
         if self.config is not None:
             # resolve data root via Hydra helper (makes paths absolute regardless of Hydra cwd)
@@ -142,9 +146,22 @@ class DataManager:
         link_df.to_parquet(link_data_path, index=False)
 
 
-@hydra.main(config_path="../../configs/data_ingestion/data_processing", config_name="data_processing")
+@hydra.main(config_path="../../configs", config_name="config")
 def main(cfg):
-    dm = DataManager(cfg=cfg)
+
+    from omegaconf import OmegaConf
+    from src.data_ingestion._config_schema import DataProcessingConfig
+    # Cargando configuración específica para data processing
+    dm_cfg = cfg.data_ingestion.data_processing
+    OmegaConf.resolve(dm_cfg) # Esto convierte todos los "${var}" en sus valores reales (strings/ints)
+    # Building a structured schema and merge to validate required fields/types
+    schema = OmegaConf.structured(DataProcessingConfig)
+    validated = OmegaConf.merge(schema, dm_cfg)
+    dp_instance = OmegaConf.to_object(validated) # This is optional, just to have a typed object
+
+    # Pasándole la configuración al DataManager
+    dm = DataManager(cfg=dp_instance)
+
     try:
         print("--- Cargando red de tráfico ---")
         # dm.load_network()

@@ -1,3 +1,5 @@
+import logging
+
 import hydra
 import torch
 import numpy as np
@@ -16,48 +18,46 @@ import os
 import sys
 import io
 
-# Parche para Windows: Forzar salida UTF-8 para soportar emojis en logs
 if os.name == 'nt':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
 
 def run_pipeline(cfg: DictConfig):
-    print(f"🚀 [HYDRA] Iniciando Pipeline. Modelo: {cfg.model._target_}")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[HYDRA] Iniciando Pipeline. Modelo: {cfg.model._target_}")
+    device = cfg.training.device
+    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Usando device: {device}")
 
     # --- 1. DATA INGESTION (Usando tu clase adaptada) ---
-    print("📊 Cargando datos estructurales...")
-    # Pasamos la config entera. El loader sacará las rutas de ahí.
+    print("Cargando datos estructurales...")
+    # config entera. El loader sacará las rutas de ahí.
     loader = LinkopingDataLoader(cfg)
 
     loader.load_all()
-    # Obtenemos los tensores estructurales (t0, capacity, masks)
-    # Tu método prepare_network_parameters() es CLAVE aquí.
+    # tensores estructurales (t0, capacity, masks)
+    # Method prepare_network_parameters() .
     network_params = loader.prepare_network_parameters()
 
     all_flows, train_mask, test_mask = loader.prepare_observed_flows()
     od_vector, od_mask = loader.prepare_od_demand_vector()
 
-    # --- 2. SAMPLING (Integrando tu engine) ---
+    # --- 2. SAMPLING (Integrando engine) ---
     print("🎲 Ejecutando Sampling Engine...")
-    # Tu SamplingEngine parece esperar un config dict.
-    # Hydra permite convertir su config a dict nativo si es necesario.
-    # Si tu engine usa internamente las claves de 'sampling.yaml', funcionará.
     sampling_engine = SamplingEngine(config=cfg)
 
-    # Supongamos que tu engine devuelve las máscaras muestreadas
-    # (Ajusta esto según el retorno real de tu engine.run())
+    # (Ajusta esto según el retorno real de engine.run())
     sampled_flow_mask = sampling_engine.run(save=False)
 
-    # Si tu engine no retorna la máscara OD, la generamos o la sacamos del loader
-    sampled_od_mask = od_mask  # Placeholder si no haces sampling de OD aún
+    # Si engine no retorna la máscara OD, generamos o sacamos del loader
+    sampled_od_mask = od_mask  # TODO hacer sampling de OD
 
-    # --- 3. INSTANCIACIÓN DEL MODELO (El momento mágico) ---
+    # --- 3. INSTANCIACIÓN DEL MODELO  ---
     print("⚙️ Construyendo Modelo Dinámicamente...")
 
     # Hydra toma los hiperparámetros del YAML (hidden_dim, etc.)
-    # Nosotros le "inyectamos" los tensores pesados que acabamos de cargar.
+    # Inyección de tensores
+    logging.info("Instanciando modelo con Hydra...")
     model = hydra.utils.instantiate(
         cfg.model,
         # Argumentos dinámicos (**kwargs)
@@ -74,19 +74,17 @@ def run_pipeline(cfg: DictConfig):
     model.to(device)
 
     # --- 4. PREPARACIÓN DE ENTRENAMIENTO ---
-    # Convertir a tensores para el DataLoader
-    true_flows_t = torch.FloatTensor(all_flows).unsqueeze(0)
-    true_od_t = torch.FloatTensor(od_vector).unsqueeze(0)
-    flow_mask_t = torch.FloatTensor(sampled_flow_mask).unsqueeze(0)
-    od_mask_t = torch.FloatTensor(sampled_od_mask).unsqueeze(0)
+    # Convertir a tensores y mover DIRECTAMENTE al device (GPU/CPU)
 
-    dataset = TrafficDataset(
-        true_flows_t.numpy(), true_od_t.numpy(),
-        flow_mask_t.numpy(), od_mask_t.numpy()
-    )
-    train_loader = DataLoader(dataset, batch_size=cfg.training.batch_size)
+    logging.info("Enviando tensores de flujos y pares OD al device...")
+    true_flows_t = torch.FloatTensor(all_flows).to(device)
+    true_od_t = torch.FloatTensor(od_vector).to(device)
+    flow_mask_t = torch.FloatTensor(sampled_flow_mask).to(device)
+    od_mask_t = torch.FloatTensor(sampled_od_mask).to(device)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.training.lr)
+    logging.info("Configurando optimizador y función de pérdida...")
+    # optimizer = torch.optim.Adam(model.parameters(), lr=cfg.training.lr)
+    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.training.lr, weight_decay=cfg.training.weight_decay)
 
     # Loss weights desde el YAML del modelo
     criterion = PartialDataLoss(
@@ -96,41 +94,57 @@ def run_pipeline(cfg: DictConfig):
     ).to(device)
 
     # --- 5. LOOP DE ENTRENAMIENTO ---
-    print("🔥 Iniciando Epochs...")
+    logging.info("Iniciando loop de entrenamiento (Full Batch)...")
     model.train()
+
+    min_iters = 2
+    max_iters_target = cfg.model.get('max_iters', 10)
+
     for epoch in range(cfg.training.epochs):
-        for batch in train_loader:
-            # Desempaquetar batch (ajusta según tu TrafficDataset)
-            b_flows, b_od, b_flow_mask, b_od_mask = batch
+        # PASAMOS TODOS LOS DATOS DE GOLPE
+        # Nota: Asegúrate de que tu modelo acepte las dimensiones sin la dimensión extra del batch
+        # O añade una dimensión 'falsa' de batch si el modelo lo espera: .unsqueeze(0)
 
-            # Mover a GPU
-            b_flows = b_flows.to(device)
-            b_flow_mask = b_flow_mask.to(device)
+        """# Cálculo dinámico de iteraciones
+        # Subimos 1 iteración cada 5 épocas, por ejemplo
+        if epoch < 5:
+            current_sue_iters = 1  # Fase inicial muy rápida
+        else:
+            # Crecimiento progresivo
+            growth = (epoch - 5) // 5
+            current_sue_iters = min(min_iters + growth, max_iters_target)
 
-            optimizer.zero_grad()
+        # Imprimir para control
+        if epoch % 10 == 0:
+            print(f"Epoch {epoch} | SUE Iters: {current_sue_iters}")"""
 
-            # Forward
-            outputs = model(
-                observed_flows=b_flows,
-                flow_mask=b_flow_mask,
-                warmup=(epoch < 5)
-            )
 
-            # Loss
-            loss_dict = criterion(
-                predicted_flows=outputs['reconstructed_flows'],
-                true_flows=b_flows,
-                flow_mask=b_flow_mask,
-                # ... pasa el resto de argumentos a tu loss ...
-                learned_alpha=outputs.get('learned_alpha'),
-                learned_beta=outputs.get('learned_beta')
-            )
+        optimizer.zero_grad()
 
-            loss_dict['total_loss'].backward()
-            optimizer.step()
+        # Forward
+        outputs = model(
+            observed_flows=true_flows_t,
+            flow_mask=flow_mask_t,
+            warmup=(epoch < 5)
+        )
+
+        # Loss
+        loss_dict = criterion(
+            predicted_flows=outputs['reconstructed_flows'],
+            true_flows=true_flows_t,
+            flow_mask=flow_mask_t,
+            predicted_od=outputs['estimated_demand'],
+            true_od=true_od_t,
+            od_mask=od_mask_t,
+            learned_alpha=outputs.get('learned_alpha'),
+            learned_beta=outputs.get('learned_beta')
+        )
+
+        loss_dict['total_loss'].backward()
+        optimizer.step()
 
         if epoch % 10 == 0:
-            print(f"Epoch {epoch}: Loss {loss_dict['total_loss'].item():.4f}")
+            logging.info(f"""Epoch {epoch}: Loss {loss_dict['total_loss'].item():.4f} - Flow Loss {loss_dict['l_flow'].item():.4f} - OD Loss {loss_dict['l_od'].item():.4f} - Reg Loss {loss_dict['l_reg'].item():.4f}""")
 
 
 @hydra.main(version_base=None, config_path="../../configs", config_name="config")

@@ -340,7 +340,7 @@ def create_partial_data_masks(
             - 'link_wise_based': Muestrea links individuales.
             - 'traffic_counts_based': Agrupa links consecutivos con mismo flujo.
     """
-    logger.info(f"\n   Creando máscaras de muestreo (Year: {volume_year})")
+    logger.info(f"Creando máscaras de muestreo (Year: {volume_year})")
 
     # 1. Extraer datos del grafo a estructura tabular interna
     # Esto desacopla la lógica compleja de sampling de la estructura de grafo

@@ -1,0 +1,13 @@
+# experiment_list.yaml
+# Esta lista se define bajo la clave 'override' para ser procesada por el sweeper.
+# Los valores se separan por comas.
+
+defaults:
+  - override /hydra/sweeper: list
+
+hydra:
+  sweeper:
+    params:
+      - pam1=a, pam2=y  # Run 1: pam1=a, pam2=y
+      - pam1=a, pam2=x  # Run 2: pam1=a, pam2=x
+      - pam1=b, pam2=z  # Run 3: pam1=b, pam2=z

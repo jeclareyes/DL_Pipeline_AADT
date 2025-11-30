@@ -2,7 +2,7 @@
 Data Ingestion para Cyclic Model - Linköping Traffic Assignment
 
 Este módulo maneja la carga y preparación de datos de Linköping para el CyclicODModel.
-Adaptado para funcionar con Hydra.
+Adaptado para funcionar con Hydra de manera robusta.
 
 Autor: Sistema de Acoplamiento Linköping
 Fecha: Noviembre 2025
@@ -19,9 +19,6 @@ from typing import Dict, Tuple, List, Optional
 import logging
 from omegaconf import DictConfig, OmegaConf
 
-# Import sampling utilities
-# from src.train.sampling import create_partial_data_masks
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -35,83 +32,82 @@ class LinkopingDataLoader:
     def __init__(self, cfg: DictConfig):
         """
         Inicializa el cargador de datos usando la configuración de Hydra.
-
-        Args:
-            cfg: Configuración completa de Hydra (DictConfig)
         """
         self.cfg = cfg
-        # Alias para mantener compatibilidad con métodos existentes que usan self.config['data']...
-        self.config = cfg
 
-        # 1. Resolver el path base desde la configuración
-        # Intentamos obtener la ruta desde 'data.base_path' (común en Linköping.yaml)
-        # o desde 'paths.data_processed' (si usas estructura global de paths)
-        if hasattr(self.cfg, 'data') and hasattr(self.cfg.data, 'base_path'):
-            path_str = self.cfg.data.base_path
-        elif hasattr(self.cfg, 'paths') and hasattr(self.cfg.paths, 'data_processed'):
-            path_str = self.cfg.paths.data_processed
+        # --- 1. RESOLUCIÓN ROBUSTA DE CONFIGURACIÓN ---
+        # Detectamos si 'data' está en la raíz (Global) o anidado en 'dataset'
+        if 'data' in self.cfg:
+            self.data_cfg = self.cfg.data
+            self.network_cfg = self.cfg.get('network', {})
+            self.sampling_cfg = self.cfg.get('sampling', {})
+            logger.info("Configuración cargada desde namespace GLOBAL (Correcto).")
+        elif 'dataset' in self.cfg and 'data' in self.cfg.dataset:
+            self.data_cfg = self.cfg.dataset.data
+            self.network_cfg = self.cfg.dataset.get('network', {})
+            self.sampling_cfg = self.cfg.dataset.get('sampling', {})
+            logger.warning("Configuración encontrada bajo 'dataset'. Se recomienda usar '# @package _global_' en el YAML.")
         else:
-            # Fallback por defecto
-            path_str = "data/processed/Linkoping"
-            logger.warning(f"   ⚠️ No se encontró 'base_path' en config. Usando default: {path_str}")
+            # Fallback crítico para evitar crash inmediato, lanzará error descriptivo luego
+            logger.error("No se encontró el bloque 'data' en la configuración.")
+            self.data_cfg = DictConfig({'volume_year': 2022}) # Dummy para evitar crash en init
+
+        # Alias para compatibilidad
+        self.config = self.cfg
+
+        # --- 2. RESOLVER PATH BASE ---
+        path_str = self.data_cfg.get('base_path', None)
+
+        if not path_str and hasattr(self.cfg, 'paths'):
+             path_str = f"{self.cfg.paths.data_processed}/Linköping"
+
+        if not path_str:
+            path_str = "data/processed/Linköping"
+            logger.warning(f"'base_path' no definido. Usando default: {path_str}")
 
         config_base = Path(path_str)
 
-        # 2. Lógica de recuperación de rutas (Smart Path Finding)
-        # Mantenemos tu lógica original para manejar problemas de encoding/rutas en Windows
+        # Lógica Smart Path Finding (manejo de encoding Windows)
         if config_base.exists():
             self.base_path = config_base
-            logger.info(f"   ✓ Usando path del config: {self.base_path}")
+            logger.info(f"Usando path: {self.base_path}")
         else:
-            # Buscar el directorio directamente usando listdir para evitar problemas de encoding
-            # Intentamos buscar en la raiz del proyecto o relativo al cwd
+            # Búsqueda manual insensible a encoding
             processed_dir = Path("data/processed")
             if not processed_dir.exists():
-                # Si estamos corriendo desde src/train, quizás data está dos niveles arriba
-                processed_dir = Path("../../data/processed")
+                processed_dir = Path("../../data/processed") # Intento relativo
 
-            linkoping_dir = None
+            found = False
             if processed_dir.exists():
                 for item in processed_dir.iterdir():
-                    # Buscamos carpetas que parezcan ser de Linkoping
-                    if item.is_dir() and ('link' in item.name.lower() or 'Link' in item.name):
-                        # Verificar que tenga archivos del proyecto para confirmar
-                        if list(item.glob('*_graph.pkl')):
-                            linkoping_dir = item
-                            break
+                    if item.is_dir() and 'link' in item.name.lower():
+                        self.base_path = item
+                        logger.info(f"Directorio autodetectado: {self.base_path}")
+                        found = True
+                        break
 
-            if linkoping_dir:
-                self.base_path = linkoping_dir
-                if 'link' in linkoping_dir.name.lower() and linkoping_dir.name != path_str.split('/')[-1]:
-                    logger.info(f"   ⚠️ Path ajustado por encoding/ubicación: {self.base_path}")
-            else:
-                # Fallback final al path del config (aunque no exista, para que el error sea claro después)
+            if not found:
                 self.base_path = config_base
-                logger.warning(f"   ⚠️ No se pudo autodetectar el directorio. Usando config: {self.base_path}")
+                logger.warning(f"No se encontró el directorio físico. Se usará: {self.base_path}")
 
-        # Datos cargados (Inicialización)
+        # Inicialización de variables
         self.graph: Optional[nx.DiGraph] = None
         self.link_data: Optional[pd.DataFrame] = None
         self.od_matrix: Optional[sparse.csr_matrix] = None
         self.routes_data: Optional[Dict] = None
         self.edge_list: Optional[List[Tuple]] = None
-
-        # Parámetros procesados
         self.network_params: Optional[Dict] = None
 
-        logger.info(f"📁 LinkopingDataLoader inicializado")
-        logger.info(f"   Base path: {self.base_path}")
+        logger.info(f" LinkopingDataLoader inicializado")
 
-        # Acceso seguro a volume_year usando OmegaConf (maneja puntos como diccionarios)
-        vol_year = self.config.data.get('volume_year', 'Unknown')
+        # Acceso seguro a volume_year
+        vol_year = self.data_cfg.get('volume_year', 'Unknown')
         logger.info(f"   Volume year: {vol_year}")
 
     def load_all(self) -> Tuple[nx.DiGraph, sparse.csr_matrix, pd.DataFrame, Dict]:
-        """
-        Carga todos los datos necesarios.
-        """
+        """Carga todos los datos necesarios."""
         logger.info(f"\n{'='*80}")
-        logger.info(f"📊 Cargando datos de Linköping")
+        logger.info(f"Cargando datos de Linköping")
         logger.info(f"{'='*80}")
 
         self.graph = self._load_graph()
@@ -120,460 +116,288 @@ class LinkopingDataLoader:
         self.routes_data = self._load_routes()
 
         self._validate_data()
-
         return self.graph, self.od_matrix, self.link_data, self.routes_data
 
     def _load_graph(self) -> nx.DiGraph:
         """Carga el grafo de red."""
-        # Acceso estilo objeto con Hydra: self.config.data.graph_file
-        graph_file = self.config.data.graph_file
-        graph_path = self.base_path / graph_file
-
-        # Si el archivo no existe, buscar con glob (encoding issues)
-        if not graph_path.exists():
-            pattern = graph_file.replace('ö', '*').replace('ä', '*').replace('å', '*')
-            matches = list(self.base_path.glob(pattern))
-            if matches:
-                graph_path = matches[0]
-            else:
-                # Intentar buscar cualquier archivo _graph.pkl
-                matches = list(self.base_path.glob('*_graph.pkl'))
-                if matches:
-                    graph_path = matches[0]
-                    logger.warning(f"   ⚠️ Usando archivo alternativo: {graph_path.name}")
-
-        logger.info(f"   📍 Cargando grafo: {graph_path}")
-
-        with open(graph_path, 'rb') as f:
-            graph = pickle.load(f)
-
-        logger.info(f"      ✓ Nodos: {graph.number_of_nodes()}")
-        logger.info(f"      ✓ Enlaces: {graph.number_of_edges()}")
-
-        return graph
+        graph_file = self.data_cfg.get('graph_file', 'Linköping_graph.pkl')
+        return self._smart_load(graph_file, "Grafo", pickle_load=True)
 
     def _load_od_matrix(self) -> sparse.csr_matrix:
         """Carga la matriz OD sparse."""
-        od_file = self.config.data.od_matrix_file
-        od_path = self.base_path / od_file
+        od_file = self.data_cfg.get('od_matrix_file', 'Linköping_od_matrix.npz')
 
-        # Si el archivo no existe, buscar con glob (encoding issues)
-        if not od_path.exists():
-            pattern = od_file.replace('ö', '*').replace('ä', '*').replace('å', '*')
-            matches = list(self.base_path.glob(pattern))
-            if matches:
-                od_path = matches[0]
-            else:
-                matches = list(self.base_path.glob('*_od_matrix.npz'))
-                if matches:
-                    od_path = matches[0]
-                    logger.warning(f"   ⚠️ Usando archivo alternativo: {od_path.name}")
+        file_path = self._resolve_file_path(od_file)
+        logger.info(f"Cargando matriz OD: {file_path}")
 
-        logger.info(f"   📍 Cargando matriz OD: {od_path}")
-
-        data = np.load(od_path)
+        data = np.load(file_path)
         od_matrix = sparse.csr_matrix(
             (data['data'], data['indices'], data['indptr']),
             shape=tuple(data['shape'])
         )
-
-        logger.info(f"      ✓ Shape: {od_matrix.shape}")
-        logger.info(f"      ✓ Non-zero elements: {od_matrix.nnz}")
-        # logger.info(f"      ✓ Sparsity: {od_matrix.nnz / (od_matrix.shape[0] * od_matrix.shape[1]):.2%}")
-
-        # Contar NaNs
-        num_nans = np.isnan(od_matrix.data).sum()
-        logger.info(f"      ✓ NaN values: {num_nans}")
-
+        logger.info(f"Shape: {od_matrix.shape}")
         return od_matrix
 
     def _load_link_data(self) -> pd.DataFrame:
         """Carga datos de enlaces."""
-        link_file = self.config.data.link_data_file
-        link_path = self.base_path / link_file
+        link_file = self.data_cfg.get('link_data_file', 'Linköping_link_data.parquet')
+        file_path = self._resolve_file_path(link_file)
 
-        # Si el archivo no existe, buscar con glob (encoding issues)
-        if not link_path.exists():
-            pattern = link_file.replace('ö', '*').replace('ä', '*').replace('å', '*')
-            matches = list(self.base_path.glob(pattern))
-            if matches:
-                link_path = matches[0]
-            else:
-                matches = list(self.base_path.glob('*_link_data.parquet'))
-                if matches:
-                    link_path = matches[0]
-                    logger.warning(f"   ⚠️ Usando archivo alternativo: {link_path.name}")
+        logger.info(f"Cargando datos de enlaces: {file_path}")
+        link_data = pd.read_parquet(file_path)
 
-        logger.info(f"   📍 Cargando datos de enlaces: {link_path}")
-
-        link_data = pd.read_parquet(link_path)
-
-        logger.info(f"      ✓ Enlaces: {len(link_data)}")
-        # logger.info(f"      ✓ Columnas: {list(link_data.columns)}")
-
-        # Verificar columnas de volumen
+        # Verificar columnas
         volume_cols = [c for c in link_data.columns if 'Volume' in c]
-        logger.info(f"      ✓ Años disponibles: {volume_cols}")
-
+        logger.info(f"Enlaces: {len(link_data)}. Años: {volume_cols}")
         return link_data
 
     def _load_routes(self) -> Dict:
-        """Carga rutas precalculadas y las convierte a tensores si es necesario."""
-        routes_file = self.config.data.routing_cache_file
+        """Carga rutas precalculadas."""
+        routes_file = self.data_cfg.get('routing_cache_file', 'routing_cache/Linköping_kshortest_paths.pkl')
+
+        # Intentar ruta configurada
         routes_path = self.base_path / routes_file
 
-        # Verificar si existe
+        # Fallbacks inteligentes
         if not routes_path.exists():
-            # Buscar alternativas
-            alt_path = self.base_path / 'routing_cache' / 'kshortest_paths.pkl'
-            if alt_path.exists():
-                routes_path = alt_path
-            else:
-                # Intento final con nombre genérico en la raíz
-                routes_path = self.base_path / 'kshortest_paths.pkl'
+            fallbacks = [
+                self.base_path / 'routing_cache' / 'kshortest_paths.pkl',
+                self.base_path / 'kshortest_paths.pkl',
+                self.base_path / f"{self.data_cfg.get('dataset', 'Linköping')}_kshortest_paths.pkl"
+            ]
+            for p in fallbacks:
+                if p.exists():
+                    routes_path = p
+                    break
 
-        logger.info(f"   📍 Cargando rutas: {routes_path}")
-
+        logger.info(f"Cargando rutas: {routes_path}")
         if not routes_path.exists():
-            raise FileNotFoundError(f"No se encontró el archivo de rutas en {routes_path}")
+            raise FileNotFoundError(f"No se encontró archivo de rutas en: {routes_path}")
 
         with open(routes_path, 'rb') as f:
             raw_data = pickle.load(f)
 
-        # --- DETECCIÓN Y CONVERSIÓN DE FORMATO ---
-        # Si es el formato crudo {(u,v): [[path1], [path2]]}
+        # Conversión de formato si es necesario (Dictionary -> Tensors)
         first_key = next(iter(raw_data))
         if isinstance(first_key, tuple):
-            logger.info("      ⚠️ Formato crudo detectado (diccionario). Convirtiendo a tensores...")
+            logger.info("Formato crudo detectado (diccionario). Convirtiendo a tensores...")
+            return self._convert_routes_dict_to_tensor(raw_data)
 
-            # Necesitamos mapear los Node IDs a Índices 0..N para los tensores
-            node_list = sorted(list(self.graph.nodes()))
-            node_to_idx = {n: i for i, n in enumerate(node_list)}
+        return raw_data
 
-            od_pairs_list = []
-            routes_tensor_list = []
+    # --- HELPER METHODS ---
 
-            k_paths = self.config.network.k_paths
-            # Calculamos longitud máxima real o usamos la del config
-            max_len = 0
-            for paths in raw_data.values():
-                for p in paths:
-                    max_len = max(max_len, len(p))
+    def _resolve_file_path(self, filename: str) -> Path:
+        """Busca un archivo manejando caracteres especiales (ö, ä, etc.)"""
+        direct_path = self.base_path / filename
+        if direct_path.exists():
+            return direct_path
 
-            # Usamos -1 como padding para permitir que el nodo 0 exista
-            num_od = len(raw_data)
-            routes_tensor = np.full((num_od, k_paths, max_len), -1, dtype=np.int32)
-            od_pairs_array = np.zeros((num_od, 2), dtype=object)  # Object para permitir IDs string si los hay
+        # Búsqueda con comodines para caracteres especiales
+        safe_pattern = filename.replace('ö', '*').replace('ä', '*').replace('å', '*')
+        matches = list(self.base_path.glob(safe_pattern))
+        if matches:
+            return matches[0]
 
-            for i, ((u, v), paths) in enumerate(raw_data.items()):
-                od_pairs_array[i] = [u, v]
+        # Búsqueda genérica por extensión
+        ext = Path(filename).suffix
+        matches = list(self.base_path.glob(f"*{ext}"))
+        if matches:
+            logger.warning(f"Archivo exacto no encontrado. Usando alternativa: {matches[0].name}")
+            return matches[0]
 
-                # Procesar hasta k rutas
-                for k, path in enumerate(paths):
-                    if k >= k_paths: break
+        raise FileNotFoundError(f"No se encontró el archivo {filename} en {self.base_path}")
 
-                    # Convertir IDs de nodos a índices
-                    try:
-                        path_indices = [node_to_idx[n] for n in path]
-                        length = len(path_indices)
-                        routes_tensor[i, k, :length] = path_indices
-                    except KeyError as e:
-                        logger.warning(f"Nodo {e} en ruta {u}->{v} no existe en el grafo.")
+    def _smart_load(self, filename: str, desc: str, pickle_load: bool = False):
+        path = self._resolve_file_path(filename)
+        logger.info(f"Cargando {desc}: {path}")
+        if pickle_load:
+            with open(path, 'rb') as f:
+                return pickle.load(f)
+        return path
 
-            routes_data = {
-                'routes': routes_tensor,
-                'od_pairs': od_pairs_array
-            }
-        else:
-            # Ya es el formato procesado
-            routes_data = raw_data
+    def _convert_routes_dict_to_tensor(self, raw_data: Dict) -> Dict:
+        """Convierte diccionario de rutas a tensores."""
+        node_list = sorted(list(self.graph.nodes()))
+        node_to_idx = {n: i for i, n in enumerate(node_list)}
 
-        logger.info(f"      ✓ Routes shape: {routes_data['routes'].shape}")
-        return routes_data
+        k_paths = self.network_cfg.get('k_paths', 10)
+        num_od = len(raw_data)
+
+        # Calcular longitud máxima
+        max_len = 0
+        for paths in raw_data.values():
+            for p in paths:
+                max_len = max(max_len, len(p))
+
+        routes_tensor = np.full((num_od, k_paths, max_len), -1, dtype=np.int32)
+        od_pairs_array = np.zeros((num_od, 2), dtype=object)
+
+        for i, ((u, v), paths) in enumerate(raw_data.items()):
+            od_pairs_array[i] = [u, v]
+            for k, path in enumerate(paths):
+                if k >= k_paths: break
+                try:
+                    path_indices = [node_to_idx[n] for n in path]
+                    routes_tensor[i, k, :len(path_indices)] = path_indices
+                except KeyError:
+                    pass # Nodo no encontrado
+
+        return {'routes': routes_tensor, 'od_pairs': od_pairs_array}
 
     def _validate_data(self):
-        """Valida consistencia de los datos."""
-        logger.info(f"\n   🔍 Validando consistencia de datos...")
+        """Validación básica de consistencia."""
+        if self.graph and self.link_data is not None:
+            if self.graph.number_of_edges() != len(self.link_data):
+                logger.warning(f"Mismatch enlaces: Grafo={self.graph.number_of_edges()}, DF={len(self.link_data)}")
+            else:
+                logger.info("Consistencia de enlaces: OK")
 
-        # 1. Número de enlaces
-        num_edges_graph = self.graph.number_of_edges()
-        num_edges_df = len(self.link_data)
-
-        if num_edges_graph != num_edges_df:
-            logger.warning(f"      ⚠️ Mismatch en enlaces: Grafo={num_edges_graph}, DataFrame={num_edges_df}")
-        else:
-            logger.info(f"      ✓ Enlaces consistentes: {num_edges_graph}")
-
-        # 2. Matriz OD y rutas
-        num_od_pairs = self.od_matrix.shape[0] * self.od_matrix.shape[1]
-        num_routes = self.routes_data['routes'].shape[0]
-
-        if num_od_pairs != num_routes:
-            logger.warning(f"      ⚠️ Mismatch OD: Matriz={num_od_pairs}, Rutas={num_routes}")
-        else:
-            logger.info(f"      ✓ Pares OD consistentes: {num_od_pairs}")
-
-        # 3. Atributos de enlaces
-        sample_edge = list(self.graph.edges())[0]
-        edge_attrs = list(self.graph.edges[sample_edge].keys())
-        required_attrs = ['capacity', 'free_flow_time', 'length', 'link_type']
-
-        missing_attrs = [attr for attr in required_attrs if attr not in edge_attrs]
-        if missing_attrs:
-            logger.warning(f"      ⚠️ Atributos faltantes: {missing_attrs}")
-        else:
-            logger.info(f"      ✓ Todos los atributos requeridos presentes")
-
-    def prepare_observed_flows(self, year: Optional[int] = None,
-                                train_split: Optional[float] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """
-        Prepara flujos observados con split train/test.
-        """
-        if year is None:
-            year = self.config.data.volume_year
-        if train_split is None:
-            train_split = self.config.data.train_split
+    def prepare_observed_flows(self, year: Optional[int] = None, train_split: Optional[float] = None):
+        if year is None: year = self.data_cfg.get('volume_year', 2022)
+        if train_split is None: train_split = self.data_cfg.get('train_split', 0.8)
 
         volume_col = f'Volume_{year}'
-
         if volume_col not in self.link_data.columns:
-            raise ValueError(f"Columna {volume_col} no encontrada. Disponibles: {self.link_data.columns.tolist()}")
+            raise ValueError(f"Columna {volume_col} no encontrada.")
 
-        logger.info(f"\n   📊 Preparando flujos observados (año {year})...")
-
-        # Obtener flujos del año seleccionado
         flows = self.link_data[volume_col].values
-
-        # Identificar enlaces con observaciones válidas
-        valid_mask = ~np.isnan(flows)
-        # num_valid = valid_mask.sum()
-
-        # Rellenar NaNs con 0 para compatibilidad
         all_flows = np.nan_to_num(flows, nan=0.0)
 
-        # Split train/test solo en enlaces con observaciones
-        np.random.seed(self.config.data.random_seed)
-
-        # Índices de enlaces válidos
-        valid_indices = np.where(valid_mask)[0]
-
-        # Shuffle y split
-        np.random.shuffle(valid_indices)
-        split_idx = int(len(valid_indices) * train_split)
-
-        train_indices = valid_indices[:split_idx]
-        test_indices = valid_indices[split_idx:]
-
         # Crear máscaras
-        train_mask = np.zeros(len(flows), dtype=np.float32)
-        test_mask = np.zeros(len(flows), dtype=np.float32)
+        valid_indices = np.where(~np.isnan(flows))[0]
+        np.random.seed(self.data_cfg.get('random_seed', 42))
+        np.random.shuffle(valid_indices)
 
-        train_mask[train_indices] = 1.0
-        test_mask[test_indices] = 1.0
+        split_idx = int(len(valid_indices) * train_split)
+        train_mask = np.zeros_like(flows, dtype=np.float32)
+        test_mask = np.zeros_like(flows, dtype=np.float32)
 
-        logger.info(f"      ✓ Train: {len(train_indices)} enlaces")
-        logger.info(f"      ✓ Test: {len(test_indices)} enlaces")
+        train_mask[valid_indices[:split_idx]] = 1.0
+        test_mask[valid_indices[split_idx:]] = 1.0
 
+        logger.info(f" Train split: {len(valid_indices[:split_idx])} obs.")
         return all_flows, train_mask, test_mask
 
-    def prepare_od_demand_vector(self) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Convierte matriz OD sparse a vector denso.
-        """
-        logger.info(f"\n   📊 Preparando vector de demandas OD...")
-
-        # Convertir a denso
-        od_dense = self.od_matrix.toarray()
-
-        # Aplanar a vector
-        od_vector = od_dense.flatten()
-
-        # Contar válidos vs NaNs
-        num_valid = (~np.isnan(od_vector)).sum()
-        # num_nan = np.isnan(od_vector).sum()
-
-        logger.info(f"      ✓ Demandas conocidas: {num_valid}/{len(od_vector)}")
-
-        # Crear máscara de OD conocidas (no NaN)
-        od_mask = (~np.isnan(od_vector)).astype(np.float32)
-
-        # Reemplazar NaNs con 0
-        od_vector = np.nan_to_num(od_vector, nan=0.0)
-
+    def prepare_od_demand_vector(self):
+        od_dense = self.od_matrix.toarray().flatten()
+        od_mask = (~np.isnan(od_dense)).astype(np.float32)
+        od_vector = np.nan_to_num(od_dense, nan=0.0)
+        logger.info(f"Demandas OD conocidas: {od_mask.sum()}")
         return od_vector, od_mask
 
     def prepare_network_parameters(self) -> Dict:
-        """
-        Extrae y prepara todos los parámetros de red para CyclicODModel.
-        """
-        logger.info(f"\n{'='*80}")
-        logger.info(f"⚙️ Preparando parámetros de red")
-        logger.info(f"{'='*80}")
-
-        # Crear lista ordenada de enlaces
+        """Prepara tensores de red para el modelo."""
         self.edge_list = list(self.graph.edges())
         num_links = len(self.edge_list)
 
-        # 1. Extraer atributos de enlaces
-        logger.info(f"   📊 Extrayendo atributos de enlaces...")
+        t0 = np.array([self.graph[u][v].get('free_flow_time', 1.0) for u, v in self.edge_list], dtype=np.float32)
+        capacity = np.array([self.graph[u][v].get('capacity', 1000.0) for u, v in self.edge_list], dtype=np.float32)
+        link_type = np.array([self.graph[u][v].get('link_type', 0) for u, v in self.edge_list], dtype=np.int32)
 
-        t0 = np.zeros(num_links, dtype=np.float32)
-        capacity = np.zeros(num_links, dtype=np.float32)
-        link_type = np.zeros(num_links, dtype=np.int32)
+        # Link Groups
+        unique_types = np.unique(link_type)
+        type_map = {t: i for i, t in enumerate(unique_types)}
+        link_group = np.array([type_map[t] for t in link_type])
 
-        for i, (u, v) in enumerate(self.edge_list):
-            edge_data = self.graph[u][v]
-            t0[i] = edge_data.get('free_flow_time', 1.0)
-            capacity[i] = edge_data.get('capacity', 1000.0)
-            link_type[i] = edge_data.get('link_type', 0)
-
-        # Map link_type IDs to indices 0 to num_link_groups-1
-        unique_link_types = np.unique(link_type)
-        link_type_to_index = {lt: i for i, lt in enumerate(unique_link_types)}
-        link_group = np.array([link_type_to_index[lt] for lt in link_type])
-
-        # 2. Preparar máscaras de rutas
-        logger.info(f"   📊 Preparando máscaras de rutas...")
-
+        # Route Masks
+        # route_masks YA ES un torch.sparse_coo_tensor
         route_masks, od_pair_indices = self._build_route_masks()
-        num_od_pairs = route_masks.shape[0]
 
-        # 3. Grupos de enlaces (link types)
-        num_link_groups = len(unique_link_types)
-
-        # 4. Consolidar parámetros
         self.network_params = {
             'num_links': num_links,
-            'num_od_pairs': num_od_pairs,
+            'num_od_pairs': route_masks.shape[0],
             't0': torch.FloatTensor(t0),
             'capacity': torch.FloatTensor(capacity),
-            'route_masks': torch.FloatTensor(route_masks),
+
+            # --- CORRECCIÓN AQUÍ ---
+            # No usar torch.FloatTensor(route_masks), usarlo directo:
+            'route_masks': route_masks,
+            # -----------------------
+
             'od_pair_indices': torch.LongTensor(od_pair_indices),
-            'num_link_groups': num_link_groups,
+            'num_link_groups': len(unique_types),
             'link_group': torch.LongTensor(link_group)
         }
-
-        logger.info(f"\n   ✅ Parámetros de red preparados")
-        logger.info(f"      - Enlaces: {num_links}")
-        logger.info(f"      - Pares OD: {num_od_pairs}")
-
+        logger.info("Parámetros de red preparados.")
         return self.network_params
 
-    def _build_route_masks(self) -> Tuple[np.ndarray, np.ndarray]:
+    def _build_route_masks(self) -> Tuple[torch.Tensor, np.ndarray]:
         """
-        Construye máscaras de rutas desde las rutas precalculadas.
+        Construye route_masks como un Tensor Esparso (Sparse COO).
+        Ahorra ~99% de memoria comparado con la versión densa.
         """
-        routes = self.routes_data['routes']  # [num_od_pairs, k_paths, max_route_length]
-        od_pairs = self.routes_data['od_pairs']  # [num_od_pairs, 2]
+        logger.info("Construyendo máscaras de ruta (Modo Esparso)...")
 
-        num_od_pairs = routes.shape[0]
-        k_paths = routes.shape[1]
+        routes = self.routes_data['routes']
+        od_pairs = self.routes_data['od_pairs']
+        num_od, k_paths = routes.shape[:2]
         num_links = len(self.edge_list)
 
-        # Crear mapeo de aristas a índices
-        edge_to_idx = {edge: i for i, edge in enumerate(self.edge_list)}
-
-        # Crear lista ordenada de nodos del grafo (para mapear índices a IDs)
+        # Mapeos rápidos
+        edge_to_idx = {e: i for i, e in enumerate(self.edge_list)}
         node_list = sorted(list(self.graph.nodes()))
+        node_to_idx = {n: i for i, n in enumerate(node_list)}
 
-        # Inicializar máscaras
-        route_masks = np.zeros((num_od_pairs, k_paths, num_links), dtype=np.float32)
+        # Listas para construir el formato COO (Coordinate List)
+        # Indices: [dim_0, dim_1, dim_2] -> [od_idx, path_idx, link_idx]
+        indices_od = []
+        indices_k = []
+        indices_link = []
+        values = []
 
-        logger.info(f"      Construyendo máscaras de rutas...")
-
-        edges_mapped = 0
-        edges_not_found = 0
-
-        # Para cada par OD y cada ruta
-        for od_idx in range(num_od_pairs):
+        for i in range(num_od):
             for k in range(k_paths):
-                route = routes[od_idx, k]
+                path = routes[i, k]
+                path = path[path != -1]  # Quitar padding
+                if len(path) < 2: continue
 
-                # --- CAMBIO IMPORTANTE AQUÍ ---
-                # Filtramos el padding (-1) en lugar de >0 para permitir el nodo 0
-                route = route[route != -1]
+                for j in range(len(path) - 1):
+                    u_idx, v_idx = path[j], path[j + 1]
+                    # Recuperar nodos reales para buscar en edge_to_idx
+                    # Nota: Si tus rutas ya tienen índices de nodo correctos, esto es rápido
+                    u, v = node_list[u_idx], node_list[v_idx]
 
-                if len(route) < 2:
-                    continue
+                    if (u, v) in edge_to_idx:
+                        l_idx = edge_to_idx[(u, v)]
 
-                for i in range(len(route) - 1):
-                    node_idx_from = int(route[i])
-                    node_idx_to = int(route[i + 1])
+                        # Guardamos la coordenada del 1.0
+                        indices_od.append(i)
+                        indices_k.append(k)
+                        indices_link.append(l_idx)
+                        values.append(1.0)
 
-                    # Validación de índices
-                    if node_idx_from >= len(node_list) or node_idx_to >= len(node_list):
-                        continue
+        # Crear el Tensor Esparso de PyTorch
+        if not indices_od:
+            logger.warning("¡No se encontraron rutas válidas para la máscara!")
+            # Retornar tensor vacío seguro
+            return torch.sparse_coo_tensor(
+                indices=torch.empty((3, 0), dtype=torch.long),
+                values=torch.empty(0),
+                size=(num_od, k_paths, num_links)
+            ), np.array([])
 
-                    # Como ya convertimos a índices en _load_routes, accedemos directo
-                    node_from = node_list[node_idx_from]
-                    node_to = node_list[node_idx_to]
-                    edge = (node_from, node_to)
+        # Construir índices [3, N_non_zeros]
+        i_tensor = torch.LongTensor([indices_od, indices_k, indices_link])
+        v_tensor = torch.FloatTensor(values)
 
-                    if edge in edge_to_idx:
-                        link_idx = edge_to_idx[edge]
-                        route_masks[od_idx, k, link_idx] = 1.0
-                        edges_mapped += 1
-                    else:
-                        edges_not_found += 1
+        sparse_route_masks = torch.sparse_coo_tensor(
+            i_tensor,
+            v_tensor,
+            size=(num_od, k_paths, num_links)
+        ).coalesce()  # Importante: coalesce ordena y optimiza la estructura
 
-        # OD pair indices
-        # Mapeamos los IDs originales (en od_pairs) a sus índices
-        node_to_idx = {node: idx for idx, node in enumerate(node_list)}
-        od_pair_indices = []
+        logger.info(
+            f"Máscara Esparsa creada. Densidad: {sparse_route_masks._nnz() / (num_od * k_paths * num_links):.6f}")
 
-        for i in range(len(od_pairs)):
-            origin_id, dest_id = od_pairs[i]
-            if origin_id in node_to_idx and dest_id in node_to_idx:
-                od_pair_indices.append([node_to_idx[origin_id], node_to_idx[dest_id]])
-            else:
-                od_pair_indices.append([-1, -1])
+        # Preparar OD indices (igual que antes)
+        od_indices = []
+        for u, v in od_pairs:
+            u_idx = node_to_idx.get(u, -1)
+            v_idx = node_to_idx.get(v, -1)
+            od_indices.append([u_idx, v_idx])
 
-        od_pair_indices = np.array(od_pair_indices, dtype=np.int64)
-
-        return route_masks, od_pair_indices
-
-    def create_sampling_masks(self,
-                             train_flow_mask: np.ndarray,
-                             od_mask: np.ndarray,
-                             flow_rate: Optional[float] = None,
-                             od_rate: Optional[float] = None) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Crea máscaras de muestreo adicionales usando el motor de sampling.
-        """
-        # Acceso vía Hydra
-        if flow_rate is None:
-            flow_rate = self.config.sampling.flow_rate
-        if od_rate is None:
-            od_rate = self.config.sampling.od_rate
-
-        strategy = self.config.sampling.get('strategy', 'random')
-        sampling_basis = self.config.sampling.get('sampling_basis', 'link_wise_based')
-        random_seed = self.config.data.random_seed
-
-        # Import local para evitar ciclos
-        from src.components.sampling.sampling import create_partial_data_masks
-
-        sampled_flow_mask, sampled_od_mask = create_partial_data_masks(
-            train_flow_mask=train_flow_mask,
-            od_mask=od_mask,
-            flow_rate=flow_rate,
-            od_rate=od_rate,
-            random_seed=random_seed,
-            strategy=strategy,
-            sampling_basis=sampling_basis,
-            graph=self.graph
-        )
-
-        return sampled_flow_mask, sampled_od_mask
+        return sparse_route_masks, np.array(od_indices, dtype=np.int64)
 
     def get_summary(self) -> Dict:
-        """Retorna resumen de datos cargados."""
-        return {
-            'network_name': self.config.data.network_name,
-            'num_nodes': self.graph.number_of_nodes() if self.graph else 0,
-            'num_links': self.graph.number_of_edges() if self.graph else 0,
-            'num_od_pairs': self.od_matrix.shape[0] * self.od_matrix.shape[1] if self.od_matrix is not None else 0,
-            'volume_year': self.config.data.volume_year,
-            'k_paths': self.config.network.k_paths,
-            'cost_function': self.config.network.cost_function
-        }
+        return {'network': self.data_cfg.get('dataset', 'Unknown')}

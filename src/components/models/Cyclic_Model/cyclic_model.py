@@ -147,117 +147,157 @@ class GraphMatcher(nn.Module):
 
 class AssignmentValidator(nn.Module):
     """
-    Valida asignación mediante Stochastic User Equilibrium (SUE).
-    La función de costo se inyecta dinámicamente vía Hydra.
+    Valida asignación mediante SUE con optimizaciones de memoria:
+    1. Warm Start: Reutiliza flujos previos.
+    2. Truncated Backprop: Solo calcula gradientes al final.
+    3. Dynamic Iterations: Permite variar iteraciones durante entrenamiento.
     """
 
     def __init__(self, num_links: int, t0: torch.Tensor, capacity: torch.Tensor,
                  route_masks: torch.Tensor, od_pair_indices: torch.Tensor,
                  num_od_pairs: int, num_link_groups: int, link_group: torch.Tensor,
-                 vdf_config: DictConfig,  # <-- CAMBIO: Recibe config, no string
+                 vdf_config: DictConfig,
                  max_iters: int = 10, convergence_threshold: float = 1e-4):
-        """
-        Args:
-            vdf_config: Configuración de Hydra para instanciar la VDF.
-        """
+
         super().__init__()
         self.max_iters = max_iters
         self.convergence_threshold = convergence_threshold
         self.register_buffer('t0', t0)
 
-        # ---------------------------------------------------------------------
-        # INSTANCIACIÓN DINÁMICA DE LA VDF
-        # ---------------------------------------------------------------------
-        # Hydra mira el _target_ en vdf_config e instancia la clase correspondiente
-        # pasándole los argumentos que requiere (t0, capacity, etc.)
+        # Instanciación VDF (Igual que antes)
         self.cost_function = hydra.utils.instantiate(
             vdf_config,
             t0=t0,
             capacity=capacity,
             num_link_groups=num_link_groups,
             link_group=link_group,
-            _recursive_=False  # Importante para pasar tensores
+            _recursive_=False
         )
 
-        # Capa de asignación estocástica
-        self.assignment_layer = StochasticAssignmentLayer(
-            route_masks=route_masks,
-            mu=1.0
-        )
-
+        self.assignment_layer = StochasticAssignmentLayer(route_masks=route_masks, mu=1.0)
         self.register_buffer('last_convergence_iter', torch.tensor(0.0))
 
-    def forward(self, estimated_demands: torch.Tensor, warmup: bool = False) -> tuple:
+        # ESTRATEGIA 1: Buffer para Warm Start
+        # Guardamos el estado del flujo para reutilizarlo en la siguiente época
+        self.register_buffer('running_flows', None)
+
+    def forward(self, estimated_demands: torch.Tensor,
+                warmup: bool = False,
+                override_max_iters: Optional[int] = None) -> tuple:
         """
-        Ejecuta SUE iterativo.
+        Args:
+            override_max_iters: ESTRATEGIA 3 (Permite variar iters desde el training loop)
         """
+
+        # Determinar iteraciones (Estrategia 3)
+        current_max_iters = override_max_iters if override_max_iters is not None else self.max_iters
+
         batch_size = estimated_demands.shape[0] if estimated_demands.dim() == 2 else 1
+        if estimated_demands.dim() == 1: estimated_demands = estimated_demands.unsqueeze(0)
 
-        if estimated_demands.dim() == 1:
-            estimated_demands = estimated_demands.unsqueeze(0)
-
-        # Costos de flujo libre
+        # Costos base
         freeflow_costs_base = self.cost_function(torch.zeros_like(self.t0))
         freeflow_costs = freeflow_costs_base.unsqueeze(0).expand(batch_size, -1)
 
+        # --- ESTRATEGIA 1: LOGICA DE WARM START ---
+        # Si estamos entrenando y tenemos un historial válido, lo usamos.
+        # Si cambiamos batch_size (ej. último batch) o es warmup, reseteamos.
+
+        can_warm_start = (
+                self.training
+                and not warmup
+                and self.running_flows is not None
+                and self.running_flows.shape[0] == batch_size
+        )
+
+        if can_warm_start:
+            # Usamos .detach() para romper el grafo hacia el pasado lejano
+            flows = self.running_flows.detach().clone()
+        else:
+            # Cold Start (Flujo Libre)
+            flows = self.assignment_layer(freeflow_costs, estimated_demands)
+
+        # --- BUCLE MSA ---
+        converged = False
+        actual_iters = 1
+
+        # ESTRATEGIA 2: Configuración de Truncated Backprop
+        # Solo calculamos gradientes en las últimas 'grad_steps' iteraciones
+        grad_steps = 3
+
         if warmup:
-            # Solo una iteración con flujo libre
+            # En warmup solo hacemos 1 pasada rápida
             reconstructed_flows = self.assignment_layer(freeflow_costs, estimated_demands)
             convergence_info = {"converged": True, "iterations": 1}
         else:
-            # SUE iterativo (MSA - Method of Successive Averages)
-            flows = self.assignment_layer(freeflow_costs, estimated_demands)
-            prev_flows = flows.clone()
+            # Si iters es muy bajo, calculamos gradiente siempre, si no, truncamos.
+            grad_start_iter = max(0, current_max_iters - grad_steps)
 
-            converged = False
-            actual_iters = 1
+            for it in range(1, current_max_iters + 1):
+                # ESTRATEGIA 2: Toggle de Gradientes
+                # Activamos gradientes solo si estamos en las últimas iteraciones Y en modo training
+                requires_grad = self.training and (it > grad_start_iter)
 
-            for it in range(1, self.max_iters + 1):
-                costs = self.cost_function(flows)
-                new_flows = self.assignment_layer(costs, estimated_demands)
+                with torch.set_grad_enabled(requires_grad):
+                    costs = self.cost_function(flows)
+                    new_flows = self.assignment_layer(costs, estimated_demands)
 
-                # MSA step
-                alpha_msa = 1.0 / (it + 1)
-                flows = flows + alpha_msa * (new_flows - flows)
+                    # MSA Step
+                    alpha_msa = 1.0 / (it + 1)
+                    flows = flows + alpha_msa * (new_flows - flows)
 
-                # Verificar convergencia
-                if it > 2:
-                    flow_change = torch.norm(flows - prev_flows, dim=1) / (torch.norm(flows, dim=1) + 1e-9)
-                    max_change = torch.max(flow_change)
-
-                    if max_change < self.convergence_threshold:
-                        converged = True
-                        actual_iters = it
-                        break
-
-                prev_flows = flows.clone()
+            # Guardar estado para la siguiente época (Warm Start)
+            if self.training:
+                self.running_flows = flows.detach()
 
             reconstructed_flows = flows
-            convergence_info = {"converged": converged, "iterations": actual_iters}
-            self.last_convergence_iter.data = torch.tensor(float(actual_iters))
+            convergence_info = {"converged": False, "iterations": current_max_iters}
 
-        # Obtener parámetros aprendidos de la función de costo (si existen)
-        # Usamos Duck Typing: si tiene el método get_alpha, lo llamamos.
-        learned_alpha = None
-        learned_beta = None
-
-        if hasattr(self.cost_function, 'get_alpha'):
-            learned_alpha = self.cost_function.get_alpha()
-
-        if hasattr(self.cost_function, 'get_beta'):
-            learned_beta = self.cost_function.get_beta()
+        # Extracción de parámetros aprendidos (Igual que antes)
+        learned_alpha = getattr(self.cost_function, 'get_alpha', lambda: None)()
+        learned_beta = getattr(self.cost_function, 'get_beta', lambda: None)()
 
         return reconstructed_flows, learned_alpha, learned_beta, convergence_info
 
 
 class StochasticAssignmentLayer(nn.Module):
     """
-    Capa de Asignación Estocástica Vectorizada (3D).
+    Capa de Asignación Estocástica Vectorizada (Optimizada para Tensores Esparsos).
     """
 
     def __init__(self, route_masks: torch.Tensor, mu: float = 1.0):
         super().__init__()
-        self.register_buffer('route_masks', route_masks.float())
+
+        # 1. Procesar Máscara Esparsa
+        # Esperamos route_masks de tamaño (Num_OD, K_Paths, Num_Links)
+        self.num_od, self.k_paths, self.num_links = route_masks.shape
+
+        # Aplanar las dos primeras dimensiones (OD y K) para hacerla 2D
+        # Nueva forma lógica: (Num_OD * K_Paths, Num_Links)
+        if route_masks.is_sparse:
+            route_masks = route_masks.coalesce()
+            indices = route_masks.indices()
+            values = route_masks.values()
+
+            # Calcular nuevos índices de fila: row = od_idx * K + k_idx
+            new_rows = indices[0] * self.k_paths + indices[1]
+            new_cols = indices[2]  # Link index se mantiene
+
+            new_indices = torch.stack([new_rows, new_cols])
+
+            # Matriz esparsa 2D: [Rows=RutasTotales, Cols=Links]
+            self.register_buffer(
+                'sparse_mask_2d',
+                torch.sparse_coo_tensor(
+                    new_indices,
+                    values,
+                    size=(self.num_od * self.k_paths, self.num_links)
+                )
+            )
+        else:
+            # Fallback por si acaso le pasas un denso
+            self.register_buffer('sparse_mask_2d', route_masks.reshape(-1, self.num_links).to_sparse())
+
         self.mu_raw = nn.Parameter(torch.tensor(float(mu)))
 
     @property
@@ -265,27 +305,78 @@ class StochasticAssignmentLayer(nn.Module):
         return torch.clamp(F.softplus(self.mu_raw), min=0.1, max=10.0)
 
     def forward(self, link_costs: torch.Tensor, demands: torch.Tensor) -> torch.Tensor:
-        # 1. Costo de Ruta
-        route_costs = torch.einsum('bl,okl->bok', link_costs, self.route_masks)
+        """
+        Args:
+            link_costs: [Batch, Num_Links]
+            demands: [Batch, Num_OD]
+        """
+        batch_size = link_costs.shape[0]
 
-        # 2. Estabilización
+        # =====================================================================
+        # PASO 1: Calcular Costo de Ruta (Link -> Ruta)
+        # Queremos: route_costs [Batch, OD, K]
+        # Operación: Sumar costos de links para cada ruta.
+        # Matemáticamente: RouteCosts = LinkCosts @ Mask.T
+        # =====================================================================
+
+        # Truco para multiplicar (Batch, Link) x (Link, RutasTotales_Esparsa)
+        # PyTorch sparse.mm requiere (Sparse x Dense). Usamos transposición:
+        # (A @ B).T = B.T @ A.T
+        # Result.T = (LinkCosts @ Mask.T).T = Mask @ LinkCosts.T
+
+        # Mask [OD*K, L] (Sparse)
+        # LinkCosts.T [L, B] (Dense)
+        # Result_T [OD*K, B]
+
+        costs_t = torch.transpose(link_costs, 0, 1)  # [L, B]
+        route_costs_flat_t = torch.sparse.mm(self.sparse_mask_2d, costs_t)  # [OD*K, B]
+
+        # Volver a formato [Batch, OD, K]
+        route_costs = route_costs_flat_t.transpose(0, 1).view(batch_size, self.num_od, self.k_paths)
+
+        # =====================================================================
+        # PASO 2: Logit Probabilities (Igual que antes)
+        # =====================================================================
+
+        # Estabilización numérica
         min_costs, _ = torch.min(route_costs, dim=2, keepdim=True)
         stable_costs = route_costs - min_costs.detach()
+        # Clamp para evitar exp() infinito
         stable_costs = torch.clamp(stable_costs, max=50.0)
 
-        # 3. Logit
         exp_utility = torch.exp(-self.mu * stable_costs)
         sum_utility = torch.sum(exp_utility, dim=2, keepdim=True)
         route_probs = exp_utility / (sum_utility + 1e-9)
 
-        # 4. Asignar Demanda
+        # Asignar Demanda: [Batch, OD, K]
         route_flows = route_probs * demands.unsqueeze(2)
 
-        # 5. Proyectar a Links
-        link_flows = torch.einsum('bok,okl->bl', route_flows, self.route_masks)
+        # =====================================================================
+        # PASO 3: Proyectar a Links (Ruta -> Link)
+        # Queremos: link_flows [Batch, Num_Links]
+        # Operación: Sumar flujos de rutas que pasan por cada link.
+        # Matemáticamente: LinkFlows = RouteFlowsFlat @ Mask
+        # =====================================================================
+
+        # RouteFlowsFlat: [Batch, OD*K]
+        route_flows_flat = route_flows.view(batch_size, -1)
+
+        # De nuevo el truco de la transpuesta para usar Sparse.mm:
+        # Result.T = (RF @ Mask).T = Mask.T @ RF.T
+        # Pero Mask.T es (L, OD*K).
+        # Para hacer esto eficiente sin transponer la matriz esparsa explícitamente (que es lento),
+        # usamos torch.sparse.mm con la transpuesta lógica si es posible,
+        # o transponemos la esparsa una sola vez en __init__ si tenemos memoria.
+        # Pero PyTorch permite .t() en sparse tensors rápido (solo cambia índices).
+
+        mask_t = self.sparse_mask_2d.t()  # [L, OD*K] (Virtualmente gratis en sparse)
+        rf_t = torch.transpose(route_flows_flat, 0, 1)  # [OD*K, B]
+
+        link_flows_t = torch.sparse.mm(mask_t, rf_t)  # [L, B]
+
+        link_flows = link_flows_t.transpose(0, 1)  # [B, L]
 
         return link_flows
-
 
 # =============================================================================
 # FUNCIÓN DE PÉRDIDA
@@ -379,10 +470,14 @@ class CyclicODModel(nn.Module):
                  od_pair_indices: torch.Tensor,
                  num_link_groups: int,
                  link_group: torch.Tensor,
-                 vdf_config: DictConfig,  # <-- CAMBIO CLAVE
-                 dropout: float = 0.1):
+                 vdf_config: DictConfig,  # Configuración VDF
+                 dropout: float = 0.1,
+                 **kwargs): # <--- AQUÍ ESTÁ LA MAGIA: kwargs absorbe loss_weights y otros extras
 
         super().__init__()
+
+        # Opcional: Si quieres guardar los kwargs por si acaso (debugging)
+        self.config_extras = kwargs
 
         self.encoder = ODEncoder(num_links, hidden_dim, feature_dim, dropout)
         self.decoder = ODDecoder(num_od_pairs, hidden_dim, feature_dim, dropout)
@@ -399,7 +494,8 @@ class CyclicODModel(nn.Module):
                 observed_flows: torch.Tensor,
                 flow_mask: torch.Tensor,
                 true_od_demand: Optional[torch.Tensor] = None,
-                warmup: bool = False) -> Dict[str, torch.Tensor]:
+                warmup: bool = False,
+                current_iter_count: Optional[int] = None) -> Dict[str, torch.Tensor]:
 
         is_batched = observed_flows.dim() == 2
         if not is_batched:
@@ -428,7 +524,10 @@ class CyclicODModel(nn.Module):
 
         # 5. Validar
         reconstructed_flows, learned_alpha, learned_beta, convergence_info = self.validator(
-            estimated_demand, warmup=warmup)
+            estimated_demand,
+            warmup=warmup,
+            override_max_iters=current_iter_count  # <--- Pasamos el valor aquí
+        )
 
         if not is_batched:
             estimated_demand = estimated_demand.squeeze(0)

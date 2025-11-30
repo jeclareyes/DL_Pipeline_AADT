@@ -1,5 +1,5 @@
 """
-Script para verificar que los artefactos generados por data_pipeline.py sean correctos.
+Script para verificar que los artefactos generados por data_pipeline_DEPRECATED.py sean correctos.
 """
 import pickle
 import pandas as pd
