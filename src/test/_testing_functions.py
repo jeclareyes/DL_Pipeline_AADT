@@ -223,6 +223,103 @@ def get_latest_epoch_data(bundle: Dict[str, Any]) -> tuple:
     return int(latest_epoch), history[latest_epoch]
 
 
+def plot_scatter_comparison(
+        pred: np.ndarray,
+        target: np.ndarray,
+        mask: Optional[np.ndarray],
+        mask_label: str,
+        title: str,
+        xlabel: str,
+        ylabel: str,
+        output_path: str,
+        log_scale: bool = True
+):
+    """
+    Genera un scatter plot comparando valores reales vs estimados.
+
+    Args:
+        mask: Array booleano. Si se provee, separa los datos en dos grupos
+              (ej. Train vs Test, o Conocido vs Desconocido).
+        mask_label: Etiqueta para los datos donde mask == True.
+    """
+    plt.figure(figsize=(10, 8))
+    sns.set_style("whitegrid")
+
+    # Crear DataFrame para facilitar el plot con Seaborn
+    data = {'True': target, 'Predicted': pred}
+
+    if mask is not None:
+        # Si hay máscara, creamos una columna de categoría
+        # mask == True -> mask_label (ej. "Test Set" o "Known OD")
+        # mask == False -> "Others" (ej. "Train Set" o "Unknown OD")
+        labels = np.where(mask, mask_label, 'Others')
+        data['Type'] = labels
+        hue = 'Type'
+        palette = {mask_label: '#FF0054', 'Others': '#0077B6'}  # Rojo para destacado, Azul para resto
+    else:
+        hue = None
+        palette = None
+
+    df_plot = pd.DataFrame(data)
+
+    # Filtrar ceros si vamos a usar escala logarítmica para evitar errores
+    if log_scale:
+        df_plot = df_plot[(df_plot['True'] > 0) & (df_plot['Predicted'] > 0)]
+
+    # Scatter Plot
+    sns.scatterplot(
+        data=df_plot,
+        x='True',
+        y='Predicted',
+        hue=hue,
+        palette=palette,
+        alpha=0.6,
+        edgecolor=None
+    )
+
+    # Línea de identidad (Perfect Fit)
+    min_val = min(df_plot['True'].min(), df_plot['Predicted'].min())
+    max_val = max(df_plot['True'].max(), df_plot['Predicted'].max())
+    plt.plot([min_val, max_val], [min_val, max_val], 'k--', lw=1.5, label='Perfect Fit')
+
+    if log_scale:
+        plt.xscale('log')
+        plt.yscale('log')
+        plt.title(f"{title} (Log Scale)")
+    else:
+        plt.title(title)
+
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300)
+    plt.close()
+
+
+def plot_link_histograms(df: pd.DataFrame, model_name: str, output_dir: str):
+    """Genera histogramas de Volumen y V/C Ratio (Igual que antes)."""
+    sns.set_style("whitegrid")
+
+    # 1. Volumen
+    plt.figure(figsize=(12, 6))
+    sns.histplot(data=df, x="Pred_Volume", hue="Link_Type", element="step", bins=50, common_norm=False)
+    plt.title(f"Distribución de Flujos Predichos por Tipo de Link\n({model_name})")
+    plt.xlabel("Volumen (veh/h)")
+    plt.savefig(os.path.join(output_dir, f"{model_name}_hist_volume.png"))
+    plt.close()
+
+    # 2. V/C Ratio
+    plt.figure(figsize=(12, 6))
+    df_filtered = df[df["VC_Ratio"] <= 2.0]
+    sns.histplot(data=df_filtered, x="VC_Ratio", hue="Link_Type", element="step", bins=50, common_norm=False)
+    plt.axvline(1.0, color='red', linestyle='--', label='Capacidad (1.0)')
+    plt.title(f"Distribución de V/C Ratio por Tipo de Link\n({model_name})")
+    plt.xlabel("Volume / Capacity Ratio")
+    plt.legend()
+    plt.savefig(os.path.join(output_dir, f"{model_name}_hist_vc_ratio.png"))
+    plt.close()
+
 def calculate_metrics(pred: np.ndarray, target: np.ndarray) -> Dict[str, float]:
     """Calcula R2, MAE, RMSE, MAPE ignorando NaNs y ceros en el target para MAPE."""
     # Aplanar arrays
@@ -290,70 +387,97 @@ def plot_link_histograms(df: pd.DataFrame, model_name: str, output_dir: str):
 
 
 def process_evaluation(file_path: str, output_dir: str):
-    """Función principal que orquesta la evaluación de un solo archivo."""
+    """Función principal orquestadora (Actualizada con Scatter Plots)."""
 
     model_name = os.path.basename(file_path).replace("eval_", "").replace(".pt", "")
     bundle = load_eval_bundle(file_path)
 
-    # 1. Obtener Datos Estáticos y Dinámicos
     static = bundle['static_data']
     epoch_num, dynamic = get_latest_epoch_data(bundle)
 
-    # 2. Preparar Datos para Links
-    # Convertir a numpy
+    # --- DATOS FLOWS ---
     pred_flows = dynamic['pred_flows'].numpy()
     true_flows = static['true_flows'].numpy()
     capacity = static['capacity'].numpy()
     link_groups = static['link_group'].numpy()
-
-    # Máscaras
     mask_test = static['mask_flow_test'].numpy().astype(bool)
-    mask_train = static['mask_flow_train'].numpy().astype(bool)
 
-    # --- MÉTRICAS DE LINKS (Solo en Test Set para validación rigurosa) ---
+    # --- MÉTRICAS FLOWS ---
+    # Calcular métricas globales y específicas de Test
     if np.any(mask_test):
         link_metrics = calculate_metrics(pred_flows[mask_test], true_flows[mask_test])
         subset_name = "TEST_SET"
+        scatter_mask = mask_test
+        scatter_label = "Test Links"
     else:
-        logging.warning("⚠️ No se encontró máscara de test. Usando TODOS los links.")
         link_metrics = calculate_metrics(pred_flows, true_flows)
         subset_name = "FULL_SET"
+        scatter_mask = None
+        scatter_label = "All Links"
 
     logging.info(f"📊 Métricas Links ({subset_name}): {link_metrics}")
 
-    # --- MÉTRICAS DE OD (Si existe Ground Truth) ---
+    # GRÁFICO 1: Scatter Flows (Real vs Pred)
+    plot_scatter_comparison(
+        pred=pred_flows,
+        target=true_flows,
+        mask=scatter_mask,
+        mask_label=scatter_label,
+        title=f"Traffic Flows: True vs Estimated ({model_name})",
+        xlabel="True Flow (veh/h)",
+        ylabel="Estimated Flow (veh/h)",
+        output_path=os.path.join(output_dir, f"{model_name}_scatter_flows.png"),
+        log_scale=True  # Recomendado para flujos de tráfico
+    )
+
+    # --- DATOS OD ---
     od_metrics = {}
     if 'true_od' in static and static['true_od'] is not None:
         true_od = static['true_od'].numpy()
         pred_od = dynamic['pred_od'].numpy()
 
-        # Usar máscara de OD conocidos si existe (para evaluar lo desconocido)
-        # O evaluar todo. Generalmente se evalúa todo el OD estimado vs real.
-        od_metrics = calculate_metrics(pred_od, true_od)
-        logging.info(f"📊 Métricas OD Matrix: {od_metrics}")
+        # Máscara de OD Conocidos
+        if 'mask_od_known' in static:
+            mask_od = static['mask_od_known'].numpy().astype(bool)
+        else:
+            mask_od = None
 
-    # 3. Guardar Métricas en CSV
+        # Métricas sobre TODO el conjunto (generalmente queremos ver si recuperó la matriz entera)
+        od_metrics = calculate_metrics(pred_od, true_od)
+        logging.info(f"📊 Métricas OD Matrix (Global): {od_metrics}")
+
+        # GRÁFICO 2: Scatter OD (Real vs Pred)
+        # Filtramos para resaltar los conocidos ("que solo se conocían obviamente")
+        plot_scatter_comparison(
+            pred=pred_od,
+            target=true_od,
+            mask=mask_od,
+            mask_label="Known OD (Input)",  # Etiqueta para los datos que SÍ se conocían
+            title=f"OD Demand: True vs Estimated ({model_name})",
+            xlabel="True Demand",
+            ylabel="Estimated Demand",
+            output_path=os.path.join(output_dir, f"{model_name}_scatter_od.png"),
+            log_scale=True
+        )
+
+    # 3. Guardar CSV (Igual que antes)
     metrics_df = pd.DataFrame([link_metrics])
     metrics_df['type'] = 'Links_Test'
     metrics_df['model'] = model_name
 
     if od_metrics:
         od_df = pd.DataFrame([od_metrics])
-        od_df['type'] = 'OD_Pairs'
+        od_df['type'] = 'OD_Pairs_Global'
         od_df['model'] = model_name
         metrics_df = pd.concat([metrics_df, od_df], ignore_index=True)
 
-    csv_path = os.path.join(output_dir, f"{model_name}_metrics.csv")
-    metrics_df.to_csv(csv_path, index=False)
+    metrics_df.to_csv(os.path.join(output_dir, f"{model_name}_metrics.csv"), index=False)
 
-    # 4. Generar DataFrame para Gráficos (Usamos TODOS los links para ver congestión global)
-    # Mapeo simple de grupos si son enteros (puedes personalizar esto si tienes un dict de nombres)
-    group_map = {0: 'Highway', 1: 'Arterial', 2: 'Collector', 3: 'Local'}  # Ejemplo genérico
+    # 4. Histogramas (Igual que antes)
+    group_map = {0: 'Highway', 1: 'Arterial', 2: 'Collector', 3: 'Local'}
     link_types_mapped = [group_map.get(g, f'Type_{g}') for g in link_groups]
-
-    # Evitar división por cero en capacidad
     safe_capacity = capacity.copy()
-    safe_capacity[safe_capacity == 0] = 1.0  # Evitar error, aunque capacidad 0 es raro
+    safe_capacity[safe_capacity == 0] = 1.0
 
     df_vis = pd.DataFrame({
         'Pred_Volume': pred_flows,
@@ -364,4 +488,4 @@ def process_evaluation(file_path: str, output_dir: str):
     })
 
     plot_link_histograms(df_vis, model_name, output_dir)
-    logging.info(f"✅ Evaluación completada para: {model_name}")
+    logging.info(f"✅ Evaluación (Gráficos y Métricas) completada para: {model_name}")

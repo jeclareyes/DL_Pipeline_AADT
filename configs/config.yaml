@@ -12,7 +12,7 @@ defaults:
   - data_ingestion/data_preprocessing: preprocessing_from_pkl
 
   # 3. Model (Busca en configs/model/Cyclic_Model.yaml)
-  - model: Cyclic_Model
+  - model: Cyclic_Model_Ultra # 'Cyclic_Model_Ultra' | 'Cyclic_Model'
 
   # 4. Training (Busca en configs/training/training.yaml)
   - training: training

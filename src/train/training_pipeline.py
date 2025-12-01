@@ -7,7 +7,7 @@ from torch.utils.data import DataLoader
 from omegaconf import DictConfig, OmegaConf
 
 # Importaciones de TU estructura
-from src.components.models.Cyclic_Model.cyclic_model import PartialDataLoss
+# from src.components.models.Cyclic_Model.cyclic_model import PartialDataLoss
 from src.components.models.Cyclic_Model.cyclic_model_data_ingestion import LinkopingDataLoader
 # Asumiendo que moviste el dataset a utils, si no, impórtalo de train_cyclic_model
 from src.utils.traffic_dataset import TrafficDataset
@@ -122,11 +122,27 @@ def run_pipeline(cfg: DictConfig):
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.training.lr, weight_decay=cfg.training.weight_decay)
 
     # Loss weights desde el YAML del modelo
-    criterion = PartialDataLoss(
-        w_flow=cfg.model.loss_weights.w_flow,
-        w_od=cfg.model.loss_weights.w_od,
-        w_reg=cfg.model.loss_weights.w_reg
-    ).to(device)
+    #criterion = PartialDataLoss(
+    #    w_flow=cfg.model.loss_weights.w_flow,
+    #    w_od=cfg.model.loss_weights.w_od,
+    #    w_reg=cfg.model.loss_weights.w_reg
+    #).to(device)
+
+    # --- CAMBIO IMPORTANTE: Instanciación dinámica del Loss ---
+    if hasattr(cfg.model, 'loss') and '_target_' in cfg.model.loss:
+        # Caso: Modelo Ultra con configuración de Loss propia
+        logging.info(f"Instanciando Loss desde config: {cfg.model.loss._target_}")
+        criterion = hydra.utils.instantiate(cfg.model.loss).to(device)
+    else:
+        # Fallback: Modelo Clásico (Cyclic_Model.yaml original)
+        # Importación local para evitar errores si no se usa
+        from src.components.models.Cyclic_Model.cyclic_model import PartialDataLoss
+        logging.info("Usando PartialDataLoss por defecto (Legacy)")
+        criterion = PartialDataLoss(
+            w_flow=cfg.model.loss_weights.w_flow,
+            w_od=cfg.model.loss_weights.w_od,
+            w_reg=cfg.model.loss_weights.w_reg
+        ).to(device)
 
     # Preparar estructura de guardado maestro
 

@@ -1,7 +1,9 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Dict
+import hydra
+from omegaconf import DictConfig
+from typing import Optional, Dict, Any
 
 
 # =============================================================================
@@ -151,8 +153,10 @@ class ImprovedGraphMatcher(nn.Module):
 class ImprovedAssignmentValidator(nn.Module):
     """Validador mejorado con convergencia verificada y estabilización."""
 
-    def __init__(self, num_links, t0, capacity, route_masks, od_pair_indices,
-                 num_od_pairs, num_link_groups, link_group,
+    def __init__(self, num_links: int, t0: torch.Tensor, capacity: torch.Tensor,
+                 route_masks: torch.Tensor, od_pair_indices: torch.Tensor,
+                 num_od_pairs: int, num_link_groups: int, link_group: torch.Tensor,
+                 vdf_config: DictConfig,  # MODIFICACIÓN: Recibe config
                  max_iters: int = 10, convergence_threshold: float = 1e-4):
         super().__init__()
         self.max_iters = max_iters
@@ -160,7 +164,15 @@ class ImprovedAssignmentValidator(nn.Module):
         self.register_buffer('t0', t0)
 
         # Función de costos con inicialización mejorada
-        self.cost_function = LinkCostFunction(t0, capacity, num_link_groups, link_group)
+        self.cost_function = hydra.utils.instantiate(
+            vdf_config,
+            t0=t0,
+            capacity=capacity,
+            num_link_groups=num_link_groups,
+            link_group=link_group,
+            _recursive_=False
+        )
+
         self.assignment_layer = StaticAssignmentLayer(route_masks, od_pair_indices, num_od_pairs)
 
         # Registro de convergencia
@@ -175,10 +187,10 @@ class ImprovedAssignmentValidator(nn.Module):
         freeflow_costs = freeflow_costs_base.unsqueeze(0).expand(batch_size, -1)
 
         if warmup:
-            reconstructed_flows = self.assignment_layer(freeflow_costs, estimated_demands)
+            reconstructed_flows, route_probs = self.assignment_layer(freeflow_costs, estimated_demands)
             convergence_info = {"converged": True, "iterations": 1}
         else:
-            flows = self.assignment_layer(freeflow_costs, estimated_demands)
+            flows, route_probs = self.assignment_layer(freeflow_costs, estimated_demands)
             prev_flows = flows.clone()
 
             converged = False
@@ -186,7 +198,9 @@ class ImprovedAssignmentValidator(nn.Module):
 
             for it in range(1, self.max_iters + 1):
                 costs = self.cost_function(flows)
-                new_flows = self.assignment_layer(costs, estimated_demands)
+                new_flows, current_probs = self.assignment_layer(costs, estimated_demands)
+
+                route_probs = current_probs
 
                 # MSA con step size adaptativo
                 alpha_msa = 1.0 / (it + 1)
@@ -210,14 +224,19 @@ class ImprovedAssignmentValidator(nn.Module):
             # Actualizar estadísticas de convergencia
             self.last_convergence_iter.data = torch.tensor(float(actual_iters))
 
-        learned_alpha = F.softplus(self.cost_function.alpha_raw)
-        learned_beta = 1.0 + F.softplus(self.cost_function.beta_raw)
+        # MODIFICACIÓN: Uso de getattr seguro por si la VDF instanciada no tiene alpha/beta (ej. modelos no-BPR)
+        learned_alpha = getattr(self.cost_function, 'get_alpha', lambda: None)()
+        learned_beta = getattr(self.cost_function, 'get_beta', lambda: None)()
 
-        return reconstructed_flows, learned_alpha, learned_beta, convergence_info
+        # Fallback para compatibilidad visual si devuelve None
+        if learned_alpha is None: learned_alpha = torch.tensor(0.15, device=self.t0.device)
+        if learned_beta is None: learned_beta = torch.tensor(4.0, device=self.t0.device)
 
+        return reconstructed_flows, learned_alpha, learned_beta, convergence_info, route_probs
 
+"""
 class LinkCostFunction(nn.Module):
-    """Función de coste BPR con restricciones mejoradas."""
+    Función de coste BPR con restricciones mejoradas.
 
     def __init__(self, t0: torch.Tensor, capacity: torch.Tensor, num_link_groups: int, link_group: torch.Tensor):
         super().__init__()
@@ -242,79 +261,116 @@ class LinkCostFunction(nn.Module):
         bpr_cost = self.t0 * (1 + alpha_links * flow_ratio ** beta_links)
 
         return bpr_cost
+"""
 
 
 class StaticAssignmentLayer(nn.Module):
-    """Capa de asignación con estabilización mejorada."""
+    """
+    Capa de asignación optimizada para Tensores Esparsos (sin einsum).
+    Reemplaza la lógica densa para evitar errores de memoria/runtime.
+    """
 
     def __init__(self, route_masks: torch.Tensor, od_pair_indices: torch.Tensor,
                  num_od_pairs: int, mu: float = 1.0):
         super().__init__()
-        self.register_buffer('route_masks', route_masks.float())
+
+        # Guardamos dimensiones originales
+        self.num_od, self.k_paths, self.num_links = route_masks.shape
         self.register_buffer('od_pair_indices', od_pair_indices)
         self.num_od_pairs = num_od_pairs
 
-        # Parámetro mu aprendible con restricciones
+        # --- LÓGICA COPIADA DE CYCLIC_MODEL (Flattening 3D -> 2D) ---
+        # Convertimos la máscara [OD, K, Links] a [OD*K, Links] para usar sparse.mm
+        if route_masks.is_sparse:
+            route_masks = route_masks.coalesce()
+            indices = route_masks.indices()
+            values = route_masks.values()
+
+            # Calcular nuevos índices de fila: row = od_idx * K + k_idx
+            new_rows = indices[0] * self.k_paths + indices[1]
+            new_cols = indices[2]
+
+            new_indices = torch.stack([new_rows, new_cols])
+
+            # Matriz esparsa 2D: [Rows=RutasTotales, Cols=Links]
+            self.register_buffer(
+                'sparse_mask_2d',
+                torch.sparse_coo_tensor(
+                    new_indices,
+                    values,
+                    size=(self.num_od * self.k_paths, self.num_links)
+                )
+            )
+        else:
+            # Fallback denso convertido a sparse
+            self.register_buffer('sparse_mask_2d',
+                                 route_masks.reshape(-1, self.num_links).to_sparse())
+
+        # Parámetro mu aprendible
         self.mu_raw = nn.Parameter(torch.tensor(mu))
 
     @property
     def mu(self):
         return torch.clamp(F.softplus(self.mu_raw), min=0.1, max=10.0)
 
-    def forward(self, link_costs: torch.Tensor, demands: torch.Tensor) -> torch.Tensor:
+    def forward(self, link_costs: torch.Tensor, demands: torch.Tensor) -> tuple:
         """
-        Args:
-            link_costs: [batch_size, num_links]
-            demands:    [batch_size, num_od_pairs]
-
-        Returns:
-            link_flows: [batch_size, num_links]
+        Calcula flujos usando multiplicación matricial esparsa (sparse.mm).
         """
-        # Dimensiones para referencia en comentarios:
-        # b: batch_size
-        # o: num_od_pairs
-        # k: num_routes (K rutas por par OD)
-        # l: num_links
+        batch_size = link_costs.shape[0]
 
-        # 1. Calcular Costo de cada Ruta (Vectorizado)
-        # Multiplicamos los costos de los links por la máscara de rutas.
-        # Operación: Sumar costo de links 'l' para cada ruta 'k' del par 'o'.
-        # Entrada: link_costs [b, l], route_masks [o, k, l]
-        # Salida:  route_costs [b, o, k]
-        route_costs = torch.einsum('bl,okl->bok', link_costs, self.route_masks)
+        # =====================================================================
+        # PASO 1: Calcular Costo de Ruta (Link -> Ruta)
+        # Reemplazo de: torch.einsum('bl,okl->bok', link_costs, self.route_masks)
+        # Lógica: RouteCosts = (Mask @ LinkCosts.T).T
+        # =====================================================================
 
-        # 2. Estabilización Numérica
-        # Restamos el mínimo costo dentro de las K opciones de cada par OD
-        # para evitar explosión exponencial en el siguiente paso.
-        # keepdim=True mantiene la dimensión k como 1 para broadcasting
+        # LinkCosts.T -> [Links, Batch]
+        costs_t = torch.transpose(link_costs, 0, 1)
+
+        # Sparse MM: [OD*K, Links] @ [Links, Batch] -> [OD*K, Batch]
+        route_costs_flat_t = torch.sparse.mm(self.sparse_mask_2d, costs_t)
+
+        # Reshape: [Batch, OD, K]
+        route_costs = route_costs_flat_t.transpose(0, 1).view(batch_size, self.num_od, self.k_paths)
+
+        # =====================================================================
+        # PASO 2: Logit Probabilities (Estabilización)
+        # =====================================================================
         min_costs, _ = torch.min(route_costs, dim=2, keepdim=True)
         stable_costs = route_costs - min_costs.detach()
-
-        # Clamp opcional para seguridad extrema
         stable_costs = torch.clamp(stable_costs, max=50.0)
 
-        # 3. Modelo Logit (Softmax sobre la dimensión K)
-        # Calculamos la utilidad (exponencial negativa del costo)
-        exp_utility = torch.exp(-self.mu * stable_costs)  # [b, o, k]
+        exp_utility = torch.exp(-self.mu * stable_costs)
+        sum_utility = torch.sum(exp_utility, dim=2, keepdim=True)
+        route_probs = exp_utility / (sum_utility + 1e-9)
 
-        # Suma de utilidades por par OD (denominador)
-        sum_utility = torch.sum(exp_utility, dim=2, keepdim=True)  # [b, o, 1]
+        # Asignar Demanda: [Batch, OD, K]
+        route_flows = route_probs * demands.unsqueeze(2)
 
-        # Probabilidad de elegir la ruta k
-        route_probs = exp_utility / (sum_utility + 1e-9)  # [b, o, k]
+        # =====================================================================
+        # PASO 3: Proyectar a Links (Ruta -> Link)
+        # Reemplazo de: torch.einsum('bok,okl->bl', route_flows, self.route_masks)
+        # Lógica: LinkFlows = (Mask.T @ RouteFlowsFlat.T).T
+        # =====================================================================
 
-        # 4. Asignar Demanda a Rutas
-        # Multiplicamos la probabilidad de la ruta por la demanda total del par OD
-        # demands se expande de [b, o] a [b, o, 1] para multiplicar
-        route_flows = route_probs * demands.unsqueeze(2)  # [b, o, k]
+        # Aplanar flujos de ruta: [Batch, OD*K]
+        route_flows_flat = route_flows.view(batch_size, -1)
 
-        # 5. Proyectar Flujos de Ruta a Flujos de Link
-        # Sumamos todo el tráfico que pasa por cada link 'l'.
-        # Operación: route_flows [b, o, k] * route_masks [o, k, l] -> Sumar sobre o, k
-        # Salida: link_flows [b, l]
-        link_flows = torch.einsum('bok,okl->bl', route_flows, self.route_masks)
+        # Transponer para multiplicar: [OD*K, Batch]
+        rf_t = torch.transpose(route_flows_flat, 0, 1)
 
-        return link_flows
+        # Truco PyTorch: mask.t() en sparse es rápido (solo invierte índices)
+        mask_t = self.sparse_mask_2d.t()  # [Links, OD*K]
+
+        # Sparse MM: [Links, OD*K] @ [OD*K, Batch] -> [Links, Batch]
+        link_flows_t = torch.sparse.mm(mask_t, rf_t)
+
+        # Volver a formato batch: [Batch, Links]
+        link_flows = link_flows_t.transpose(0, 1)
+
+        # Retornamos TUPLA (Flujos, Probabilidades) para compatibilidad con pipeline
+        return link_flows, route_probs
 
 
 class AdaptiveCombinedLoss(nn.Module):
@@ -334,55 +390,56 @@ class AdaptiveCombinedLoss(nn.Module):
         self.register_buffer('loss_history_od', torch.tensor(0.0))
         self.register_buffer('update_count', torch.tensor(0.0))
 
-    def forward(self, model_output: dict, observed_counts_train_only: torch.Tensor,
-                true_od_demand: torch.Tensor = None, od_mask: torch.Tensor = None,
-                convergence_info: dict = None, 
-                all_counts: torch.Tensor = None, train_mask: torch.Tensor = None) -> dict:
+    def forward(self,
+                predicted_flows: torch.Tensor,  # Pipeline envía esto
+                true_flows: torch.Tensor,  # Pipeline envía esto
+                flow_mask: torch.Tensor,  # Pipeline envía esto
+                predicted_od: torch.Tensor,  # Pipeline envía esto
+                true_od: torch.Tensor,  # Pipeline envía esto
+                od_mask: torch.Tensor,  # Pipeline envía esto
+                learned_alpha: Optional[torch.Tensor] = None,
+                learned_beta: Optional[torch.Tensor] = None,
+                **kwargs) -> Dict[str, torch.Tensor]:
 
-        # Pérdida de aforos
-        if all_counts is not None and train_mask is not None and train_mask.any():
-            l_counts = self.mse_loss(model_output["reconstructed_flows"][train_mask], all_counts[train_mask])
+        # Lógica Interna Adaptada
+
+        # 1. Loss de Flujos
+        if flow_mask.any():
+            masked_pred = predicted_flows * flow_mask
+            masked_true = true_flows * flow_mask
+            l_counts = self.mse_loss(masked_pred, masked_true)
         else:
-            print("No training mask provided or no counts to train on, using default loss.")
-            l_counts = self.mse_loss(model_output["reconstructed_flows"][train_mask],observed_counts_train_only)
+            l_counts = torch.tensor(0.0, device=predicted_flows.device)
 
-        # Pérdida de OD conocidas
-        l_od = torch.tensor(0.0, device=l_counts.device)
-        od_supervision_ratio = 0.0
+        # 2. Loss de OD
+        l_od = torch.tensor(0.0, device=predicted_flows.device)
+        od_ratio = 0.0
+        if od_mask is not None and od_mask.any():
+            masked_pred_od = predicted_od * od_mask
+            masked_true_od = true_od * od_mask
+            l_od = self.mse_loss(masked_pred_od, masked_true_od)
+            od_ratio = od_mask.float().mean().item()
 
-        if true_od_demand is not None and od_mask is not None:
-            est_demand_masked = model_output["estimated_demand"][od_mask]
-            true_demand_masked = true_od_demand[od_mask]
-            if true_demand_masked.numel() > 0:
-                l_od = self.mse_loss(est_demand_masked, true_demand_masked)
-                od_supervision_ratio = od_mask.float().mean().item()
+        # 3. Regularización
+        l_reg = torch.tensor(0.0, device=predicted_flows.device)
+        if learned_alpha is not None and learned_beta is not None:
+            l_reg = (torch.norm(learned_alpha - 0.15, p=2) +
+                     torch.norm(learned_beta - 4.0, p=2))
 
-        # Regularización mejorada
-        l_reg = (torch.norm(model_output["learned_alpha"] - 0.15, p=2) +
-                 torch.norm(model_output["learned_beta"] - 4.0, p=2))
-
-        # Penalización por no convergencia
-        convergence_penalty = 0.0
-        """if convergence_info and not convergence_info.get("converged", True):
-            convergence_penalty = 0.1 * convergence_info.get("iterations", self.max_iters)"""
-
-        # Adaptación de pesos
+        # 4. Adaptación de Pesos (Tu lógica original)
         if self.adaptive_weights and self.training:
-            self._adapt_weights(l_counts.detach(), l_od.detach(), od_supervision_ratio)
+            self._adapt_weights(l_counts.detach(), l_od.detach(), od_ratio)
 
-        # Pérdida total
         total_loss = (self.w_counts * l_counts +
                       self.w_od * l_od +
-                      self.w_reg * l_reg +
-                      convergence_penalty)
+                      self.w_reg * l_reg)
 
         return {
             "total_loss": total_loss,
-            "l_counts": l_counts,
+            "l_flow": l_counts,  # Renombrado para compatibilidad con logs del pipeline (antes l_counts)
             "l_od": l_od,
             "l_reg": l_reg,
-            "convergence_penalty": convergence_penalty,
-            "w_counts": self.w_counts.item(),
+            "w_flow": self.w_counts.item(),  # Renombrado para logs
             "w_od": self.w_od.item()
         }
 
@@ -425,7 +482,9 @@ class UltraCyclicODModel(nn.Module):
 
     def __init__(self, num_links, num_od_pairs, hidden_dim, feature_dim, num_structures,
                  t0, capacity, route_masks, od_pair_indices, num_link_groups, link_group,
-                 dropout: float = 0.1):
+                 vdf_config: DictConfig,  # MODIFICACIÓN: Argumento obligatorio nuevo
+                 dropout: float = 0.1,
+                 **kwargs):
         super().__init__()
 
         self.encoder = ODEncoder(num_links, hidden_dim, feature_dim, dropout)
@@ -433,7 +492,8 @@ class UltraCyclicODModel(nn.Module):
         self.graph_matcher = ImprovedGraphMatcher(feature_dim, num_structures)
         self.validator = ImprovedAssignmentValidator(
             num_links, t0, capacity, route_masks, od_pair_indices,
-            num_od_pairs, num_link_groups, link_group
+            num_od_pairs, num_link_groups, link_group,
+            vdf_config=vdf_config
         )
 
         # NO necesitamos encoder separado - usamos el mismo encoder para mantener 
@@ -470,19 +530,22 @@ class UltraCyclicODModel(nn.Module):
         estimated_demand = self.decoder(g_x)
 
         # 5. Validar con SUE
-        reconstructed_flows, learned_alpha, learned_beta, convergence_info = self.validator(
+        reconstructed_flows, learned_alpha, learned_beta, convergence_info, route_probs = self.validator(
             estimated_demand, warmup=warmup)
 
         if not is_batched:
             estimated_demand = estimated_demand.squeeze(0)
             reconstructed_flows = reconstructed_flows.squeeze(0)
+            if route_probs is not None:
+                route_probs = route_probs.squeeze(0)
 
         return {
             "estimated_demand": estimated_demand,
             "reconstructed_flows": reconstructed_flows,
             "learned_alpha": learned_alpha,
             "learned_beta": learned_beta,
-            "convergence_info": convergence_info
+            "convergence_info": convergence_info,
+            "route_probs": route_probs
         }
 
     def validate_latent_space_consistency(self, observed_counts, true_od_demand):

@@ -1,6 +1,6 @@
 
 root: outputs/runs
-model_to_test: "CyclicODModel"
+model_to_test: "CyclicODModelUltra" # "CyclicODModelUltra" | "CyclicODModel"
 
 eval_mode:
   single_model: false  # true | false
