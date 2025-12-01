@@ -46,3 +46,8 @@ paths:
   data_processed: ${paths.root_dir}/data/processed
   trained_models: ${paths.root_dir}/models
   outputs: ${paths.root_dir}/outputs
+
+runs:
+  dir: outputs/runs/${model.model_name}\
+  # /_Epochs_${training.epochs}_VDF_${network.cost_function}_Learning_Rate_${training.lr}_Flow_Sampling_Rate_${sampling.flow_rate}_Sampling_Strategy_${sampling.strategy}_Sampling_Basis_${sampling.sampling_basis}
+

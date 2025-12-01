@@ -1,0 +1,2 @@
+_target_: src.components.vdf.conical.ConicalCostFunction
+learnable_params: true

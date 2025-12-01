@@ -1,1 +1,7 @@
 
+root: outputs/runs
+model_to_test: "CyclicODModel"
+
+eval_mode:
+  single_model: false  # true | false
+  instance_to_test: "Epochs_300_VDF_bpr_Learning_Rate_0.001_Flow_Sampling_Rate_0.8_Sampling_Strategy_spatial_LHS_Sampling_Basis_link_wise_based.pt"

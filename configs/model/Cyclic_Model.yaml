@@ -3,6 +3,7 @@
 
 # 1. Target: Apunta a la clase Python exacta
 _target_: src.components.models.Cyclic_Model.cyclic_model.CyclicODModel
+model_name: "CyclicODModel"
 
 # 2. Arquitectura (Hiperparámetros del modelo)
 hidden_dim: 128        # Ajustado a un valor estándar (antes tenías 64 en uno y 256 en otro)

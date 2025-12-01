@@ -4,7 +4,7 @@ import hydra
 import torch
 import numpy as np
 from torch.utils.data import DataLoader
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 # Importaciones de TU estructura
 from src.components.models.Cyclic_Model.cyclic_model import PartialDataLoss
@@ -13,6 +13,8 @@ from src.components.models.Cyclic_Model.cyclic_model_data_ingestion import Linko
 from src.utils.traffic_dataset import TrafficDataset
 # Tu motor de sampling existente
 from src.components.sampling.engine import SamplingEngine
+
+from src.train._saving_handler import save_checkpoint
 
 import os
 import sys
@@ -24,6 +26,39 @@ if os.name == 'nt':
 
 
 def run_pipeline(cfg: DictConfig):
+    # Hydra ya ha cambiado el directorio de trabajo a la carpeta de salida configurada en config.yaml
+    output_dir = cfg.runs.dir
+    logging.info(f"Directorio de salida del run: {output_dir}")
+
+    # ---------------------------------------------------------
+    # 1. CONSTRUCCIÓN DEL NOMBRE DEL ARCHIVO (Largo y descriptivo)
+    # ---------------------------------------------------------
+    # Usamos getattr o get para evitar errores si alguna clave no existe
+    # Asumimos que 'network.cost_function' se refiere a cfg.network.cost_function
+    # Si tu config usa 'vdf' en lugar de 'network', ajusta abajo (ej. cfg.vdf.name)
+
+    base_name = (
+        f"Epochs_{cfg.training.epochs}_"
+        f"VDF_{cfg.get('network', {}).get('cost_function', 'UnknownVDF')}_"
+        f"Learning_Rate_{cfg.training.lr}_"
+        f"Flow_Sampling_Rate_{cfg.sampling.flow_rate}_"
+        f"Sampling_Strategy_{cfg.sampling.strategy}_"
+        f"Sampling_Basis_{cfg.sampling.sampling_basis}"
+    )
+
+    model_filename = f"{base_name}.pt"
+    eval_filename = (f"eval_{base_name}.pt")
+
+    full_model_path = os.path.join(output_dir, model_filename)
+    full_eval_path = os.path.join(output_dir, eval_filename)
+
+    logging.info(f"El entrenamiento se guardará en: {model_filename}")
+    logging.info(f"Las evaluaciones se guardarán en: {eval_filename}")
+
+    # ---------------------------------------------------------
+    # 2. INICIO DEL PIPELINE
+    # ---------------------------------------------------------
+
     print(f"[HYDRA] Iniciando Pipeline. Modelo: {cfg.model._target_}")
     device = cfg.training.device
     # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -93,6 +128,32 @@ def run_pipeline(cfg: DictConfig):
         w_reg=cfg.model.loss_weights.w_reg
     ).to(device)
 
+    # Preparar estructura de guardado maestro
+
+    # Inicializamos el diccionario maestro que contendrá TODAS las epochs
+    master_checkpoint = {
+        'config': OmegaConf.to_container(cfg, resolve=True),  # Guardamos config globalmente
+        'epochs_history': {}  # Aquí acumularemos cada checkpoint
+    }
+
+    master_eval_bundle = {
+        'config': OmegaConf.to_container(cfg, resolve=True),
+        'static_data': {
+            # Guardamos esto una sola vez porque es estático
+            'capacity': network_params['capacity'].cpu(),
+            't0': network_params['t0'].cpu(),
+            'link_group': network_params['link_group'].cpu(),
+            # Inputs / Ground Truth
+            'true_flows': torch.FloatTensor(all_flows).cpu(),
+            'true_od': torch.FloatTensor(od_vector).cpu(),
+            'mask_flow_train': torch.BoolTensor(train_mask).cpu(),
+            'mask_flow_test': torch.BoolTensor(test_mask).cpu(),
+            'mask_od_known': torch.BoolTensor(od_mask).cpu(),  # Si aplica
+        },
+        'epochs_history': {}  # Aquí guardaremos las predicciones evolutivas
+    }
+
+
     # --- 5. LOOP DE ENTRENAMIENTO ---
     logging.info("Iniciando loop de entrenamiento (Full Batch)...")
     model.train()
@@ -104,20 +165,6 @@ def run_pipeline(cfg: DictConfig):
         # PASAMOS TODOS LOS DATOS DE GOLPE
         # Nota: Asegúrate de que tu modelo acepte las dimensiones sin la dimensión extra del batch
         # O añade una dimensión 'falsa' de batch si el modelo lo espera: .unsqueeze(0)
-
-        """# Cálculo dinámico de iteraciones
-        # Subimos 1 iteración cada 5 épocas, por ejemplo
-        if epoch < 5:
-            current_sue_iters = 1  # Fase inicial muy rápida
-        else:
-            # Crecimiento progresivo
-            growth = (epoch - 5) // 5
-            current_sue_iters = min(min_iters + growth, max_iters_target)
-
-        # Imprimir para control
-        if epoch % 10 == 0:
-            print(f"Epoch {epoch} | SUE Iters: {current_sue_iters}")"""
-
 
         optimizer.zero_grad()
 
@@ -146,6 +193,48 @@ def run_pipeline(cfg: DictConfig):
         if epoch % 10 == 0:
             logging.info(f"""Epoch {epoch}: Loss {loss_dict['total_loss'].item():.4f} - Flow Loss {loss_dict['l_flow'].item():.4f} - OD Loss {loss_dict['l_od'].item():.4f} - Reg Loss {loss_dict['l_reg'].item():.4f}""")
 
+        current_loss = loss_dict['total_loss'].item()
+
+        # ---------------------------------------------------------
+        # 2. GUARDADO ACUMULATIVO EN UN SOLO ARCHIVO
+        # ---------------------------------------------------------
+        # Guardamos cada 10 epochs Y TAMBIÉN la primer y última
+        if (epoch + 1) == 0 or (epoch + 1) % 10 == 0 or (epoch + 1) == cfg.training.epochs:
+            # 1. Crear el estado de la epoch actual
+            epoch_state = {
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'loss': current_loss,
+                # CORRECCIÓN: Verificamos si v es Tensor antes de llamar a .item()
+                'metrics': {
+                    k: (v.item() if isinstance(v, torch.Tensor) else v)
+                    for k, v in loss_dict.items()
+                }
+            }
+
+            # 2. Añadirlo al historial del maestro usando el número de epoch como clave
+            master_checkpoint['epochs_history'][epoch + 1] = epoch_state
+
+            # 3. Sobreescribir el archivo único con el historial actualizado
+            torch.save(master_checkpoint, full_model_path)
+
+            # --- 2. Guardar Datos de Evaluación (Checkpoint pesado) ---
+            # Extraemos los datos del último forward pass
+            eval_snapshot = {
+                'pred_flows': outputs['reconstructed_flows'].detach().cpu(),
+                'pred_od': outputs['estimated_demand'].detach().cpu(),
+                'route_probs': outputs['route_probs'].detach().cpu(),  # <--- Aquí van las probs
+                'alpha': outputs.get('learned_alpha', torch.tensor(-1)).detach().cpu(),
+                'beta': outputs.get('learned_beta', torch.tensor(-1)).detach().cpu(),
+                'convergence': outputs.get('convergence_info', {})
+            }
+
+            master_eval_bundle['epochs_history'][epoch + 1] = eval_snapshot
+            torch.save(master_eval_bundle, full_eval_path)
+
+            logging.info(f"[Epoch {epoch + 1}] Checkpoint y Evaluación actualizados.")
+
+    logging.info("Entrenamiento completado.")
 
 @hydra.main(version_base=None, config_path="../../configs", config_name="config")
 def main(cfg: DictConfig):

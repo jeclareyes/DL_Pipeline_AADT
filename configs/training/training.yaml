@@ -11,7 +11,7 @@ input_routes:
   link_df: ${data.base_path}/${data.link_data_file}
 
 # Hiperparámetros del Entrenamiento (Optimizador, Loops, etc.)
-epochs: 100
+epochs: 300
 batch_size: 1
 lr: 0.001
 weight_decay: 1e-5

@@ -1,0 +1,2 @@
+_target_: src.components.vdf.bpr_modified.BPRModifiedCostFunction
+learnable_params: true

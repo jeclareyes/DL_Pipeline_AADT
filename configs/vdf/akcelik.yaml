@@ -1,0 +1,3 @@
+_target_: src.components.vdf.akcelik.AkcelikCostFunction
+learnable_params: true
+T: 1.0  # Periodo de análisis en horas (puedes cambiarlo si simulas picos de 15 min = 0.25)

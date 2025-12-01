@@ -41,7 +41,7 @@ sampling:
 network:
   k_paths: 10
   max_route_length: 130
-  cost_function: "bpr"
+  cost_function: "conical" # 'akcelik' | 'bpr_modified' | 'conical' | 'bpr'
 
   # Parámetros iniciales de BPR (pueden ser específicos de la red)
   bpr_params:

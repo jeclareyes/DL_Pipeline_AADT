@@ -215,7 +215,10 @@ class AssignmentValidator(nn.Module):
             flows = self.running_flows.detach().clone()
         else:
             # Cold Start (Flujo Libre)
-            flows = self.assignment_layer(freeflow_costs, estimated_demands)
+            flows, _ = self.assignment_layer(freeflow_costs, estimated_demands)
+
+        # Variable para almacenar las probs de la última iteración
+        final_route_probs = None
 
         # --- BUCLE MSA ---
         converged = False
@@ -227,7 +230,7 @@ class AssignmentValidator(nn.Module):
 
         if warmup:
             # En warmup solo hacemos 1 pasada rápida
-            reconstructed_flows = self.assignment_layer(freeflow_costs, estimated_demands)
+            reconstructed_flows, final_route_probs = self.assignment_layer(freeflow_costs, estimated_demands)
             convergence_info = {"converged": True, "iterations": 1}
         else:
             # Si iters es muy bajo, calculamos gradiente siempre, si no, truncamos.
@@ -240,7 +243,9 @@ class AssignmentValidator(nn.Module):
 
                 with torch.set_grad_enabled(requires_grad):
                     costs = self.cost_function(flows)
-                    new_flows = self.assignment_layer(costs, estimated_demands)
+                    new_flows, current_probs = self.assignment_layer(costs, estimated_demands)
+
+                    final_route_probs = current_probs
 
                     # MSA Step
                     alpha_msa = 1.0 / (it + 1)
@@ -257,7 +262,7 @@ class AssignmentValidator(nn.Module):
         learned_alpha = getattr(self.cost_function, 'get_alpha', lambda: None)()
         learned_beta = getattr(self.cost_function, 'get_beta', lambda: None)()
 
-        return reconstructed_flows, learned_alpha, learned_beta, convergence_info
+        return reconstructed_flows, learned_alpha, learned_beta, convergence_info, final_route_probs
 
 
 class StochasticAssignmentLayer(nn.Module):
@@ -376,7 +381,7 @@ class StochasticAssignmentLayer(nn.Module):
 
         link_flows = link_flows_t.transpose(0, 1)  # [B, L]
 
-        return link_flows
+        return link_flows, route_probs
 
 # =============================================================================
 # FUNCIÓN DE PÉRDIDA
@@ -513,7 +518,7 @@ class CyclicODModel(nn.Module):
         h_y = None
         if self.training and true_od_demand is not None:
             with torch.no_grad():
-                true_flows, _, _, _ = self.validator(true_od_demand, warmup=True)
+                true_flows, _, _, _, _ = self.validator(true_od_demand, warmup=True)
                 h_y = self.encoder(true_flows)
 
         # 3. Matching
@@ -523,7 +528,7 @@ class CyclicODModel(nn.Module):
         estimated_demand = self.decoder(g_x)
 
         # 5. Validar
-        reconstructed_flows, learned_alpha, learned_beta, convergence_info = self.validator(
+        reconstructed_flows, learned_alpha, learned_beta, convergence_info, route_probs = self.validator(
             estimated_demand,
             warmup=warmup,
             override_max_iters=current_iter_count  # <--- Pasamos el valor aquí
@@ -532,11 +537,14 @@ class CyclicODModel(nn.Module):
         if not is_batched:
             estimated_demand = estimated_demand.squeeze(0)
             reconstructed_flows = reconstructed_flows.squeeze(0)
+            if route_probs is not None:
+                route_probs = route_probs.squeeze(0)
 
         return {
             "estimated_demand": estimated_demand,
             "reconstructed_flows": reconstructed_flows,
             "learned_alpha": learned_alpha,
             "learned_beta": learned_beta,
-            "convergence_info": convergence_info
+            "convergence_info": convergence_info,
+            "route_probs": route_probs
         }
