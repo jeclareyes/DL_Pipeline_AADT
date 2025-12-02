@@ -16,7 +16,8 @@ from typing import Optional, Dict, Any
 # =============================================================================
 
 class ODEncoder(nn.Module):
-    """Codifica los aforos en un vector de características latentes."""
+    """Toma el vector de conteos de vehículos (cuántos coches pasaron por cada sensor)
+    y lo comprime en un vector de características (embedding)."""
 
     def __init__(self, num_links: int, hidden_dim: int, feature_dim: int, dropout: float = 0.1):
         super().__init__()
@@ -33,11 +34,16 @@ class ODEncoder(nn.Module):
         )
 
     def forward(self, counts_vector: torch.Tensor) -> torch.Tensor:
+        """Forward pass del encoder.
+            Input: [counts_vector]: Tensor de aforos [batch_size, num_links]
+            Output: Tensor de características latentes [batch_size, feature_dim]
+        """
         return self.network(counts_vector)
 
 
 class ODDecoder(nn.Module):
-    """Decodifica el vector latente regularizado en la demanda OD final."""
+    """Hace lo inverso al Encoder. Toma el vector latente procesado
+    y predice cuántos viajes hay entre cada par Origen-Destino."""
 
     def __init__(self, num_od_pairs: int, hidden_dim: int, feature_dim: int, dropout: float = 0.1):
         super().__init__()
@@ -50,10 +56,15 @@ class ODDecoder(nn.Module):
             nn.LeakyReLU(0.2),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim // 2, num_od_pairs),
-            nn.Softplus()
+            nn.Softplus() # Asegura salidas positivas para demandas
         )
 
     def forward(self, g_x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass del decoder.
+            Input: [g_x]: Tensor de características latentes [batch_size, feature_dim]
+            Output: Tensor de demandas OD predichas [batch_size, num_od_pairs]
+        """
         return self.network(g_x)
 
 
@@ -63,6 +74,11 @@ class ImprovedGraphMatcher(nn.Module):
     - Regularización de matrices M y V
     - Mecanismo de atención más robusto
     - Flujo de gradientes consistente
+
+
+    M: Matriz de Memoria: [feature_dim x num_structures]
+    V: Vector de Votación: [1 x num_structures]
+    attention_net: Una mini-red que decide a qué estructura prestar atención ahora.
     """
 
     def __init__(self, feature_dim: int, num_structures: int,
@@ -89,7 +105,18 @@ class ImprovedGraphMatcher(nn.Module):
         self.register_buffer('update_count', torch.tensor(0.0))
 
     def _update_matrices_regularized(self, h_x: torch.Tensor, h_y: torch.Tensor):
-        """Actualización de matrices M y V con regularización."""
+        """Actualiza la memoria $M$ y $V$ basándose en qué tan bien coincidió la
+        entrada con la referencia. Usa Momentum (promedio móvil) para que la memoria
+        no cambie bruscamente con un solo dato raro.
+
+        Input: h_x: [batch_size, feature_dim]
+
+        Se compara con M: [feature_dim, num_structures]
+        Atención decide pesos: [batch_size, num_structures]
+
+        Ouput: g_x: [batch_size, feature_dim]
+
+        """
         batch_size = h_x.size(0)
 
         # Normalización mejorada
@@ -131,6 +158,8 @@ class ImprovedGraphMatcher(nn.Module):
             self.update_count = uc + 1.0
 
     def forward(self, h_x: torch.Tensor, h_y: torch.Tensor = None) -> torch.Tensor:
+
+        # TODO explicar
         # Actualizar matrices solo en entrenamiento y con referencia
         if self.training and h_y is not None:
             # Usar detach para evitar gradientes en la actualización de matrices
@@ -151,7 +180,9 @@ class ImprovedGraphMatcher(nn.Module):
 
 
 class ImprovedAssignmentValidator(nn.Module):
-    """Validador mejorado con convergencia verificada y estabilización."""
+    """Actúa como un simulador de tráfico "diferenciable".
+    Toma la demanda OD predicha y calcula qué calles se usarían,
+    respetando la congestión (si una calle se llena, los conductores cambian de ruta)."""
 
     def __init__(self, num_links: int, t0: torch.Tensor, capacity: torch.Tensor,
                  route_masks: torch.Tensor, od_pair_indices: torch.Tensor,
@@ -159,7 +190,7 @@ class ImprovedAssignmentValidator(nn.Module):
                  vdf_config: DictConfig,  # MODIFICACIÓN: Recibe config
                  max_iters: int = 10, convergence_threshold: float = 1e-4):
         super().__init__()
-        self.max_iters = max_iters
+        self.max_iters = max_iters # Número máximo de iteraciones SUE
         self.convergence_threshold = convergence_threshold
         self.register_buffer('t0', t0)
 
@@ -198,13 +229,13 @@ class ImprovedAssignmentValidator(nn.Module):
 
             for it in range(1, self.max_iters + 1):
                 costs = self.cost_function(flows)
-                new_flows, current_probs = self.assignment_layer(costs, estimated_demands)
+                new_flows, current_probs = self.assignment_layer(costs, estimated_demands) # Asignación con costos actualizados
 
                 route_probs = current_probs
 
                 # MSA con step size adaptativo
                 alpha_msa = 1.0 / (it + 1)
-                flows = flows + alpha_msa * (new_flows - flows)
+                flows = flows + alpha_msa * (new_flows - flows) # Actualizar flujos
 
                 # Verificar convergencia
                 if it > 2:  # No verificar en las primeras iteraciones
@@ -216,9 +247,9 @@ class ImprovedAssignmentValidator(nn.Module):
                         actual_iters = it
                         break
 
-                prev_flows = flows.clone()
+                prev_flows = flows.clone() # Actualizar para la siguiente iteración
 
-            reconstructed_flows = flows
+            reconstructed_flows = flows # Flujos finales después de SUE
             convergence_info = {"converged": converged, "iterations": actual_iters}
 
             # Actualizar estadísticas de convergencia
@@ -268,6 +299,9 @@ class StaticAssignmentLayer(nn.Module):
     """
     Capa de asignación optimizada para Tensores Esparsos (sin einsum).
     Reemplaza la lógica densa para evitar errores de memoria/runtime.
+
+    Realiza la operación matemática pesada: mapear viajes de rutas
+    a los arcos físicos que componen esas rutas.
     """
 
     def __init__(self, route_masks: torch.Tensor, od_pair_indices: torch.Tensor,
@@ -325,7 +359,7 @@ class StaticAssignmentLayer(nn.Module):
         # Lógica: RouteCosts = (Mask @ LinkCosts.T).T
         # =====================================================================
 
-        # LinkCosts.T -> [Links, Batch]
+        # LinkCosts.T [OD*K, Links] (Sparse) -> [Links, Batch]
         costs_t = torch.transpose(link_costs, 0, 1)
 
         # Sparse MM: [OD*K, Links] @ [Links, Batch] -> [OD*K, Batch]
@@ -363,7 +397,7 @@ class StaticAssignmentLayer(nn.Module):
         # Truco PyTorch: mask.t() en sparse es rápido (solo invierte índices)
         mask_t = self.sparse_mask_2d.t()  # [Links, OD*K]
 
-        # Sparse MM: [Links, OD*K] @ [OD*K, Batch] -> [Links, Batch]
+        # Sparse MM: [Links, OD*K] (Sparse) @ [OD*K, Batch] -> [Links, Batch]
         link_flows_t = torch.sparse.mm(mask_t, rf_t)
 
         # Volver a formato batch: [Batch, Links]
@@ -487,21 +521,26 @@ class UltraCyclicODModel(nn.Module):
                  **kwargs):
         super().__init__()
 
+        # Convierte conteos de tráfico en representación latente
         self.encoder = ODEncoder(num_links, hidden_dim, feature_dim, dropout)
+
+        # Convierte representación latente en demanda OD
         self.decoder = ODDecoder(num_od_pairs, hidden_dim, feature_dim, dropout)
+
+        #
         self.graph_matcher = ImprovedGraphMatcher(feature_dim, num_structures)
+
+        # SUE mejorado con validación de convergencia
         self.validator = ImprovedAssignmentValidator(
             num_links, t0, capacity, route_masks, od_pair_indices,
             num_od_pairs, num_link_groups, link_group,
             vdf_config=vdf_config
         )
 
-        # NO necesitamos encoder separado - usamos el mismo encoder para mantener 
-        # h_x y h_y en el mismo espacio latente
-
-
     def forward(self, observed_counts: torch.Tensor, true_od_demand: torch.Tensor = None,
                 warmup: bool = False) -> dict:
+
+        # 0. Preparación de datos (Batching)
         is_batched = observed_counts.dim() == 2
         if not is_batched:
             observed_counts = observed_counts.unsqueeze(0)
@@ -510,28 +549,33 @@ class UltraCyclicODModel(nn.Module):
 
         # 1. Codificar aforos observados
         h_x = self.encoder(observed_counts)
+        # output: [batch_size, feature_dim]
 
         # 2. Generar referencia h_y usando el MISMO encoder (espacio latente compartido)
         h_y = None
         if self.training and true_od_demand is not None:
             with torch.no_grad():
                 # Simular flujos "ideales" a partir de la OD verdadera
-                true_flows, _, _, _ = self.validator(true_od_demand, warmup=True)
+                true_flows, _, _, _, _ = self.validator(true_od_demand, warmup=True)
 
                 # CRÍTICO: Usar el MISMO encoder para mantener h_x y h_y 
                 # en el mismo espacio latente - esto es clave para que el 
                 # GraphMatcher pueda hacer comparaciones directas
                 h_y = self.encoder(true_flows)
+                # output: [batch_size, feature_dim]
 
         # 3. Aplicar graph matcher
         g_x = self.graph_matcher(h_x, h_y)
+        # output: [batch_size, feature_dim]
 
-        # 4. Decodificar demanda
+        # 4. Decodificar demanda. Toma el vector latente y predice OD
         estimated_demand = self.decoder(g_x)
+        # output: [batch_size, num_od_pairs]
 
         # 5. Validar con SUE
         reconstructed_flows, learned_alpha, learned_beta, convergence_info, route_probs = self.validator(
             estimated_demand, warmup=warmup)
+        # output: [batch_size, num_links], [num_link_groups], [num_link_groups], dict, [batch_size, num_od, k_paths]
 
         if not is_batched:
             estimated_demand = estimated_demand.squeeze(0)
@@ -540,12 +584,12 @@ class UltraCyclicODModel(nn.Module):
                 route_probs = route_probs.squeeze(0)
 
         return {
-            "estimated_demand": estimated_demand,
-            "reconstructed_flows": reconstructed_flows,
-            "learned_alpha": learned_alpha,
-            "learned_beta": learned_beta,
-            "convergence_info": convergence_info,
-            "route_probs": route_probs
+            "estimated_demand": estimated_demand, # output: [num_od_pairs]
+            "reconstructed_flows": reconstructed_flows, # output: [num_links]
+            "learned_alpha": learned_alpha, # output: [num_link_groups]
+            "learned_beta": learned_beta, # output: [num_link_groups]
+            "convergence_info": convergence_info, # output: dict
+            "route_probs": route_probs # output: [num_od, k_paths]
         }
 
     def validate_latent_space_consistency(self, observed_counts, true_od_demand):
