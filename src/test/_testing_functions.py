@@ -205,7 +205,7 @@ def load_eval_bundle(file_path: str) -> Dict[str, Any]:
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"No se encontró el archivo: {file_path}")
 
-    logging.info(f"📂 Cargando datos de evaluación: {file_path}")
+    logging.info(f"Cargando datos de evaluación: {file_path}")
     return torch.load(file_path, map_location='cpu')
 
 
@@ -219,7 +219,7 @@ def get_latest_epoch_data(bundle: Dict[str, Any]) -> tuple:
     sorted_epochs = sorted(history.keys(), key=lambda x: int(x))
     latest_epoch = sorted_epochs[-1]
 
-    logging.info(f"⏳ Usando datos de la época {latest_epoch} para el análisis.")
+    logging.info(f"Usando datos de la época {latest_epoch} para el análisis.")
     return int(latest_epoch), history[latest_epoch]
 
 
@@ -386,6 +386,127 @@ def plot_link_histograms(df: pd.DataFrame, model_name: str, output_dir: str):
     plt.close()
 
 
+# =============================================================================
+# FUNCIONES DE EXPORTACIÓN (Nuevas)
+# =============================================================================
+
+def export_flows_csv(
+        pred_flows: np.ndarray,
+        true_flows: np.ndarray,
+        mask_observed: np.ndarray,
+        output_path: str,
+        extras: Dict[str, np.ndarray] = None
+):
+    """
+    Exporta un CSV con comparación de flujos y variables físicas opcionales.
+
+    Args:
+        pred_flows: Array de flujos estimados.
+        true_flows: Array de flujos reales (ground truth).
+        mask_observed: Array booleano (True donde hay lectura real).
+        output_path: Ruta donde guardar el CSV.
+        extras: Diccionario opcional con {nombre_columna: array_datos}
+                ej: {'Capacity': cap_array, 'Link_Type': type_array}
+    """
+    # 1. Columnas Base
+    df = pd.DataFrame({
+        'estimated_flow': pred_flows.flatten(),
+        'true_flow': true_flows.flatten(),
+        'is_observed': mask_observed.flatten().astype(bool)
+    })
+
+    # 2. Añadir columnas opcionales (Capacity, t0, Link_Type, etc.)
+    if extras:
+        for col_name, data in extras.items():
+            # Aseguramos que tenga la misma longitud
+            if len(data.flatten()) == len(df):
+                df[col_name] = data.flatten()
+            else:
+                logging.warning(
+                    f"La variable extra '{col_name}' no tiene la misma longitud que los flujos. Se omite.")
+
+    # 3. Guardar
+    df.to_csv(output_path, index_label='link_index')
+    logging.info(f"Flujos exportados a: {output_path}")
+
+
+def _classify_pair_type(o_node: int, d_node: int, num_tazs: int) -> str:
+    """Clasifica el par según si sus nodos son TAZ (Centroides) o Auxiliares."""
+    # Asumimos que los primeros 'num_tazs' nodos (0 a num_tazs-1) son los centroides
+    o_is_taz = o_node < num_tazs
+    d_is_taz = d_node < num_tazs
+
+    if o_is_taz and d_is_taz:
+        return 'taz to taz'
+    elif o_is_taz and not d_is_taz:
+        return 'taz to aux'
+    elif not o_is_taz and d_is_taz:
+        return 'aux to taz'
+    else:
+        return 'aux to aux'
+
+
+def export_od_analysis_csv(
+        pred_demand: np.ndarray,
+        true_demand: np.ndarray,
+        od_indices: np.ndarray,
+        output_path: str,
+        mask_known: Optional[np.ndarray] = None,
+        num_centroids: int = 0
+):
+    """
+    Exporta CSV detallado de pares OD con clasificación de tipo de nodo.
+
+    Args:
+        pred_demand: Array de demanda estimada.
+        true_demand: Array de demanda real.
+        od_indices: Array/Tensor [N_pairs, 2] con los IDs de nodo (Origen, Destino).
+        output_path: Ruta de salida.
+        mask_known: Array booleano indicando qué pares eran conocidos (input).
+        num_centroids: Número de centroides (TAZs) para clasificar tipos de par.
+    """
+    # Validar dimensiones
+    if len(pred_demand) != len(od_indices):
+        raise ValueError(f"Desajuste: {len(pred_demand)} demandas vs {len(od_indices)} índices OD.")
+
+    # 1. Crear DataFrame Base
+    df = pd.DataFrame({
+        'origin_node': od_indices[:, 0],
+        'destination_node': od_indices[:, 1],
+        'estimated_od': pred_demand,
+        'known_od_value': true_demand if true_demand is not None else np.zeros_like(pred_demand)
+    })
+
+    # 2. Columna Booleana de "Conocido"
+    if mask_known is not None:
+        df['is_known_pair'] = mask_known.astype(bool)
+    else:
+        df['is_known_pair'] = False  # Por defecto todo desconocido si no se pasa máscara
+
+    # 3. Clasificación de Pares (TAZ vs Aux)
+    # Vectorizamos la operación para eficiencia
+    if num_centroids > 0:
+        # Convertimos a numpy para iterar rápido si no lo es
+        if isinstance(od_indices, torch.Tensor):
+            indices_np = od_indices.cpu().numpy()
+        else:
+            indices_np = od_indices
+
+        df['pair_type'] = [
+            _classify_pair_type(o, d, num_centroids)
+            for o, d in indices_np
+        ]
+    else:
+        df['pair_type'] = 'unknown (no num_centroids provided)'
+
+    # 4. Reordenar columnas para que origin/dest/type queden primero
+    cols = ['origin_node', 'destination_node', 'pair_type', 'estimated_od', 'known_od_value', 'is_known_pair']
+    df = df[cols]
+
+    df.to_csv(output_path, index=False)
+    logging.info(f"Análisis OD exportado a: {output_path}")
+
+
 def process_evaluation(file_path: str, output_dir: str):
     """Función principal orquestadora (Actualizada con Scatter Plots)."""
 
@@ -393,6 +514,7 @@ def process_evaluation(file_path: str, output_dir: str):
     bundle = load_eval_bundle(file_path)
 
     static = bundle['static_data']
+    mask = static['masks']
     epoch_num, dynamic = get_latest_epoch_data(bundle)
 
     # --- DATOS FLOWS ---
@@ -400,7 +522,9 @@ def process_evaluation(file_path: str, output_dir: str):
     true_flows = static['true_flows'].numpy()
     capacity = static['capacity'].numpy()
     link_groups = static['link_group'].numpy()
-    mask_test = static['mask_flow_test'].numpy().astype(bool)
+    mask_test = mask['flow_test'].numpy().astype(bool)
+
+
 
     # --- MÉTRICAS FLOWS ---
     # Calcular métricas globales y específicas de Test
@@ -415,7 +539,7 @@ def process_evaluation(file_path: str, output_dir: str):
         scatter_mask = None
         scatter_label = "All Links"
 
-    logging.info(f"📊 Métricas Links ({subset_name}): {link_metrics}")
+    logging.info(f"Métricas Links ({subset_name}): {link_metrics}")
 
     # GRÁFICO 1: Scatter Flows (Real vs Pred)
     plot_scatter_comparison(
@@ -444,7 +568,7 @@ def process_evaluation(file_path: str, output_dir: str):
 
         # Métricas sobre TODO el conjunto (generalmente queremos ver si recuperó la matriz entera)
         od_metrics = calculate_metrics(pred_od, true_od)
-        logging.info(f"📊 Métricas OD Matrix (Global): {od_metrics}")
+        logging.info(f"Métricas OD Matrix (Global): {od_metrics}")
 
         # GRÁFICO 2: Scatter OD (Real vs Pred)
         # Filtramos para resaltar los conocidos ("que solo se conocían obviamente")
@@ -474,7 +598,7 @@ def process_evaluation(file_path: str, output_dir: str):
     metrics_df.to_csv(os.path.join(output_dir, f"{model_name}_metrics.csv"), index=False)
 
     # 4. Histogramas (Igual que antes)
-    group_map = {0: 'Highway', 1: 'Arterial', 2: 'Collector', 3: 'Local'}
+    group_map = {0: 'Multi-Lane', 1: 'Motorway', 2: 'Two_Lane', 3: 'Rural', 4: 'Connectors'}
     link_types_mapped = [group_map.get(g, f'Type_{g}') for g in link_groups]
     safe_capacity = capacity.copy()
     safe_capacity[safe_capacity == 0] = 1.0
@@ -488,4 +612,62 @@ def process_evaluation(file_path: str, output_dir: str):
     })
 
     plot_link_histograms(df_vis, model_name, output_dir)
-    logging.info(f"✅ Evaluación (Gráficos y Métricas) completada para: {model_name}")
+    logging.info(f"Evaluación (Gráficos y Métricas) completada para: {model_name}")
+
+    # =====================================================
+    # NUEVO: EXPORTACIÓN DE FLUJOS (CSV)
+    # =====================================================
+    # Preparamos las variables opcionales del usuario
+    flow_extras = {
+        'capacity': static['capacity'].numpy(),
+        't0': static['t0'].numpy(),
+        'link_group': static['link_group'].numpy()
+    }
+
+    # Usamos la máscara de test como "is_observed" para distinguir
+    # OJO: Si tienes una máscara global de "sensores reales", úsala aquí.
+    # Usualmente mask_flow_train | mask_flow_test = todos los sensores.
+    mask_observed_total = (
+            static['masks']['flow_train'].numpy().astype(bool) |
+            static['masks']['flow_test'].numpy().astype(bool)
+    )
+
+    export_flows_csv(
+        pred_flows=pred_flows,
+        true_flows=true_flows,
+        mask_observed=mask_observed_total,
+        output_path=os.path.join(output_dir, f"{model_name}_flows_detailed.csv"),
+        extras=flow_extras
+    )
+
+    # =====================================================
+    # EXPORTACIÓN DE OD PAIRS (CSV) - ACTUALIZADO
+    # =====================================================
+    if 'true_od' in static and static['true_od'] is not None:
+
+        # VERIFICACIÓN: ¿Tenemos los índices guardados?
+        if 'od_pair_indices' in static:
+            od_indices = static['od_pair_indices'].numpy()
+            num_centroids = static.get('num_centroids', 0)  # Leemos del archivo, no del loader
+
+            true_od = static['true_od'].numpy()
+            pred_od = dynamic['pred_od'].numpy()
+
+            mask_od_known = None
+            if 'mask_od_known' in static:
+                mask_od_known = static['mask_od_known'].numpy()
+
+            export_od_analysis_csv(
+                pred_demand=pred_od,
+                true_demand=true_od,
+                od_indices=od_indices,
+                output_path=os.path.join(output_dir, f"{model_name}_od_analysis.csv"),
+                mask_known=mask_od_known,
+                num_centroids=num_centroids
+            )
+        else:
+            # Fallback por si intentas evaluar un modelo viejo que no tenía estos datos guardados
+            logging.warning(
+                f"El archivo {model_name} no contiene 'od_indices'. No se puede exportar el análisis OD detallado. (Re-entrena el modelo con el nuevo pipeline).")
+
+    logging.info(f"Evaluación completa para: {model_name}")

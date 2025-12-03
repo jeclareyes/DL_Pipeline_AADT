@@ -531,7 +531,7 @@ class CyclicODModel(nn.Module):
         reconstructed_flows, learned_alpha, learned_beta, convergence_info, route_probs = self.validator(
             estimated_demand,
             warmup=warmup,
-            override_max_iters=current_iter_count  # <--- Pasamos el valor aquí
+            override_max_iters=current_iter_count
         )
 
         if not is_batched:

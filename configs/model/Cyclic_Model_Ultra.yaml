@@ -2,7 +2,7 @@
 
 # 1. Target: Apunta al wrapper de compatibilidad o al modelo directo
 _target_: src.components.models.Cyclic_Model_2.cyclic_model_ultra.CyclicODModelUltra
-model_name: "CyclicODModelUltra"
+model_name: "CyclicODModel_U"
 
 # 2. Arquitectura
 hidden_dim: 128

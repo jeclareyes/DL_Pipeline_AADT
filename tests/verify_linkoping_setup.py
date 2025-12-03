@@ -35,13 +35,13 @@ def main():
 
     # 1. Verificar archivos de configuración
     print("\n1. ARCHIVOS DE CONFIGURACIÓN")
-    all_ok &= check_file("../configs/linkoping.yaml", "Configuración")
+    all_ok &= check_file("../configs/dataset/Linköping.yaml", "Configuración")
 
     # 2. Verificar scripts
     print("\n2. SCRIPTS DE ENTRENAMIENTO")
     all_ok &= check_file("../src/components/models/Cyclic_Model/cyclic_model.py", "Modelo")
     all_ok &= check_file("../src/components/models/Cyclic_Model/cyclic_model_data_ingestion.py", "Data Loader")
-    all_ok &= check_file("../src/components/models/Cyclic_Model/train_cyclic_model.py", "Script de entrenamiento")
+    all_ok &= check_file("../src/components/models/Cyclic_Model/train_cyclic_model_deprecated.py", "Script de entrenamiento")
 
     # 3. Verificar datos
     print("\n3. DATOS DE LINKÖPING")
@@ -100,7 +100,7 @@ def main():
     # 4. Verificar configuración
     print("\n4. CONFIGURACIÓN")
     try:
-        with open("../configs/linkoping.yaml", 'r', encoding='utf-8') as f:
+        with open("../configs/dataset/Linköping.yaml", 'r', encoding='utf-8') as f:
             config = yaml.safe_load(f)
 
         print(f"   ✓ YAML cargado correctamente")
@@ -181,7 +181,7 @@ def main():
         print("✅ VERIFICACIÓN COMPLETADA - TODO LISTO PARA ENTRENAMIENTO")
         print("=" * 80)
         print("\nPara iniciar el entrenamiento, ejecutar:")
-        print("   python src/models/Cyclic_Model/train_cyclic_model.py --config configs/linkoping.yaml")
+        print("   python src/models/Cyclic_Model/train_cyclic_model_deprecated.py --config configs/Linköping.yaml")
         print("\nO usar el script rápido:")
         print("   train_linkoping.bat")
         return 0

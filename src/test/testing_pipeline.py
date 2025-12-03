@@ -34,7 +34,7 @@ def main(cfg: DictConfig):
     results_dir = os.path.join(model_dir, "test_results")
     os.makedirs(results_dir, exist_ok=True)
 
-    logging.info(f"🚀 Iniciando Testing Pipeline en: {model_dir}")
+    logging.info(f"Iniciando Testing Pipeline en: {model_dir}")
 
     target_files = []
 
@@ -54,7 +54,7 @@ def main(cfg: DictConfig):
         if os.path.exists(file_path):
             target_files.append(file_path)
         else:
-            logging.error(f"❌ No se encontró el archivo específico: {file_path}")
+            logging.error(f" No se encontró el archivo específico: {file_path}")
             # Intento de fallback: buscar si el usuario puso el nombre sin extensión
             if not file_path.endswith(".pt"):
                 if os.path.exists(file_path + ".pt"):
@@ -64,10 +64,10 @@ def main(cfg: DictConfig):
         # Modo Batch: Todos los eval_*.pt en la carpeta
         pattern = os.path.join(model_dir, "eval_*.pt")
         target_files = glob(pattern)
-        logging.info(f"🔎 Modo Batch: Se encontraron {len(target_files)} modelos para evaluar.")
+        logging.info(f"Modo Batch: Se encontraron {len(target_files)} modelos para evaluar.")
 
     if not target_files:
-        logging.warning("⚠️ No hay archivos para procesar. Verifica paths y prefijos 'eval_'.")
+        logging.warning("No hay archivos para procesar. Verifica paths y prefijos 'eval_'.")
         return
 
     # 3. Ejecución del Test
@@ -75,7 +75,7 @@ def main(cfg: DictConfig):
         try:
             process_evaluation(pt_file, results_dir)
         except Exception as e:
-            logging.error(f"❌ Error evaluando {os.path.basename(pt_file)}: {str(e)}")
+            logging.error(f"Error evaluando {os.path.basename(pt_file)}: {str(e)}")
             import traceback
             traceback.print_exc()
 

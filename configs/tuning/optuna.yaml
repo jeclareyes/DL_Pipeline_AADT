@@ -1,0 +1,40 @@
+# @package _global_
+
+# Valores por defecto para la orquestación
+defaults:
+  - override /hydra/sweeper: optuna
+  - override /hydra/sweeper/sampler: tpe
+
+hydra:
+  sweeper:
+    sampler:
+      seed: 123
+    direction: minimize  # Queremos minimizar el MSE
+    study_name: traffic_assignment_optimization
+    storage: null  # Opcional: "sqlite:///optuna.db" para guardar historial si se corta la luz
+    n_trials: 20   # Número total de experimentos a correr
+    n_jobs: 1      # Cuántos experimentos correr en paralelo (Cuidado con la GPU)
+
+    # AQUÍ DEFINIMOS QUÉ SE TUNEA
+    # Si quieres "apagar" una variable, simplemente coméntala (#).
+    params:
+
+      # --- 1. ARQUITECTURA (Prioridad Alta) ---
+      # Tamaño de las capas ocultas
+      model.hidden_dim: choice(64, 128, 256)
+      # Tamaño del vector latente
+      model.feature_dim: choice(32, 64)
+      # Número de estructuras en el GraphMatcher
+      model.num_structures: int(interval(3, 10))
+      # Dropout para regularización
+      model.dropout: interval(0.0, 0.5)
+
+      # --- 2. ENTRENAMIENTO (Prioridad Alta) ---
+      # Tasa de aprendizaje (escala logarítmica es mejor para LR)
+      training.lr: tag(log, interval(0.0001, 0.1))
+      # Decaimiento de pesos (L2 regularization)
+      training.weight_decay: interval(1e-6, 1e-3)
+
+      # --- 3. FÍSICA Y PÉRDIDA (Prioridad Secundaria - Descomentar para activar) ---
+      # model.loss_weights.w_reg: interval(0.001, 0.1)
+      # model.loss_weights.w_od: interval(0.1, 5.0)

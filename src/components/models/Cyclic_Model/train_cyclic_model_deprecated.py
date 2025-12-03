@@ -8,7 +8,7 @@ Este script entrena el modelo CyclicODModel con:
 - Exportación de resultados
 
 Uso:
-    python src/models/train_cyclic_model.py --od_rate 0.2 --flow_rate 0.3 --epochs 100
+    python src/models/train_cyclic_model_deprecated.py --od_rate 0.2 --flow_rate 0.3 --epochs 100
 """
 import sys
 from pathlib import Path
@@ -464,7 +464,7 @@ def compare_with_frank_wolfe(model: nn.Module,
 
 def main():
     parser = argparse.ArgumentParser(description='Train Cyclic Model for Linköping Traffic Assignment')
-    parser.add_argument('--config', type=str, default='configs/linkoping.yaml',
+    parser.add_argument('--config', type=str, default='configs/Linköping.yaml',
                        help='Ruta al archivo de configuración YAML')
     parser.add_argument('--volume_year', type=int, default=None,
                        help='Año de volumen (sobrescribe config)')
