@@ -74,30 +74,80 @@ class TNTPNetworkLoader:
                 data_lines.append(line)
         return data_lines
 
-    def _parse_dataframe(self, data_lines: List[str]) -> pd.DataFrame:
+    def _parse_dataframe(
+            self,
+            data_lines: List[str],
+            columns: Optional[List[str]] = None
+    ) -> pd.DataFrame:
+        """
+        Parse the cleaned data lines into a pandas DataFrame.
+
+        If `columns` is provided, it is used directly as column names, in
+        the same order as in the original TNTP header. Otherwise, a set of
+        heuristics is applied to infer column names.
+        """
         if not data_lines:
             raise ValueError('No se encontraron líneas de datos en el archivo')
+
         data_string = '\n'.join(data_lines)
-        raw = pd.read_csv(io.StringIO(data_string), sep=r'\s+', header=None, engine='python')
+
+        # Leer como columnas separadas por espacios/tabulaciones
+        raw = pd.read_csv(
+            io.StringIO(data_string),
+            sep=r'\s+',
+            header=None,
+            engine='python'
+        )
+
+        # 1) Caso: tenemos header original → usamos exactamente ese orden
+        if columns is not None:
+            # Normalizar nombres: quitar espacios y, si quieres, pasarlos a minúsculas
+            norm_cols = [c.strip() for c in columns if c.strip()]
+            raw.columns = norm_cols
+
+            # Convertir a numéricas donde aplique
+            for col in raw.columns:
+                if col.lower() == 'lanes':
+                    raw[col] = pd.to_numeric(raw[col], errors='coerce')
+                    raw[col] = raw[col].fillna(1).astype(int)
+                else:
+                    raw[col] = pd.to_numeric(raw[col], errors='coerce')
+
+            return raw
+
+        # 2) Fallback: no hay header, usar tu lógica actual
         ncols = raw.shape[1]
-        base_cols = ['init_node', 'term_node', 'capacity', 'length',
-                     'free_flow_time', 'b', 'power', 'speed', 'toll', 'link_type']
-        cols = None
+
+        base_cols = [
+            'init_node', 'term_node', 'capacity', 'length',
+            'free_flow_time', 'b', 'power', 'speed', 'toll', 'link_type'
+        ]
+
+        cols: List[str]
+
         if ncols == len(base_cols):
             cols = base_cols
+
         elif ncols == len(base_cols) + 1:
             col3 = raw.iloc[:, 3]
             try:
-                frac_small_int = (col3.dropna().apply(float).round(0) == col3.dropna().astype(float)).sum() / max(1, len(col3.dropna()))
+                frac_small_int = (
+                                         col3.dropna().apply(float).round(0)
+                                         == col3.dropna().astype(float)
+                                 ).sum() / max(1, len(col3.dropna()))
             except Exception:
                 frac_small_int = 0.0
+
             median_col3 = float(col3.dropna().median()) if len(col3.dropna()) > 0 else float('nan')
+
             if (not pd.isna(median_col3) and median_col3 <= 20 and frac_small_int > 0.6):
                 cols = ['init_node', 'term_node', 'capacity', 'lanes'] + base_cols[3:]
             else:
                 cols = base_cols[:9] + ['VDF'] + base_cols[9:]
+
         elif ncols == len(base_cols) + 2:
             cols = ['init_node', 'term_node', 'capacity', 'lanes'] + base_cols[3:9] + ['VDF'] + [base_cols[9]]
+
         else:
             cols = []
             for i in range(ncols):
@@ -105,23 +155,52 @@ class TNTPNetworkLoader:
                     cols.append(base_cols[i])
                 else:
                     cols.append(f'col_extra_{i}')
+
         raw.columns = cols
+
         for col in raw.columns:
-            if col in ['lanes']:
+            if col == 'lanes':
                 raw[col] = pd.to_numeric(raw[col], errors='coerce')
                 raw[col] = raw[col].fillna(1).astype(int)
             elif col == 'VDF':
                 raw[col] = pd.to_numeric(raw[col], errors='coerce')
             else:
                 raw[col] = pd.to_numeric(raw[col], errors='coerce')
+
         return raw
 
     def load(self) -> Tuple[pd.DataFrame, Dict[str, Union[int, List[str]]]]:
+        """
+        Load the TNTP network file into memory, using the original header
+        line (if present) to set column names in the same order as the file.
+        """
         lines = self._read_lines()
         metadata = self._parse_metadata(lines)
+
+        # Encontrar dónde empiezan los datos
         start_idx = self._find_data_start(lines)
+
+        # Intentar coger el header justo antes de los datos
+        columns_from_file: Optional[List[str]] = None
+        if start_idx > 0:
+            header_line = lines[start_idx - 1].strip()
+            # Si parece una línea de nombres de columnas, la usamos
+            if 'init_node' in header_line.lower() and 'term_node' in header_line.lower():
+                # split() separa por cualquier cantidad de espacios → respeta el orden
+                columns_from_file = header_line.split()
+
+        # También respetar columnas que vengan desde <ORIGINAL HEADER>, si existieran
+        if 'columns' in metadata and metadata['columns']:
+            # Prioridad al header explícito del fichero, si lo prefieres:
+            # columns_from_file = columns_from_file or metadata['columns']
+            # O prioridad a metadata['columns']:
+            columns_from_file = metadata['columns']  # type: ignore
+
         data_lines = self._prepare_data_lines(lines, start_idx)
-        df = self._parse_dataframe(data_lines)
+
+        # Pasar la lista de columnas al parser
+        df = self._parse_dataframe(data_lines, columns=columns_from_file)
+
         return df, metadata
 
 

@@ -1,4 +1,4 @@
-import logging
+﻿import logging
 
 import hydra
 import torch
@@ -64,32 +64,85 @@ def run_pipeline(cfg: DictConfig):
     # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Usando device: {device}")
 
-    # --- 1. DATA INGESTION (Usando tu clase adaptada) ---
-    print("Cargando datos estructurales...")
+    # ---------------------------------------------------------
+    # 1. DATA INGESTION (Load Universe & Observed)
+    # ---------------------------------------------------------
+    print("Loading Data...")
     # config entera. El loader sacará las rutas de ahí.
     loader = LinkopingDataLoader(cfg)
-
     loader.load_all()
-    # tensores estructurales (t0, capacity, masks)
-    # Method prepare_network_parameters() .
-    network_params = loader.prepare_network_parameters()
+    network_params = loader.prepare_network_parameters() # tensores estructurales (t0, capacity, masks)
 
-    all_flows, train_mask, test_mask = loader.prepare_observed_flows()
-    od_vector, od_mask = loader.prepare_od_demand_vector()
+    # A) Flujos: Universo total y máscara de observados (Known)
+    all_flows, observed_flow_mask = loader.prepare_observed_flows()
 
-    # --- 2. SAMPLING (Integrando engine) ---
-    print("🎲 Ejecutando Sampling Engine...")
+    # B) OD: Universo total y máscara de observados (Known)
+    od_vector, observed_od_mask = loader.prepare_od_demand_vector()
+
+    # C) Calcular UNOBSERVED (Unknown) por complemento
+    # Unobserved = 1 - Observed
+    unobserved_flow_mask = 1.0 - observed_flow_mask
+    unobserved_od_mask = 1.0 - observed_od_mask
+
+    # ---------------------------------------------------------
+    # 2. SAMPLING (Split Observed into Training & Testing)
+    # ---------------------------------------------------------
+    logging.info("Ejecutando Sampling Engine (Train/Test Split)...")
     sampling_engine = SamplingEngine(config=cfg)
 
-    # (Ajusta esto según el retorno real de engine.run())
-    sampled_flow_mask = sampling_engine.run(save=False)
+    # El engine recibe LO OBSERVADO y devuelve LO DE ENTRENAMIENTO
+    train_flow_mask, train_od_mask = sampling_engine.run(
+        override_graph=loader.graph,
+        override_observed_flow_mask=observed_flow_mask,
+        override_observed_od_mask=observed_od_mask
+    )
 
-    # Si engine no retorna la máscara OD, generamos o sacamos del loader
-    sampled_od_mask = od_mask  # TODO hacer sampling de OD
+    # Calcular TESTING por sustracción:
+    # Testing = Observed - Training
+    # (Matemáticamente seguro porque train es subset de observed)
+    test_flow_mask = observed_flow_mask - train_flow_mask
+    test_od_mask = observed_od_mask - train_od_mask
 
-    # --- 3. INSTANCIACIÓN DEL MODELO  ---
-    print("⚙️ Construyendo Modelo Dinámicamente...")
+    # Validación de seguridad (evitar -1 por errores de redondeo)
+    test_flow_mask = np.clip(test_flow_mask, 0.0, 1.0)
+    test_od_mask = np.clip(test_od_mask, 0.0, 1.0)
 
+    # ---------------------------------------------------------
+    # 3. RESUMEN DE DATASETS (sanity check)
+    # ---------------------------------------------------------
+    from src.train._pipeline_utils import log_dataset_summary
+
+    # For LINKS
+    log_dataset_summary("LINKS", len(all_flows), observed_flow_mask, train_flow_mask, test_flow_mask,
+                        unobserved_flow_mask, logging)
+
+    logging.info("-" * 40)
+
+    # For OD PAIRS
+    log_dataset_summary("OD PAIRS", len(od_vector), observed_od_mask, train_od_mask, test_od_mask, unobserved_od_mask,
+                        logging)
+
+    # ---------------------------------------------------------
+    # 4. PREPARACIÓN DE TENSORES
+    # ---------------------------------------------------------
+    logging.info("Enviando tensores al device...")
+
+    # Datos
+    true_flows_t = torch.FloatTensor(all_flows).to(device)
+    true_od_t = torch.FloatTensor(od_vector).to(device)
+
+    # Máscaras Principales (Para el Modelo/Loss)
+    train_flow_mask_t = torch.FloatTensor(train_flow_mask).to(device)
+    train_od_mask_t = torch.FloatTensor(train_od_mask).to(device)
+
+    # Máscaras Auxiliares (Para Evaluación posterior)
+    test_flow_mask_t = torch.FloatTensor(test_flow_mask).to(device)
+    # unobserved_t no suele necesitarse en GPU, pero se puede subir si se requiere
+
+    # ---------------------------------------------------------
+    # 5. MODELO & ENTRENAMIENTO
+    # ---------------------------------------------------------
+    logging.info("Construyendo Modelo...")
     # Hydra toma los hiperparámetros del YAML (hidden_dim, etc.)
     # Inyección de tensores
     logging.info("Instanciando modelo con Hydra...")
@@ -107,15 +160,6 @@ def run_pipeline(cfg: DictConfig):
         _recursive_=False
     )
     model.to(device)
-
-    # --- 4. PREPARACIÓN DE ENTRENAMIENTO ---
-    # Convertir a tensores y mover DIRECTAMENTE al device (GPU/CPU)
-
-    logging.info("Enviando tensores de flujos y pares OD al device...")
-    true_flows_t = torch.FloatTensor(all_flows).to(device)
-    true_od_t = torch.FloatTensor(od_vector).to(device)
-    flow_mask_t = torch.FloatTensor(sampled_flow_mask).to(device)
-    od_mask_t = torch.FloatTensor(sampled_od_mask).to(device)
 
     logging.info("Configurando optimizador y función de pérdida...")
     # optimizer = torch.optim.Adam(model.parameters(), lr=cfg.training.lr)
@@ -152,19 +196,30 @@ def run_pipeline(cfg: DictConfig):
         'epochs_history': {}  # Aquí acumularemos cada checkpoint
     }
 
+    # TODO: está pendiente VDF y Número de carriles
     master_eval_bundle = {
         'config': OmegaConf.to_container(cfg, resolve=True),
         'static_data': {
             # Guardamos esto una sola vez porque es estático
+            'true_flows': torch.FloatTensor(all_flows).cpu(),
+            'true_od': torch.FloatTensor(od_vector).cpu(),
+
+            # Parámetros de red
             'capacity': network_params['capacity'].cpu(),
             't0': network_params['t0'].cpu(),
             'link_group': network_params['link_group'].cpu(),
-            # Inputs / Ground Truth
-            'true_flows': torch.FloatTensor(all_flows).cpu(),
-            'true_od': torch.FloatTensor(od_vector).cpu(),
-            'mask_flow_train': torch.BoolTensor(train_mask).cpu(),
-            'mask_flow_test': torch.BoolTensor(test_mask).cpu(),
-            'mask_od_known': torch.BoolTensor(od_mask).cpu(),  # Si aplica
+
+            # Máscaras completas
+            'masks': {
+                'flow_observed': torch.BoolTensor(observed_flow_mask).cpu(),
+                'flow_unobserved': torch.BoolTensor(unobserved_flow_mask).cpu(),
+                'flow_train': torch.BoolTensor(train_flow_mask).cpu(),
+                'flow_test': torch.BoolTensor(test_flow_mask).cpu(),
+
+                'od_observed': torch.BoolTensor(observed_od_mask).cpu(),
+                'od_train': torch.BoolTensor(train_od_mask).cpu(),
+                'od_test': torch.BoolTensor(test_od_mask).cpu()
+            }
         },
         'epochs_history': {}  # Aquí guardaremos las predicciones evolutivas
     }
@@ -187,7 +242,8 @@ def run_pipeline(cfg: DictConfig):
         # Forward
         outputs = model(
             observed_flows=true_flows_t,
-            flow_mask=flow_mask_t,
+            flow_mask=train_flow_mask_t,
+            true_od_demand=true_od_t,
             warmup=(epoch < 5)
         )
 
@@ -195,10 +251,10 @@ def run_pipeline(cfg: DictConfig):
         loss_dict = criterion(
             predicted_flows=outputs['reconstructed_flows'],
             true_flows=true_flows_t,
-            flow_mask=flow_mask_t,
+            flow_mask=train_flow_mask_t,
             predicted_od=outputs['estimated_demand'],
             true_od=true_od_t,
-            od_mask=od_mask_t,
+            od_mask=train_od_mask_t, # TODO, sería train porque no usamos test od loss. Pero debo confirmar si esto es una buena práctica
             learned_alpha=outputs.get('learned_alpha'),
             learned_beta=outputs.get('learned_beta')
         )

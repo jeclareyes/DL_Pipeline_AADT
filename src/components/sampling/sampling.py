@@ -317,7 +317,8 @@ def create_partial_data_masks(
     flow_rate: float,
     od_rate: float,
     graph: Union[nx.Graph, nx.DiGraph],
-    volume_year: Optional[int] = None,
+    # volume_year: Optional[int] = 2022,  # TODO implementar en yaml
+    volume_year: int = 2022,
     random_seed: int = 42,
     strategy: str = "random",
     sampling_basis: str = "link_wise_based"

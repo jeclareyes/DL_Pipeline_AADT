@@ -4,16 +4,8 @@ import torch.nn.functional as F
 import hydra
 from omegaconf import DictConfig
 from typing import Optional, Dict, Any
+import logging
 
-
-# =============================================================================
-# MEJORAS IMPLEMENTADAS:
-# 1. Graph Matcher con regularización y flujo de gradientes consistente
-# 2. Generación más robusta de h_y usando un encoder separado
-# 3. Función de pérdida adaptativa y balanceada
-# 4. Mecanismo de atención mejorado
-# 5. Validación de convergencia en SUE
-# =============================================================================
 
 class ODEncoder(nn.Module):
     """Toma el vector de conteos de vehículos (cuántos coches pasaron por cada sensor)
@@ -188,10 +180,15 @@ class ImprovedAssignmentValidator(nn.Module):
                  route_masks: torch.Tensor, od_pair_indices: torch.Tensor,
                  num_od_pairs: int, num_link_groups: int, link_group: torch.Tensor,
                  vdf_config: DictConfig,  # MODIFICACIÓN: Recibe config
-                 max_iters: int = 10, convergence_threshold: float = 1e-4):
+                 max_iters: int = 100,
+                 convergence_threshold: float = 1e-2,
+                 max_trips_scaler: float = 1.0): # Factor de escala para desnormalizar
         super().__init__()
+
         self.max_iters = max_iters # Número máximo de iteraciones SUE
         self.convergence_threshold = convergence_threshold
+        self.max_trips_scaler = max_trips_scaler
+
         self.register_buffer('t0', t0)
 
         # Función de costos con inicialización mejorada
@@ -207,63 +204,114 @@ class ImprovedAssignmentValidator(nn.Module):
         self.assignment_layer = StaticAssignmentLayer(route_masks, od_pair_indices, num_od_pairs)
 
         # Registro de convergencia
-        self.register_buffer('last_convergence_iter', torch.tensor(0.0))
+        self.register_buffer('last_iterations', torch.tensor(0.0))
 
-    def forward(self, estimated_demands: torch.Tensor, warmup: bool = False) -> tuple:
-        batch_size = estimated_demands.shape[0]
-        device = estimated_demands.device
+    def forward(self, normalized_demand: torch.Tensor, warmup: bool = False) -> tuple:
+        """
+        Args:
+            normalized_demand: Tensor [Batch, OD] en rango [0, 1] aprox (salida de red neuronal).
+            warmup: Si es True, hace solo 1 iteración.
+        """
+        batch_size = normalized_demand.shape[0]
 
-        # Costos de flujo libre
-        freeflow_costs_base = self.cost_function(torch.zeros_like(self.t0))
-        freeflow_costs = freeflow_costs_base.unsqueeze(0).expand(batch_size, -1)
+        # -----------------------------------------------------------
+        # 1. DESNORMALIZACIÓN (Escala Neuronal -> Escala Física)
+        # -----------------------------------------------------------
+        # Convertimos la demanda a vehículos/hora reales para que la VDF tenga sentido físico.
+        real_demand = normalized_demand * self.max_trips_scaler
 
-        if warmup:
-            reconstructed_flows, route_probs = self.assignment_layer(freeflow_costs, estimated_demands)
-            convergence_info = {"converged": True, "iterations": 1}
-        else:
-            flows, route_probs = self.assignment_layer(freeflow_costs, estimated_demands)
-            prev_flows = flows.clone()
+        # Costos iniciales (Flujo Libre)
+        # Usamos detach() aquí por seguridad, aunque zeros no tiene gradiente.
+        freeflow_costs = self.cost_function(torch.zeros_like(self.t0).expand(batch_size, -1)).detach()
+
+        # -----------------------------------------------------------
+        # 2. FASE DE BÚSQUEDA DE EQUILIBRIO (Sin Gradientes)
+        # -----------------------------------------------------------
+        # Ejecutamos el MSA dentro de 'torch.no_grad()'.
+        # Esto evita guardar 100 copias del grafo y evita gradientes explosivos.
+        # Los parámetros de la VDF NO se actualizan con lo que pase aquí dentro.
+
+        with torch.no_grad():
+            # Asignación Inicial (All-or-Nothing o Logit inicial)
+            flows, _ = self.assignment_layer(freeflow_costs, real_demand)
 
             converged = False
             actual_iters = 1
 
-            for it in range(1, self.max_iters + 1):
-                costs = self.cost_function(flows)
-                new_flows, current_probs = self.assignment_layer(costs, estimated_demands) # Asignación con costos actualizados
+            if not warmup:
+                for it in range(1, self.max_iters + 1):
+                    prev_flows = flows.clone()
 
-                route_probs = current_probs
+                    # a. Calcular Costos (Física)
+                    costs = self.cost_function(flows)
 
-                # MSA con step size adaptativo
-                alpha_msa = 1.0 / (it + 1)
-                flows = flows + alpha_msa * (new_flows - flows) # Actualizar flujos
+                    # b. Nueva Asignación Auxiliar
+                    new_flows, _ = self.assignment_layer(costs, real_demand)
 
-                # Verificar convergencia
-                if it > 2:  # No verificar en las primeras iteraciones
-                    flow_change = torch.norm(flows - prev_flows, dim=1) / (torch.norm(flows, dim=1) + 1e-9)
-                    max_change = torch.max(flow_change)
+                    # c. Promedio MSA (Method of Successive Averages)
+                    alpha_msa = 1.0 / (it + 1)
+                    flows = flows + alpha_msa * (new_flows - flows)
 
+                    # d. Verificar Convergencia (Gap Relativo)
+                    # Evitamos división por cero con 1e-9
+                    flow_change = torch.norm(flows - prev_flows, dim=1) / (torch.norm(prev_flows, dim=1) + 1e-9)
+                    max_change = torch.max(flow_change).item()  # Scalar para checkear
+
+                    actual_iters = it
                     if max_change < self.convergence_threshold:
                         converged = True
-                        actual_iters = it
+                        # logging.info("MSA convergió tras {} iters. Error: {:.6f}".format(it, max_change))
                         break
 
-                prev_flows = flows.clone() # Actualizar para la siguiente iteración
+            # Guardamos estadística para monitoreo
+            self.last_iterations.data = torch.tensor(float(actual_iters))
 
-            reconstructed_flows = flows # Flujos finales después de SUE
-            convergence_info = {"converged": converged, "iterations": actual_iters}
+            # Logging condicional (útil para debug, cuidado si imprime mucho en training loop)
+            if not converged and not warmup:
+                logging.debug(f"MSA no convergió tras {self.max_iters} iters. Error: {max_change:.6f}") # TODO: importante
 
-            # Actualizar estadísticas de convergencia
-            self.last_convergence_iter.data = torch.tensor(float(actual_iters))
+        # -----------------------------------------------------------
+        # 3. FASE DE GRADIENTE (One-Step Unrolling)
+        # -----------------------------------------------------------
+        # Aquí ocurre la magia. Tomamos el flujo de equilibrio 'flows' calculado arriba,
+        # PERO lo tratamos como un punto fijo constante (detached).
+        # Volvemos a calcular Costos y Asignación UNA VEZ permitiendo gradientes.
 
-        # MODIFICACIÓN: Uso de getattr seguro por si la VDF instanciada no tiene alpha/beta (ej. modelos no-BPR)
+        # A. Costos Finales:
+        # Al pasar 'flows.detach()', cortamos la historia del MSA.
+        # PERO, 'self.cost_function' usa sus parámetros internos (alpha, beta).
+        # Por tanto, se genera gradiente para alpha/beta basado en este estado final.
+        final_costs = self.cost_function(flows.detach())
+
+        # B. Flujos Reconstruidos Finales:
+        # 'real_demand' SÍ tiene gradiente (viene del Decoder).
+        # 'final_costs' SÍ tiene gradiente (de los parámetros VDF).
+        # El resultado 'reconstructed_flows' conecta todo para el Backprop.
+        reconstructed_flows_real, route_probs = self.assignment_layer(final_costs, real_demand)
+
+        # C. Renormalizar para el pipeline DL
+        # Devolvemos el flujo en escala [0, 1] para que la Loss y el Backward Encoder
+        # no se vuelvan locos con números gigantes.
+        reconstructed_flows_norm = reconstructed_flows_real / self.max_trips_scaler
+
+        # -----------------------------------------------------------
+        # 4. EXTRACCIÓN DE PARÁMETROS (Para visualización/Logs)
+        # -----------------------------------------------------------
         learned_alpha = getattr(self.cost_function, 'get_alpha', lambda: None)()
         learned_beta = getattr(self.cost_function, 'get_beta', lambda: None)()
 
-        # Fallback para compatibilidad visual si devuelve None
         if learned_alpha is None: learned_alpha = torch.tensor(0.15, device=self.t0.device)
         if learned_beta is None: learned_beta = torch.tensor(4.0, device=self.t0.device)
 
-        return reconstructed_flows, learned_alpha, learned_beta, convergence_info, route_probs
+        convergence_info = {
+            "converged": converged,
+            "iterations": actual_iters,
+            "final_gap": max_change if not warmup and 'max_change' in locals() else 0.0
+        }
+
+        # IMPORTANTE: reconstructed_flows está en escala REAL (Veh/h).
+        # Quien calcule la Loss function debe decidir si normalizarlo de nuevo o no.
+        return reconstructed_flows_norm, learned_alpha, learned_beta, convergence_info, route_probs
 
 """
 class LinkCostFunction(nn.Module):
@@ -504,6 +552,7 @@ class AdaptiveCombinedLoss(nn.Module):
             # Ajustar w_od inversamente proporcional al ratio y a la disponibilidad de datos OD
             self.w_od.data = torch.clamp(ratio * (0.1 + od_ratio), min=0.1, max=5.0)
 
+
         # Incrementar contador de actualizaciones
         if isinstance(self.update_count, torch.Tensor):
             self.update_count.data = self.update_count.data + 1.0
@@ -518,11 +567,14 @@ class UltraCyclicODModel(nn.Module):
                  t0, capacity, route_masks, od_pair_indices, num_link_groups, link_group,
                  vdf_config: DictConfig,  # MODIFICACIÓN: Argumento obligatorio nuevo
                  dropout: float = 0.1,
+                 max_trips_scaler: float = 1.0,
                  **kwargs):
         super().__init__()
 
+        # TODO recomentar
         # Convierte conteos de tráfico en representación latente
-        self.encoder = ODEncoder(num_links, hidden_dim, feature_dim, dropout)
+        self.forward_encoder = ODEncoder(num_links, hidden_dim, feature_dim, dropout)
+        self.backward_encoder = ODEncoder(num_links, hidden_dim, feature_dim, dropout)
 
         # Convierte representación latente en demanda OD
         self.decoder = ODDecoder(num_od_pairs, hidden_dim, feature_dim, dropout)
@@ -534,7 +586,8 @@ class UltraCyclicODModel(nn.Module):
         self.validator = ImprovedAssignmentValidator(
             num_links, t0, capacity, route_masks, od_pair_indices,
             num_od_pairs, num_link_groups, link_group,
-            vdf_config=vdf_config
+            vdf_config=vdf_config,
+            max_trips_scaler=max_trips_scaler
         )
 
     def forward(self, observed_counts: torch.Tensor, true_od_demand: torch.Tensor = None,
@@ -548,7 +601,7 @@ class UltraCyclicODModel(nn.Module):
                 true_od_demand = true_od_demand.unsqueeze(0)
 
         # 1. Codificar aforos observados
-        h_x = self.encoder(observed_counts)
+        h_x = self.forward_encoder(observed_counts)
         # output: [batch_size, feature_dim]
 
         # 2. Generar referencia h_y usando el MISMO encoder (espacio latente compartido)
@@ -556,12 +609,12 @@ class UltraCyclicODModel(nn.Module):
         if self.training and true_od_demand is not None:
             with torch.no_grad():
                 # Simular flujos "ideales" a partir de la OD verdadera
-                true_flows, _, _, _, _ = self.validator(true_od_demand, warmup=True)
+                true_flows_norm, _, _, _, _ = self.validator(true_od_demand, warmup=True)
 
                 # CRÍTICO: Usar el MISMO encoder para mantener h_x y h_y 
                 # en el mismo espacio latente - esto es clave para que el 
                 # GraphMatcher pueda hacer comparaciones directas
-                h_y = self.encoder(true_flows)
+                h_y = self.backward_encoder(true_flows_norm)
                 # output: [batch_size, feature_dim]
 
         # 3. Aplicar graph matcher
@@ -599,11 +652,11 @@ class UltraCyclicODModel(nn.Module):
         """
         with torch.no_grad():
             # Generar h_x y h_y
-            h_x = self.encoder(observed_counts)
+            h_x = self.forward_encoder(observed_counts)
 
             if true_od_demand is not None:
                 true_flows, _, _, _ = self.validator(true_od_demand, warmup=True)
-                h_y = self.encoder(true_flows)
+                h_y = self.backward_encoder(true_flows)
 
                 # Métricas de consistencia
                 cosine_sim = F.cosine_similarity(h_x, h_y, dim=1).mean()

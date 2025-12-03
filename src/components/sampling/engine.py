@@ -2,7 +2,7 @@ import importlib
 import importlib.util
 import logging
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 import yaml
 import numpy as np
 import networkx as nx
@@ -12,7 +12,6 @@ from omegaconf import DictConfig, OmegaConf
 import hydra
 
 from src.components.sampling.base import BaseSampler
-from src.components.sampling import sampling as core_sampling
 
 logger = logging.getLogger(__name__)
 
@@ -220,7 +219,10 @@ class SamplingEngine:
     # ----------------------------
     # Run
     # ----------------------------
-    def run(self, save: bool = True, overwrite: bool = True) -> np.ndarray:
+    def run(self,
+            override_graph: Optional[nx.DiGraph] = None,
+            override_observed_flow_mask: Optional[np.ndarray] = None,
+            override_observed_od_mask: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray]:
         # TODO overwrite debe colocarse en el yaml
         """Ejecuta el sampling y opcionalmente guarda la máscara de flujo muestreada.
 
@@ -231,46 +233,49 @@ class SamplingEngine:
         Returns:
             sampled_flow_mask: np.ndarray (float32)
         """
-        # 1. Load graph
-        G = self._load_graph()
+        G = override_graph  # Asumimos que viene del pipeline
 
-        # 2. Prepare masks
-        # year = self.cfg.get('data', {}).get('volume_year', None) # TODO
-        year = 2022  # placeholder until volume_year handling is implemented
-        if year is not None:
-            try:
-                year = int(year)
-            except Exception:
-                year = None
+        # 1. Definir Universo Válido (Observed)
+        if override_observed_flow_mask is not None:
+            observed_flow_mask = override_observed_flow_mask
+        else:
+            # Fallback (no debería usarse si el pipeline está bien)
+            observed_flow_mask = np.ones(len(G.edges()), dtype=np.float32)
 
-        all_flows, train_mask = self._prepare_train_flow_mask(G, year=year)
+        if override_observed_od_mask is not None:
+            observed_od_mask = override_observed_od_mask
+        else:
+            observed_od_mask = np.zeros(1, dtype=np.float32)
 
-        # 3. Load strategy
-        strategy_spec = self.strategy_name
-        if strategy_spec is None:
-            raise RuntimeError("No se definió 'strategy' en el config (ej: 'random_sampling' o module:Class)")
+        # 2. Instanciar Estrategia
+        strategy = self._load_strategy_from_spec(self.strategy_name)
 
-        strategy_inst = self._load_strategy_from_spec(strategy_spec)
+        logger.info(f" SamplingEngine: Seleccionando TRAINING set de {int(observed_flow_mask.sum())} observed links.")
+        logger.info(f"   -> Estrategia: {self.strategy_name}")
+        logger.info(f"   -> Flow Train Rate: {self.flow_rate}")
+        logger.info(f"   -> OD Train Rate: {self.od_rate}")
 
-        # 4. Run sampling via strategy instance
-        sampled_flow_mask, sampled_od_mask = strategy_inst.create_partial_data_masks(
-            train_flow_mask=train_mask,
-            od_mask=np.zeros(1, dtype=np.float32),  # placeholder, od sampling not implemented
+        # 3. Delegar a la estrategia
+        # La estrategia debe retornar SUBSETS de las máscaras de entrada
+        train_flow_mask, train_od_mask = strategy.create_partial_data_masks(
+            train_flow_mask=observed_flow_mask,  # Le pasamos todo lo observado
+            od_mask=observed_od_mask,
             flow_rate=self.flow_rate,
             od_rate=self.od_rate,
             graph=G,
-            volume_year=year
+            volume_year=self.cfg['data']['volume_year']
         )
 
-        # 5. Save if requested
+        # TODO: implementar
+        """# 5. Save if requested
         if save:
             if self.output_path.exists() and not overwrite:
                 logger.info(f"Output exists and overwrite=False -> skipping save: {self.output_path}")
             else:
                 np.save(self.output_path, sampled_flow_mask)
-                logger.info(f"Saved sampled_flow_mask to: {self.output_path}")
+                logger.info(f"Saved sampled_flow_mask to: {self.output_path}")"""
 
-        return sampled_flow_mask
+        return train_flow_mask, train_od_mask
 
 
 # Hydra entrypoint

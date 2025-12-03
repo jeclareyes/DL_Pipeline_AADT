@@ -11,10 +11,10 @@ input_routes:
   link_df: ${data.base_path}/${data.link_data_file}
 
 # Hiperparámetros del Entrenamiento (Optimizador, Loops, etc.)
-epochs: 300
+epochs: 100
 batch_size: 1
 lr: 0.001
-weight_decay: 1e-5
+weight_decay: 1e-3
 
 # Configuración del Optimizador
 optimizer: "adam"
@@ -29,9 +29,9 @@ scheduler_params:
 
 # Early Stopping (Parada temprana si no mejora)
 early_stopping:
-  enabled: true
+  enabled: false
   patience: 20
-  min_delta: 0.001
+  min_delta: 0.0001
 
 # Configuración de Hardware
 device: "cuda"  # 'cuda', 'cpu', o 'auto'

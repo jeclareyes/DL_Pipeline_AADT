@@ -14,9 +14,9 @@ dropout: 0.1
 loss:
   _target_: src.components.models.Cyclic_Model_2.cyclic_model_ultra.AdaptiveCombinedLoss
   w_counts: 1.0
-  w_od: 1.0
+  w_od: 0.0
   w_reg: 0.01
-  adaptive_weights: true
+  adaptive_weights: false
 
 # 4. Pesos para legacy (se ignoran si usamos el bloque loss, pero evitan errores si algo los busca)
 loss_weights:

@@ -24,3 +24,5 @@ venv/
 /src/train/outputs/
 /generate_tree.py
 /project_tree_direct.txt
+/scripts/
+/tests/

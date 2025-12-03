@@ -41,7 +41,7 @@ route_calculation:
   algorithm: yen_astar
   parallel_mode: True # True | False
   weight: free_flow_time
-  force_recompute: true # True | False
+  force_recompute: false # True | False
   n_workers: 8
   chunk_size: 100
   engine: "networkx" # 'networkx' | 'rustworkx'

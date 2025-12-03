@@ -4,7 +4,7 @@ Data Ingestion para Cyclic Model - Linköping Traffic Assignment
 Este módulo maneja la carga y preparación de datos de Linköping para el CyclicODModel.
 Adaptado para funcionar con Hydra de manera robusta.
 
-Autor: Sistema de Acoplamiento Linköping
+Autor: Jorge Clavijo
 Fecha: Noviembre 2025
 """
 
@@ -253,38 +253,43 @@ class LinkopingDataLoader:
             else:
                 logger.info("Consistencia de enlaces: OK")
 
-    def prepare_observed_flows(self, year: Optional[int] = None, train_split: Optional[float] = None):
+    def prepare_observed_flows(self, year: Optional[int] = None):
+        """
+        Retorna el universo de flujos y una máscara de 'Observed' (1 donde hay dato, 0 donde no).
+        """
         if year is None: year = self.data_cfg.get('volume_year', 2022)
-        if train_split is None: train_split = self.data_cfg.get('train_split', 0.8)
 
         volume_col = f'Volume_{year}'
         if volume_col not in self.link_data.columns:
-            raise ValueError(f"Columna {volume_col} no encontrada.")
+            # Fallback simple
+            if 'flow' in self.link_data.columns:
+                volume_col = 'flow'
+            else:
+                raise ValueError(f"Columna {volume_col} no encontrada.")
 
         flows = self.link_data[volume_col].values
         all_flows = np.nan_to_num(flows, nan=0.0)
 
-        # Crear máscaras
-        valid_indices = np.where(~np.isnan(flows))[0]
-        np.random.seed(self.data_cfg.get('random_seed', 42))
-        np.random.shuffle(valid_indices)
+        # MÁSCARA OBSERVED (Known Universe)
+        observed_mask = (~np.isnan(flows)).astype(np.float32)
 
-        split_idx = int(len(valid_indices) * train_split)
-        train_mask = np.zeros_like(flows, dtype=np.float32)
-        test_mask = np.zeros_like(flows, dtype=np.float32)
+        logger.info(f" Links con datos Observados (Known): {int(observed_mask.sum())}")
 
-        train_mask[valid_indices[:split_idx]] = 1.0
-        test_mask[valid_indices[split_idx:]] = 1.0
-
-        logger.info(f" Train split: {len(valid_indices[:split_idx])} obs.")
-        return all_flows, train_mask, test_mask
+        # Retorna solo 2 valores: Los datos y la máscara de existencia
+        return all_flows, observed_mask
 
     def prepare_od_demand_vector(self):
+        """
+        Retorna el universo de OD y máscara de 'Observed' (Known).
+        """
         od_dense = self.od_matrix.toarray().flatten()
-        od_mask = (~np.isnan(od_dense)).astype(np.float32)
+
+        # MÁSCARA OBSERVED OD
+        observed_mask = (~np.isnan(od_dense)).astype(np.float32)
         od_vector = np.nan_to_num(od_dense, nan=0.0)
-        logger.info(f"Demandas OD conocidas: {od_mask.sum()}")
-        return od_vector, od_mask
+
+        logger.info(f" Pares OD Observados (Known): {int(observed_mask.sum())}")
+        return od_vector, observed_mask
 
     def prepare_network_parameters(self) -> Dict:
         """Prepara tensores de red para el modelo."""
@@ -294,11 +299,20 @@ class LinkopingDataLoader:
         t0 = np.array([self.graph[u][v].get('free_flow_time', 1.0) for u, v in self.edge_list], dtype=np.float32)
         capacity = np.array([self.graph[u][v].get('capacity', 1000.0) for u, v in self.edge_list], dtype=np.float32)
         link_type = np.array([self.graph[u][v].get('link_type', 0) for u, v in self.edge_list], dtype=np.int32)
+        length = np.array([self.graph[u][v].get('length', 1.0) for u, v in self.edge_list], dtype=np.float32)
+        lanes = np.array([self.graph[u][v].get('lanes', 1) for u, v in self.edge_list], dtype=np.int32)
+        speed = np.array([self.graph[u][v].get('speed', 15.0) for u, v in self.edge_list], dtype=np.float32)
+        vdf_number = np.array([self.graph[u][v].get('vdf', 1) for u, v in self.edge_list], dtype=np.int32)
 
         # Link Groups
         unique_types = np.unique(link_type)
         type_map = {t: i for i, t in enumerate(unique_types)}
         link_group = np.array([type_map[t] for t in link_type])
+
+        # VDF-aggregation Groups
+        unique_vdf_agg_types = np.unique(vdf_number)
+        vdf_agg_type_map = {t: i for i, t in enumerate(unique_vdf_agg_types)}
+        vdf_agg_group = np.array([vdf_agg_type_map[t] for t in vdf_number])
 
         # Route Masks
         # route_masks YA ES un torch.sparse_coo_tensor
@@ -309,15 +323,15 @@ class LinkopingDataLoader:
             'num_od_pairs': route_masks.shape[0],
             't0': torch.FloatTensor(t0),
             'capacity': torch.FloatTensor(capacity),
-
-            # --- CORRECCIÓN AQUÍ ---
-            # No usar torch.FloatTensor(route_masks), usarlo directo:
+            'length': torch.FloatTensor(length),
+            'lanes': torch.LongTensor(lanes),
+            'speed': torch.FloatTensor(speed),
+            'vdf_number': torch.LongTensor(vdf_number),
             'route_masks': route_masks,
-            # -----------------------
-
             'od_pair_indices': torch.LongTensor(od_pair_indices),
             'num_link_groups': len(unique_types),
-            'link_group': torch.LongTensor(link_group)
+            'link_group': torch.LongTensor(link_group),
+            'vdf_agg_group': torch.LongTensor(vdf_agg_group),
         }
         logger.info("Parámetros de red preparados.")
         return self.network_params
