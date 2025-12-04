@@ -12,7 +12,6 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
-import torch
 from omegaconf import OmegaConf
 import hydra
 
@@ -23,7 +22,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 # Imported here to avoid circular imports at package import time in some cases
-from src.components.models.Cyclic_Model.cyclic_model import PartialDataLoss
+from src.components.models.CGAME_MLP_SUE import PartialDataLoss
 
 
 def _get_latest_epoch_state(master_checkpoint: Dict[str, Any]) -> Dict[str, Any]:

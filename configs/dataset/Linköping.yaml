@@ -5,6 +5,8 @@
 
 # DATA
 # Responsabilidad: Definir la ubicación física de los archivos de este dataset.
+# Ante la creación de nuevos datasets, solo es necesario crear un nuevo archivo YAML
+# similar a este, especificando las rutas y parámetros específicos del dataset.
 # =============================================================================
 data:
   dataset: "Linköping"

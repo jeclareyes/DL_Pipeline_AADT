@@ -1,27 +1,74 @@
 # @package _global_
 # configs/sampling/sampling.yaml
 
-# Definimos input_routes a nivel global para que las interpolaciones funcionen
+# -----------------------------------------------------------------------------
+# INPUT ROUTES
+# Defines where the physical files for the graph and data are located.
+# Uses Hydra interpolation (${...}) to reuse paths defined in data.
+# -----------------------------------------------------------------------------
 input_routes:
-  # Usamos la ruta base que ya cargó Linköping.yaml
+  # General base path (usually 'data/Linköping' or similar)
   general_route: ${data.base_path}
 
-  # Rutas derivadas
+  # Graph pickle file (NetworkX). Contains topology and attributes (x, y, type).
   graph_route: ${input_routes.general_route}/${data.dataset}_graph.pkl
+
+  # Origin–Destination matrix (ground-truth demand).
   od_matrix_route: ${input_routes.general_route}/${data.dataset}_od_matrix.npz
+
+  # Link data (table with flows, capacities, etc.).
   link_data_route: ${input_routes.general_route}/${data.dataset}_link_data.parquet
 
-# Parámetros de sampling (quedarán en cfg.sampling)
+# -----------------------------------------------------------------------------
+# SAMPLING ENGINE PARAMETERS
+# Control the behavior of the SamplingEngine.
+# -----------------------------------------------------------------------------
 sampling:
+  # [Float 0.0 - 1.0]: Percentage of observed flows used for TRAINING.
+  # The remaining part (1.0 - flow_rate) is reserved for TESTING/VALIDATION.
   flow_rate: 0.8
+
+  # [Float 0.0 - 1.0]: Percentage of known OD pairs used for training.
+  # Typically 1.0 if the initial OD demand is treated as a fixed prior.
   od_rate: 1.0
-  sampling_basis: link_wise_based
+
+  # [String]: Defines the atomic unit of sampling.
+  # - 'link_wise_based': Each link is independent and selected at random.
+  # - 'traffic_counts_based': Groups consecutive links with the same flow (single sensor).
+  #   Avoids spatial data leakage (e.g., one segment of the same road in train
+  #   and another in test).
+  sampling_basis: traffic_counts_based  # NOTE: This was the source of confusion.
+
+  # Output paths for saving the generated masks (.npy)
   output_dir: outputs/masks
   output_filename: sampled_flow_mask.npy
-  # Estrategia por defecto dentro del bloque sampling
+
+  # [String]: Name of the strategy to use (must match a key in sampling_strategies_routes)
   strategy: spatial_LHS
 
-# Estrategias disponibles (nivel global o referenciadas por el engine)
+# -----------------------------------------------------------------------------
+# PARÁMETROS ESPECÍFICOS DE LA ESTRATEGIA
+# Se pasan como **kwargs al constructor de la clase definida en 'strategy'.
+# -----------------------------------------------------------------------------
+strategy_params:
+  # [Boolean]: Si True, activa el 'Random Fill' cuando el LHS se satura.
+  #   - True (Recomendado): Garantiza llegar al flow_rate (ej. 80%) rellenando
+  #     aleatoriamente los huecos que el LHS no pudo cubrir por colisiones.
+  #   - False (LHS Puro): Prioriza la calidad geométrica estricta. Si hay colisiones,
+  #     se seleccionarán MENOS datos de los solicitados (ej. 40% en lugar de 80%).
+  random_fill: true
+
+  # [Int]: Semilla aleatoria específica para la estrategia (opcional, por defecto usa global).
+  # random_seed: 42
+
+
+
+# -----------------------------------------------------------------------------
+# STRATEGY REGISTRY
+# Maps short names to the Python class that implements the logic.
+# -----------------------------------------------------------------------------
 sampling_strategies_routes:
+  # Simple random sampling (Random Uniform)
   random_sampling: src.components.sampling.strategies.random_sampler:RandomStrategy
+  # Spatial Latin Hypercube Sampling (ensures uniform geographic coverage)
   spatial_LHS: src.components.sampling.strategies.spatial_LHS:SpatialLHSStrategy

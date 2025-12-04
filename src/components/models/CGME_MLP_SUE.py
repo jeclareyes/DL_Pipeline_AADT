@@ -1,3 +1,48 @@
+"""
+=============================================================================
+MODEL NAME: STATIC_CYCLIC_MLP_SUE (CGME_MLP_SUE)
+BASED ON:   Cyclic Graph Attentive Match Encoder (Li et al., 2022)
+TYPE:       Cyclic Graph Matcher MLP-Encoder-Decoder with Stochastic User Equilibrium
+DOMAIN:     Static OD Estimation + Static Flow Estimation (No time dimension)
+=============================================================================
+
+ARCHITECTURE OVERVIEW:
+----------------------
+Este modelo es una adaptación estática del framework CGAME. Reemplaza la inferencia
+temporal y la red neuronal inversa (backward) por un validador físico basado en
+Asignación de Tráfico (SUE - Stochastic User Equilibrium).
+
+      [Observed Counts] --(Encoder MLP)--> [h_x] --(Graph Matcher)--> [g_x]
+                                             ^            |
+                                             | (Matching) v
+      [True OD Demand] --(Encoder MLP)--- [h_y] <--(Decoder MLP)-- [Pred OD]
+            |
+            +----(Assignment Validator / SUE)----> [Reconstructed Flows]
+
+KEY COMPONENTS:
+1. ODEncoder (MLP):
+   - Red neuronal simple (Linear -> LeakyReLU -> Linear).
+   - Procesa vectores de conteos estáticos (sin dimensión temporal T).
+
+2. GraphMatcher (The Core - from CGAME):
+   - Alinea los espacios latentes Forward (h_x) y Backward (h_y).
+   - Utiliza matrices de estructura (M) y valor (V) con mecanismo de atención
+     para filtrar coincidencias incorrectas entre estimación y asignación[cite: 10].
+
+3. AssignmentValidator (The Physics - SUE):
+   - Reemplaza la "Backward Network" del paper original.
+   - Implementa un simulador de tráfico diferenciable (MSA Loop).
+   - Calcula probabilidades de ruta (Logit) y costos de congestión (BPR)
+     para garantizar que los flujos reconstruidos respeten la física del tráfico.
+
+INPUTS/OUTPUTS:
+---------------
+- Input:  Tensor de conteos observados [Batch, Num_Links].
+- Output: Tensor de demanda OD estimada [Batch, Num_OD_Pairs].
+- Loss:   Mezcla de error de reconstrucción de flujos y consistencia latente.
+=============================================================================
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -54,7 +99,7 @@ class ODDecoder(nn.Module):
 
 class GraphMatcher(nn.Module):
     """
-    Strict implementation of the Graph Matcher following the CGAME paper.
+    Implementation of the Graph Matcher following the CGAME paper.
     References: Equations 7, 9, 10, 11 and Algorithm 1.
     """
 
@@ -77,7 +122,6 @@ class GraphMatcher(nn.Module):
     def update_matrices(self, h_x: torch.Tensor, h_y: torch.Tensor):
         """
         Performs the M and V update based on similarity (Algorithm 1 of the paper).
-        Should be called only during training.
         """
         # Avoid gradients during memory update
         with torch.no_grad():
@@ -85,14 +129,14 @@ class GraphMatcher(nn.Module):
 
             # --- Equation 9: Update of M ---
             # Paper: M_j = (1 - lambda)*M + lambda * similarity(h_x, h_y)
-            # We compute element-wise cosine-like similarity summed over the batch
+            # Compute element-wise cosine-like similarity summed over the batch
             dot_xy = torch.sum(h_x * h_y, dim=0, keepdim=True).T  # [feature_dim, 1]
             norm_x = torch.sqrt(torch.sum(h_x * h_x, dim=0, keepdim=True)).T + 1e-8
             norm_y = torch.sqrt(torch.sum(h_y * h_y, dim=0, keepdim=True)).T + 1e-8
 
             similarity_term_M = dot_xy / (norm_x * norm_y)  # [feature_dim, 1]
 
-            # Expand to all structures (the paper implies each structure
+            # Expand to all structures
             # captures different subsets, but mathematically the base update is the same
             # if there are no external masks. Apply the same update to all columns).
             similarity_M_expanded = similarity_term_M.expand(-1, self.num_structures).clone()
@@ -159,7 +203,7 @@ class GraphMatcher(nn.Module):
         return g_x
 
 
-class ImprovedAssignmentValidator(nn.Module):
+class AssignmentValidator(nn.Module):
     """Acts as a differentiable traffic simulator.
     Takes the predicted OD demand and computes which links would be used,
     respecting congestion (if a link fills up, drivers change routes).
@@ -415,7 +459,7 @@ class StaticAssignmentLayer(nn.Module):
         return link_flows, route_probs
 
 
-class AdaptiveCombinedLoss(nn.Module):
+class LossCalculator(nn.Module):
     """Adaptive and balanced loss function."""
 
     def __init__(self, w_counts: float = 1.0, w_od: float = 1.0, w_reg: float = 0.01,
@@ -534,7 +578,7 @@ class CyclicODModel(nn.Module):
         self.graph_matcher = GraphMatcher(feature_dim, num_structures)
 
         # --- 3. Physical Backward Network (Your design) ---
-        self.validator = ImprovedAssignmentValidator(
+        self.validator = AssignmentValidator(
             num_links, t0, capacity, route_masks, od_pair_indices,
             num_od_pairs, num_link_groups, link_group,
             vdf_config=vdf_config,
@@ -620,7 +664,7 @@ class PartialDataLoss(nn.Module):
     """
     Compatibility wrapper that replicates the API of `PartialDataLoss` used
     by the original training. Implementation based on the version from
-    `cyclic_model.py` to ensure consistent behavior.
+    `CGAME_MLP_SUE.py` to ensure consistent behavior.
     """
 
     def __init__(self, w_flow: float = 1.0, w_od: float = 1.0, w_reg: float = 0.01):
@@ -741,5 +785,5 @@ __all__ = [
     'CyclicODModelUltra',
     'PartialDataLoss',
     'CyclicODModel',
-    'AdaptiveCombinedLoss'
+    'LossCalculator'
 ]

@@ -1,8 +1,8 @@
-# configs/model/Cyclic_Model_Ultra.yaml
+# configs/model/CGME_MLP_SUE.yaml
 
 # 1. Target: Apunta al wrapper de compatibilidad o al modelo directo
-_target_: src.components.models.Cyclic_Model_2.cyclic_model_ultra.CyclicODModelUltra
-model_name: "CyclicODModel_U"
+_target_: src.components.models.CGME_MLP_SUE.CyclicODModel
+model_name: "CGME_MLP_SUE"
 
 # 2. Arquitectura
 hidden_dim: 128
@@ -12,7 +12,7 @@ dropout: 0.1
 
 # 3. Configuración de la Función de Pérdida (NUEVO BLOQUE)
 loss:
-  _target_: src.components.models.Cyclic_Model_2.cyclic_model_ultra.AdaptiveCombinedLoss
+  _target_: src.components.models.CGME_MLP_SUE.LossCalculator
   w_counts: 1.0
   w_od: 0.0
   w_reg: 0.01

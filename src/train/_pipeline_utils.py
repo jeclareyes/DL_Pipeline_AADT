@@ -163,3 +163,43 @@ def check_intermediate_convergence(model, val_loader, scaler, epoch, writer=None
         plt.close()
 
     model.train()  # Volver a modo entrenamiento
+
+
+### Lógica de nomenclatura y asignación de directorios a los archivos de modelos entrenados .pt según sea K-Fold y entrenamiento estándar
+
+def get_run_filenames(cfg) -> tuple:
+    """
+    Genera nombres de archivo descriptivos basados en la configuración del experimento.
+    Recupera la lógica original de construcción de strings largos.
+
+    Retorna:
+        (model_filename, eval_filename)
+    """
+    # Extracción segura de parámetros para evitar KeyErrors
+    epochs = cfg.training.get('epochs', 'Unknown')
+    lr = cfg.training.get('lr', 'Unknown')
+
+    # Manejo de VDF anidado (puede estar en network.cost_function o vdf.name)
+    vdf_name = cfg.get('network', {}).get('cost_function',
+                                          cfg.get('vdf', {}).get('name', 'UnknownVDF'))
+
+    # Parámetros de Sampling
+    sampling_cfg = cfg.get('sampling', {})
+    flow_rate = sampling_cfg.get('flow_rate', 'All')
+    strategy = sampling_cfg.get('strategy', 'Unknown')
+    basis = sampling_cfg.get('sampling_basis', 'Unknown')
+
+    # Construcción del nombre base
+    base_name = (
+        f"Epochs_{epochs}_"
+        f"VDF_{vdf_name}_"
+        f"Learning_Rate_{lr}_"
+        f"Flow_Rate_{flow_rate}_"
+        f"Strat_{strategy}_"
+        f"Basis_{basis}"
+    )
+
+    model_filename = f"{base_name}.pt"
+    eval_filename = f"eval_{base_name}.pt"
+
+    return model_filename, eval_filename
