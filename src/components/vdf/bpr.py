@@ -1,15 +1,20 @@
+import logging
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from networkx.algorithms.flow import capacity_scaling
+
 from .base import BaseCostFunction  # Asegúrate de tener esta base
 
 class BPRCostFunction(BaseCostFunction):
     """
     Función de costo BPR modularizada.
     """
-    def __init__(self, t0, capacity, num_link_groups, link_group, learnable_params=True):
+    def __init__(self, t0, capacity, num_link_groups, link_group, lanes, learnable_params=True):
         super().__init__()
         # Registramos buffers (no se entrenan, son datos)
+        self.register_buffer('lanes', lanes)
         self.register_buffer('t0', t0)
         self.register_buffer('capacity', capacity)
         self.register_buffer('link_group', link_group.to(torch.long))
@@ -40,6 +45,16 @@ class BPRCostFunction(BaseCostFunction):
         alpha_links = alpha[self.link_group]
         beta_links = beta[self.link_group]
 
+        capacity_factor = 16 # Factor de escala para la capacidad según número de horas efectivas
+
         # Evitar divisiones por cero y explosiones numéricas
-        flow_ratio = torch.clamp(link_flows / (self.capacity + 1e-9), max=5.0)
-        return self.t0 * (1 + alpha_links * flow_ratio ** beta_links)
+        flow_ratio = torch.clamp(link_flows / ((self.capacity * capacity_factor) * self.lanes  + 1e-9), max=5.0)
+
+        # Verificamos si existe al menos un valor mayor a 1.0 en el tensor
+        # TODO uncomment
+        """if (flow_ratio > 1.0).any():
+            logging.warning(
+                f"flow_ratio excede el límite en algunos enlaces. Máximo actual: {flow_ratio.max().item():.4f}")"""
+
+        cost = self.t0 * (1 + alpha_links * flow_ratio ** beta_links)
+        return cost

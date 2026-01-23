@@ -6,17 +6,30 @@ _target_: src.components.models.CGAME_MLP_SUE.CyclicODModel
 model_name: "CGAME_MLP_SUE"
 
 # 2. Arquitectura (Hiperparámetros del modelo)
-hidden_dim: 128
-feature_dim: 64
-num_structures: 5
-dropout: 0.0
+architecture:
+  num_structures: 4
+  feature_dim: 512
+
+  # hidden dimensions for the MLPs
+  hidden_dim_from_link: 512 # Link to feature MLP
+
+  hidden_dim_from_od: 1024   # OD to feature MLP
+  hidden_dim_to_od: 1024   # Feature to OD MLP
+
+  dropout_from_od: 0.0
+  dropout_to_od: 0.0
+  dropout_from_link: 0.0
 
 # 3. Pesos de la Función de Pérdida (Loss Weights)
-loss_weights:
+loss:
+  _target_: src.components.models.CGAME_MLP_SUE.Loss
   w_flow: 1.0
-  w_od: 100.0
-  w_reg: 0.01
-  w_physics: 0.5
+  w_od: 0.0
+  w_demand_reg: 1.0e-3
+
+  # Estos valores serán sobreescritos por el trainer, pero deben existir como base
+  link_scale: 1.0
+  od_scale: 1.0
 
 # 4. Configuración de la Función de Costo (VDF)
 vdf_config: ${vdf}
@@ -31,3 +44,39 @@ route_masks: ???
 od_pair_indices: ???
 num_link_groups: ???
 link_group: ???
+
+# 6. Convergencia para AssignmentValidator (MSA)
+msa_convergence:
+  # more about each strategy below
+  strategy: hybrid       # "relative_flow" | "relative_gap" | "hybrid"
+
+  flow_tol: 1e-5 # asociado a relative_flow
+  gap_tol: 1e-2 # asociado a relative_gap
+
+  min_iters: 5
+  max_iters: 10
+
+  grad_steps: 2
+  eps: 1e-9
+
+verbose: false
+
+
+# About MSA convergence:
+# - relative_flow: delta = ||f_new - f_old||_2 / ||f_old||_2.
+# Se detiene cuando el cambio entre el flujo actual y el anterior es insignificante. Ese cambio lo dicta el umbral flow_tol.
+# Esto no garantiza que el sistema esté cerca del equilibrio, solo que los flujos ya no cambian mucho.
+
+# - relative_gap: gap = (total_system_travel_time - total_demand_travel_time) / total_demand_travel_time
+# Mide la diferencia entre el costo total actual y el costo si todos usaran la ruta mínima (flujo libre instantáneo).
+# Garantiza equilibrio real, pero requiere el costo de la ruta mínima en cada iteración, lo cual es costoso
+# computacionalmente en el forward pass.
+
+# - hybrid: combines the practicality of `relative_flow` (cheap, fast) with the theoretical guarantee of `relative_gap`
+# (expensive, accurate). Implemented behavior:
+# In each MSA iteration compute `delta = ||f_{it} - f_{it-1}||2 / (||f{it-1}||_2 + eps)`.
+# If `delta < flow_tol` and `it >= min_iters`, compute the `gap` (the more expensive check).
+# If `gap < gap_tol` then stop early (converged). Otherwise continue iterating until `max_iters`.
+# If `delta` never falls below `flow_tol`, stop at `max_iters`.
+# After stopping, ensure gradient bookkeeping: if the loop ended before the configured `grad_steps`,
+# run up to `grad_steps` final iterations with autograd enabled (or keep the last iteration with grad) so losses that depend on equilibrium flows backpropagate correctly.

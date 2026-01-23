@@ -44,7 +44,7 @@ sampling:
   output_filename: sampled_flow_mask.npy
 
   # [String]: Name of the strategy to use (must match a key in sampling_strategies_routes)
-  strategy: spatial_LHS
+  strategy: spatial_LHS # 'random_sampling' | 'spatial_LHS'
 
 # -----------------------------------------------------------------------------
 # PARÁMETROS ESPECÍFICOS DE LA ESTRATEGIA

@@ -12,7 +12,7 @@ defaults:
   - data_ingestion/data_preprocessing: preprocessing_from_pkl
 
   # 3. Model (Busca en configs/model/CGAME_MLP_SUE.yaml)
-  - model: CGAME_MLP_SUE # 'CGME_MLP_SUE' | 'CGAME_MLP_SUE'
+  - model: CGAME_MLP_SUE # 'CGME_MLP_SUE' | 'CGAME_MLP_SUE' | 'CGAME'
 
   # 4. Training (Busca en configs/training/training.yaml)
   - training: training
@@ -25,7 +25,7 @@ defaults:
   - testing: testing
 
   # 7. VDF (Busca en configs/vdf/bpr.yaml)
-  - vdf: bpr
+  - vdf: bpr # 'bpr_modified' | 'bpr' | 'akcelik' | 'conical'
 
 # Global project variables
 project_name: "DL_Pipeline_AADT"

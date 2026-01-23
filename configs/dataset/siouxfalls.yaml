@@ -4,17 +4,17 @@
 # DATA
 # =============================================================================
 data:
-  network_name: "Linköping"
-  base_path: "data/processed/Linköping"
+  dataset: "SiouxFalls"
+  base_path: "data/processed/${data.dataset}"
 
   # Input files
-  graph_file: "Linköping_graph.pkl"
-  link_data_file: "Linköping_link_data.parquet"
-  od_matrix_file: "Linköping_od_matrix.npz"
-  routing_cache_file: "routing_cache/kshortest_paths.pkl"
+  graph_file: "${data.dataset}_graph.pkl"
+  link_data_file: "${data.dataset}_link_data.parquet"
+  od_matrix_file: "${data.dataset}_od_matrix.npz"
+  routing_cache_file: "routing_cache/${data.dataset}_kshortest_paths.pkl"
 
   # Volume year to use for training
-  volume_year: 2022  # Options: 2018, 2019, 2022, 2023
+  volume_year: 0  # Options: 2018, 2019, 2022, 2023
 
   # Data split
   train_split: 0.8  # 80% for training, 20% for testing
@@ -24,18 +24,15 @@ data:
 # =============================================================================
 sampling:
   # Fraction of observed flows for training
-  flow_rate: 0.3  # 30% of observed flows are used
+  flow_rate: 0.9
 
   # Fraction of known OD demands
-  od_rate: 0.2  # 20% of OD are known
+  od_rate: 1.0
 
-  # Sampling strategy
-  strategy: "stratified"  # Options: random, stratified, topk, hybrid
+  # Sampling strategy for links
+  strategy: "random"
+  sampling_basis: "link_wise_based"
 
-  # Stratified sampling (optional)
-  stratified:
-    volume_bins: [0, 500, 1000, 2000, 5000, 10000]
-    sampling_probs: [0.1, 0.2, 0.3, 0.4, 0.5]
 
 # NETWORK
 # =============================================================================

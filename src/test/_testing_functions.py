@@ -22,7 +22,6 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 # Imported here to avoid circular imports at package import time in some cases
-from src.components.models.CGAME_MLP_SUE import PartialDataLoss
 
 
 def _get_latest_epoch_state(master_checkpoint: Dict[str, Any]) -> Dict[str, Any]:
@@ -87,14 +86,7 @@ def evaluate_model_from_checkpoint(master_checkpoint: Dict[str, Any],
                                    device: torch.device) -> Dict[str, Any]:
     """Load state dict from checkpoint (latest epoch) into model and evaluate.
 
-    Args:
-        master_checkpoint: checkpoint dict loaded from torch.load().
-        model: instantiated model (matching checkpoint architecture).
-        tensors: dict with keys: true_flows_t, true_od_t, flow_mask_t, od_mask_t
-        device: torch.device
-
-    Returns:
-        dict with numeric metrics (losses) and meta info
+    Now creates the Loss function dynamically based on the saved config.
     """
     epoch_state = _get_latest_epoch_state(master_checkpoint)
     state_dict = epoch_state.get("model_state_dict") or epoch_state.get("state_dict")
@@ -111,51 +103,65 @@ def evaluate_model_from_checkpoint(master_checkpoint: Dict[str, Any],
     flow_mask_t = tensors["flow_mask_t"]
     od_mask_t = tensors["od_mask_t"]
 
-    # Loss function - build from the checkpoint's stored config if available
-    # Try to get loss_weights from saved config, else fall back to defaults on model
-    loss_cfg = None
+    # --- CORRECCIÓN: Instanciación Dinámica de la Loss ---
+    criterion = None
+
+    # 1. Recuperar la config del checkpoint
     if "config" in master_checkpoint:
-        cfg = master_checkpoint["config"]
-        # cfg may be plain dict
-        loss_cfg = (cfg.get("model", {}) or {}).get("loss_weights")
+        # Aseguramos que sea OmegaConf para poder navegar fácil
+        ckpt_cfg = master_checkpoint["config"]
+        if not isinstance(ckpt_cfg, (DictConfig, list)):
+            ckpt_cfg = OmegaConf.create(ckpt_cfg)
 
-    if loss_cfg is not None:
-        w_flow = loss_cfg.get("w_flow", 1.0)
-        w_od = loss_cfg.get("w_od", 1.0)
-        w_reg = loss_cfg.get("w_reg", 0.0)
-    else:
-        # sensible defaults
-        w_flow, w_od, w_reg = 1.0, 1.0, 0.0
+        # 2. Buscar la definición de la loss en la config guardada
+        if hasattr(ckpt_cfg, "model") and hasattr(ckpt_cfg.model, "loss"):
+            try:
+                # Instancia EXACTAMENTE la misma loss que se usó al entrenar
+                criterion = hydra.utils.instantiate(ckpt_cfg.model.loss).to(device)
+                logging.info(f"Loss function instantiated dynamically: {ckpt_cfg.model.loss._target_}")
+            except Exception as e:
+                logging.warning(f"Could not instantiate loss from config: {e}. Metrics based on Loss will be skipped.")
 
-    criterion = PartialDataLoss(w_flow=w_flow, w_od=w_od, w_reg=w_reg).to(device)
+    # Si falló la carga o es un checkpoint muy antiguo sin config de loss
+    if criterion is None:
+        logging.warning("No loss config found. Using a generic MSE evaluator as fallback.")
+        # Fallback genérico simple (solo MSE) para no romper el código
+        criterion = torch.nn.MSELoss()
+        # Nota: Esto no generará el diccionario detallado (l_flow, l_od),
+        # así que el bloque siguiente necesita un try-catch o lógica condicional.
 
     with torch.no_grad():
         outputs = model(observed_flows=true_flows_t, flow_mask=flow_mask_t, warmup=False)
 
-        loss_dict = criterion(
-            predicted_flows=outputs["reconstructed_flows"],
-            true_flows=true_flows_t,
-            flow_mask=flow_mask_t,
-            predicted_od=outputs["estimated_demand"],
-            true_od=true_od_t,
-            od_mask=od_mask_t,
-            learned_alpha=outputs.get("learned_alpha"),
-            learned_beta=outputs.get("learned_beta"),
-        )
+        # Calculamos la loss solo si tenemos un criterio válido y complejo
+        # Asumimos que si instanciamos via Hydra, cumple la interfaz estándar (acepta kwargs)
+        try:
+            loss_dict = criterion(
+                predicted_flows=outputs["reconstructed_flows"],
+                true_flows=true_flows_t,
+                flow_mask=flow_mask_t,
+                predicted_od=outputs["estimated_demand"],
+                true_od=true_od_t,
+                od_mask=od_mask_t,
+                learned_alpha=outputs.get("learned_alpha"),
+                learned_beta=outputs.get("learned_beta"),
+            )
+        except TypeError:
+            # Fallback por si criterion es un simple nn.MSELoss()
+            loss_val = criterion(outputs["reconstructed_flows"], true_flows_t)
+            loss_dict = {"total_loss": loss_val}
 
     # Convert any tensors to python numbers
     metrics = {k: (v.item() if isinstance(v, torch.Tensor) else float(v)) for k, v in loss_dict.items()}
 
     meta = {
-        # timezone-aware UTC timestamp
         "evaluated_at": datetime.now(timezone.utc).isoformat(),
         "checkpoint_latest_epoch": None,
     }
-    # try to pull epoch number
+
     try:
         epochs = list(master_checkpoint.get("epochs_history", {}).keys())
         if epochs:
-            # store as string to avoid static-type warnings and keep JSON-safe
             meta["checkpoint_latest_epoch"] = str(max(int(k) for k in epochs))
     except Exception:
         meta["checkpoint_latest_epoch"] = None

@@ -13,17 +13,22 @@ input_routes:
 k_folds: 1  # Número de folds para cross-validation
 
 # Hiperparámetros del Entrenamiento (Optimizador, Loops, etc.)
-epochs: 300
+epochs: 100
 batch_size: 1
-lr: 0.0001
+lr: 5.0e-4
 weight_decay: 1e-3
 
+# Warmup policy: controla si se utiliza warmup y cuántas épocas dura
+warmup:
+  enabled: false # true | false
+  epochs: 50
+
 # Configuración del Optimizador
-optimizer: "adam"
+optimizer: "adam" # 'adam' | 'sgd' | 'adamw'
 
 # Scheduler (Control de tasa de aprendizaje)
 scheduler: "reduce_on_plateau"
-grad_clip_norm: 1.0
+grad_clip_norm: 0.5
 scheduler_params:
   factor: 0.5
   patience: 10
@@ -31,12 +36,17 @@ scheduler_params:
 
 # Early Stopping (Parada temprana si no mejora)
 early_stopping:
-  enabled: true
+  enabled: false
   patience: 20
   min_delta: 0.0001
 
 # Configuración de Hardware
 device: "cuda"  # 'cuda', 'cpu', o 'auto'
+
+metrics_on_training: true # Calcular métricas durante el entrenamiento
+
+# Prescaling strategy for inputs: 'standard' | 'capacity' | 'max'
+scaling_strategy: max # standard | capacity | max
 
 # Validación
 val_frequency: 5
