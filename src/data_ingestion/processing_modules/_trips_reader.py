@@ -24,7 +24,7 @@ class FlowReader:
         self.combined_df = None
 
     def load(self) -> pd.DataFrame:
-        self.flow_df = pd.read_csv(self.path, delim_whitespace=True, skiprows=0)
+        self.flow_df = pd.read_csv(self.path, sep=r"\s+", skiprows=0)
         self.flow_df.columns = self.flow_df.columns.str.strip()
         colmap = {c.lower(): c for c in self.flow_df.columns}
         column_mapping = {}

@@ -3,6 +3,7 @@ __pycache__/
 *.md
 .env
 venv/
+.venv/
 .idea/
 *.iml
 .DS_Store
@@ -26,3 +27,4 @@ venv/
 /project_tree_direct.txt
 /scripts/
 /tests/
+dl_pipeline_aadt.egg-info
