@@ -1,0 +1,18 @@
+# configs/tuning/sue.yaml
+# @package _global_
+
+defaults:
+  - base
+
+hydra:
+  sweeper:
+    params:
+      # --- Arquitectura Específica de SUE ---
+      model.architecture.hidden_dim_from_link: choice(64, 128)
+      # Nota: SUE no tiene hidden_dim_to_link, así que no lo ponemos aquí.
+      model.architecture.feature_dim: choice(32, 64)
+      
+      model.architecture.dropout_from_link: interval(0.0, 0.2)
+
+      # --- Física (Solo relevante para SUE) ---
+      # model.loss.w_od: interval(0.5, 2.0)

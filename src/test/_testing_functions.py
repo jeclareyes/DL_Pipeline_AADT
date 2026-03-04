@@ -24,6 +24,27 @@ import seaborn as sns
 # Imported here to avoid circular imports at package import time in some cases
 
 
+# Utility: coerce tensors/arrays to 1-D numpy arrays before building DataFrames
+def _to_1d(arr, name: Optional[str] = None):
+    """Coerce input to a 1-D numpy array.
+
+    Args:
+        arr: torch.Tensor, numpy array, list, or None.
+        name: optional name used in error messages.
+
+    Returns:
+        1-D numpy.ndarray or None if arr is None.
+    """
+    if arr is None:
+        return None
+    if isinstance(arr, torch.Tensor):
+        arr = arr.cpu().numpy()
+    arr = np.asarray(arr)
+    if arr.ndim == 0:
+        arr = arr.reshape(1)
+    return arr.ravel()
+
+
 def _get_latest_epoch_state(master_checkpoint: Dict[str, Any]) -> Dict[str, Any]:
     """Return the epoch-state dict for the latest epoch saved in master_checkpoint.
     master_checkpoint is expected to have an 'epochs_history' mapping from str(epoch)->state.
@@ -250,18 +271,26 @@ def plot_scatter_comparison(
     plt.figure(figsize=(10, 8))
     sns.set_style("whitegrid")
 
-    # Crear DataFrame para facilitar el plot con Seaborn
-    data = {'True': target, 'Predicted': pred}
+    # Coerce inputs to 1-D numpy arrays
+    pred_arr = _to_1d(pred, name="pred")
+    true_arr = _to_1d(target, name="target")
+
+    if pred_arr.shape != true_arr.shape:
+        raise ValueError(f"pred and target shapes differ: {pred_arr.shape} vs {true_arr.shape}")
 
     if mask is not None:
         # Si hay máscara, creamos una columna de categoría
         # mask == True -> mask_label (ej. "Test Set" o "Known OD")
         # mask == False -> "Others" (ej. "Train Set" o "Unknown OD")
-        labels = np.where(mask, mask_label, 'Others')
-        data['Type'] = labels
+        mask_arr = _to_1d(mask, name="mask")
+        if mask_arr.shape != true_arr.shape:
+            raise ValueError(f"Mask shape {mask_arr.shape} != data shape {true_arr.shape}")
+        labels = np.where(mask_arr, mask_label, 'Others')
+        data = {'True': true_arr, 'Predicted': pred_arr, 'Type': labels}
         hue = 'Type'
         palette = {mask_label: '#FF0054', 'Others': '#0077B6'}  # Rojo para destacado, Azul para resto
     else:
+        data = {'True': true_arr, 'Predicted': pred_arr}
         hue = None
         palette = None
 
@@ -413,19 +442,26 @@ def export_flows_csv(
         extras: Diccionario opcional con {nombre_columna: array_datos}
                 ej: {'Capacity': cap_array, 'Link_Type': type_array}
     """
-    # 1. Columnas Base
+    # 1. Columnas Base (aseguramos 1-D)
+    pred_vec = _to_1d(pred_flows, name='pred_flows')
+    true_vec = _to_1d(true_flows, name='true_flows')
+    mask_vec = _to_1d(mask_observed, name='mask_observed')
+
     df = pd.DataFrame({
-        'estimated_flow': pred_flows.flatten(),
-        'true_flow': true_flows.flatten(),
-        'is_observed': mask_observed.flatten().astype(bool)
+        'estimated_flow': pred_vec,
+        'true_flow': true_vec,
+        'is_observed': mask_vec.astype(bool)
     })
 
     # 2. Añadir columnas opcionales (Capacity, t0, Link_Type, etc.)
     if extras:
         for col_name, data in extras.items():
+            flat = _to_1d(data, name=col_name)
+            if flat is None:
+                continue
             # Aseguramos que tenga la misma longitud
-            if len(data.flatten()) == len(df):
-                df[col_name] = data.flatten()
+            if flat.shape[0] == df.shape[0]:
+                df[col_name] = flat
             else:
                 logging.warning(
                     f"La variable extra '{col_name}' no tiene la misma longitud que los flujos. Se omite.")
@@ -470,21 +506,36 @@ def export_od_analysis_csv(
         mask_known: Array booleano indicando qué pares eran conocidos (input).
         num_centroids: Número de centroides (TAZs) para clasificar tipos de par.
     """
-    # Validar dimensiones
-    if len(pred_demand) != len(od_indices):
-        raise ValueError(f"Desajuste: {len(pred_demand)} demandas vs {len(od_indices)} índices OD.")
+    # 1. Crear DataFrame Base (asegurando 1-D para pred/true y formato para índices)
+    pred_vec = _to_1d(pred_demand, name='pred_demand')
+    true_vec = _to_1d(true_demand, name='true_demand') if true_demand is not None else np.zeros_like(pred_vec)
 
-    # 1. Crear DataFrame Base
+    # Asegurar od_indices es numpy array con forma (N,2)
+    if isinstance(od_indices, torch.Tensor):
+        indices_np = od_indices.cpu().numpy()
+    else:
+        indices_np = np.asarray(od_indices)
+
+    if indices_np.ndim != 2 or indices_np.shape[1] < 2:
+        raise ValueError(f"od_indices must be shape (N,2), got {indices_np.shape}")
+
+    if len(pred_vec) != indices_np.shape[0]:
+        raise ValueError(f"Desajuste: {len(pred_vec)} demandas vs {indices_np.shape[0]} índices OD.")
+
     df = pd.DataFrame({
-        'origin_node': od_indices[:, 0],
-        'destination_node': od_indices[:, 1],
-        'estimated_od': pred_demand,
-        'known_od_value': true_demand if true_demand is not None else np.zeros_like(pred_demand)
+        'origin_node': indices_np[:, 0],
+        'destination_node': indices_np[:, 1],
+        'estimated_od': pred_vec,
+        'known_od_value': true_vec
     })
 
     # 2. Columna Booleana de "Conocido"
     if mask_known is not None:
-        df['is_known_pair'] = mask_known.astype(bool)
+        mask_vec = _to_1d(mask_known, name='mask_known')
+        if mask_vec.shape[0] != df.shape[0]:
+            logging.warning("La máscara 'mask_known' no coincide en longitud con los pares OD; se ignorará.")
+        else:
+            df['is_known_pair'] = mask_vec.astype(bool)
     else:
         df['is_known_pair'] = False  # Por defecto todo desconocido si no se pasa máscara
 
@@ -608,12 +659,25 @@ def process_evaluation(file_path: str, output_dir: str):
     safe_capacity = capacity.copy()
     safe_capacity[safe_capacity == 0] = 1.0
 
+    # Asegurar vectores 1-D antes de construir el DataFrame de visualización
+    pred_vec = _to_1d(pred_flows, name='pred_flows')
+    cap_vec = _to_1d(capacity, name='capacity')
+    safe_cap_vec = _to_1d(safe_capacity, name='safe_capacity')
+    mask_test_vec = _to_1d(mask_test, name='mask_test')
+
+    if not (pred_vec.shape == cap_vec.shape == safe_cap_vec.shape):
+        raise ValueError("pred_flows, capacity and safe_capacity must have the same shape for visualization")
+
+    if len(link_types_mapped) != pred_vec.shape[0]:
+        # try to coerce by repeating or trimming would be unsafe; raise and log
+        raise ValueError(f"Length of link_types_mapped ({len(link_types_mapped)}) doesn't match data length ({pred_vec.shape[0]})")
+
     df_vis = pd.DataFrame({
-        'Pred_Volume': pred_flows,
-        'Capacity': capacity,
-        'VC_Ratio': pred_flows / safe_capacity,
+        'Pred_Volume': pred_vec,
+        'Capacity': cap_vec,
+        'VC_Ratio': pred_vec / safe_cap_vec,
         'Link_Type': link_types_mapped,
-        'Is_Test': mask_test
+        'Is_Test': mask_test_vec
     })
 
     plot_link_histograms(df_vis, model_name, output_dir)

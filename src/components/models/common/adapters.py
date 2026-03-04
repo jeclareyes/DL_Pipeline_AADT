@@ -47,7 +47,8 @@ class RouteModelAdapter:
         This orchestrator function coordinates the entire data transformation process:
         1. Establishes canonical edge ordering (critical for index consistency)
         2. Extracts physical network properties (free-flow times, capacities)
-        3. Builds sparse route-link incidence matrices
+        3. Builds sparse route-link incidence matrices (supporting both legacy 3D and 
+           optimized 2D topological formats).
         4. Packages all components into a unified dictionary
 
         Args:
@@ -68,7 +69,11 @@ class RouteModelAdapter:
             Dict[str, torch.Tensor]: Complete model input dictionary containing:
                 - 'num_links' (int): Total number of links in network
                 - 'num_od_pairs' (int): Number of origin-destination pairs
-                - 'route_masks' (torch.SparseTensor): [OD, K, Links] incidence matrix
+
+                - 'route_masks' (torch.sparse.FloatTensor): 3D legacy incidence [OD, K, Links]
+                - 'delta_matrix' (torch.sparse.FloatTensor): 2D transpose incidence [Links, OD*K]
+                - 'route_validity_mask' (torch.BoolTensor): 2D valid routes boolean [OD, K]
+                
                 - 'od_pair_indices' (torch.LongTensor): [OD, 2] node index pairs
                 - 't0' (torch.FloatTensor): [Links] free-flow travel times
                 - 'capacity' (torch.FloatTensor): [Links] link capacities
@@ -90,7 +95,12 @@ class RouteModelAdapter:
         physics_tensors = self._extract_physics(graph, edge_list)
 
         # 3. Build sparse route-link incidence masks
-        masks, od_indices = self._build_sparse_route_masks(routes_data, graph, edge_to_idx)
+        # TODO: to deprecate the old 3D route_masks and replace with the new 2D delta_matrix and validity_mask in the model.
+        # masks, od_indices = self._build_sparse_route_masks(routes_data, graph, edge_to_idx)
+
+        masks, delta_matrix, validity_mask, od_indices = self._build_sparse_route_masks(
+            routes_data, graph, edge_to_idx
+        )
 
         # 4. Assemble final model input package
         model_inputs = {
@@ -98,6 +108,8 @@ class RouteModelAdapter:
             'num_od_pairs': masks.shape[0],
             'route_masks': masks.to(self.device),
             'od_pair_indices': od_indices.to(self.device),
+            'delta_matrix': delta_matrix.to(self.device), # NEW: Transpose incidence for efficient link-based computations
+            'route_validity_mask': validity_mask.to(self.device), # NEW: 2D boolean mask indicating valid routes per OD pair
             **physics_tensors  # Unpacks t0, capacity, link_group, etc.
         }
 
@@ -161,6 +173,120 @@ class RouteModelAdapter:
         }
 
     def _build_sparse_route_masks(self, routes_data: Dict, graph: nx.DiGraph, edge_to_idx: Dict) -> Tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Construct sparse topological tensors from K-shortest path data.
+        
+        CRITICAL ARCHITECTURAL WARNING:
+        This method generates TWO distinct sparse incidence matrices to satisfy 
+        different hardware and mathematical constraints across models. DO NOT delete 
+        either matrix, as they serve different generations of traffic models.
+        
+        1. 'route_masks' (3D Sparse) -> [num_od, k_limit, num_links]
+           - Legacy tensor for CGAME_DataDriven model.
+           - Represents the conceptual hierarchy: OD -> Routes -> Links.
+           - Cannot be efficiently multiplied using torch.sparse.mm() due to 3D shape.
+           
+        2. 'delta_matrix' (2D Sparse Transposed) -> [num_links, num_od * k_limit]
+           - Required by Topo-CGAME (CRAME_DataDriven) physics-informed architecture.
+           - Flattens the [OD, K] dimensions into a single continuous route index (r).
+           - Pragmatic design: allows ultra-fast $x = \Delta f$ projection on GPUs 
+             using standard 2D sparse matrix multiplication without OOM errors.
+             
+        3. 'route_validity_mask' (2D Dense Boolean) -> [num_od, k_limit]
+           - Required by Topo-CGAME (CRAME_DataDriven) Attention Mechanism.
+           - Maps which routes actually exist (True) vs padded empty slots (False).
+           - Used to inject negative infinity before Softmax to prevent flow leakage.
+
+        Args:
+            routes_data (Dict): Route information format.
+            graph (nx.DiGraph): Network graph (used for node mapping).
+            edge_to_idx (Dict[Tuple, int]): Maps edge tuples to canonical link indices.
+
+        Returns:
+            Tuple containing (legacy_3d_mask, delta_2d_matrix, route_validity_mask, od_pair_indices)
+        """
+        raw_routes = routes_data if 'routes' not in routes_data else self._convert_tensor_to_dict(routes_data, graph)
+
+        k_limit = 10
+        num_od = len(raw_routes)
+        num_links = len(edge_to_idx)
+        
+        # --- 1. Initialization for Legacy 3D Tensor ---
+        indices_od_3d, indices_k_3d, indices_link_3d, values_3d = [], [], [], []
+        
+        # --- 2. Initialization for New 2D Delta Tensor ---
+        indices_link_2d, indices_r_2d, values_2d = [], [], []
+        
+        # --- 3. Initialization for Route Validity Mask ---
+        validity_mask = torch.zeros((num_od, k_limit), dtype=torch.bool, device=self.device)
+
+        od_pair_list = []
+        od_idx = 0
+
+        for (u, v), paths in raw_routes.items():
+            od_pair_list.append([u, v])
+
+            for k, path in enumerate(paths):
+                if k >= k_limit:
+                    break
+                
+                # Flag this route slot as valid (physically exists)
+                validity_mask[od_idx, k] = True
+                
+                # Flattened route index 'r' for the 2D Delta matrix
+                r_idx = (od_idx * k_limit) + k
+
+                for i in range(len(path) - 1):
+                    u_node, v_node = path[i], path[i + 1]
+                    if (u_node, v_node) in edge_to_idx:
+                        l_idx = edge_to_idx[(u_node, v_node)]
+
+                        # Populate Legacy 3D coords
+                        indices_od_3d.append(od_idx)
+                        indices_k_3d.append(k)
+                        indices_link_3d.append(l_idx)
+                        values_3d.append(1.0)
+                        
+                        # Populate New 2D coords [Link, Route]
+                        indices_link_2d.append(l_idx)
+                        indices_r_2d.append(r_idx)
+                        values_2d.append(1.0)
+
+            od_idx += 1
+
+        if not indices_od_3d:
+            empty_tensor = torch.empty(0, device=self.device)
+            return empty_tensor, empty_tensor, validity_mask, empty_tensor
+
+        # --- Assembly: Legacy 3D Sparse Tensor ---
+        i_tensor_3d = torch.LongTensor([indices_od_3d, indices_k_3d, indices_link_3d])
+        v_tensor_3d = torch.FloatTensor(values_3d)
+        legacy_mask = torch.sparse_coo_tensor(
+            i_tensor_3d, v_tensor_3d,
+            size=(num_od, k_limit, num_links),
+            device=self.device
+        ).coalesce()
+
+        # --- Assembly: New 2D Delta Sparse Tensor ---
+        i_tensor_2d = torch.LongTensor([indices_link_2d, indices_r_2d])
+        v_tensor_2d = torch.FloatTensor(values_2d)
+        total_routes_r = num_od * k_limit
+        delta_matrix = torch.sparse_coo_tensor(
+            i_tensor_2d, v_tensor_2d,
+            size=(num_links, total_routes_r),
+            device=self.device
+        ).coalesce()
+
+        # --- Assembly: OD Indices ---
+        node_list = sorted(list(graph.nodes()))
+        node_map = {n: i for i, n in enumerate(node_list)}
+        od_indices_num = [[node_map.get(u, -1), node_map.get(v, -1)] for u, v in od_pair_list]
+        od_indices_tensor = torch.LongTensor(od_indices_num).to(self.device)
+
+        return legacy_mask, delta_matrix, validity_mask, od_indices_tensor
+
+    def _build_sparse_route_masks_deprecated(self, routes_data: Dict, graph: nx.DiGraph, edge_to_idx: Dict) -> Tuple[
         torch.Tensor, torch.Tensor]:
         """
         Construct sparse route-link incidence tensor from K-shortest path data.

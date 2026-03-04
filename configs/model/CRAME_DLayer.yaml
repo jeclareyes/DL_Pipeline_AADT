@@ -1,0 +1,46 @@
+# configs/model/CRAME_DLayer.yaml
+# =============================================================================
+
+# 1. Target
+_target_: src.components.models.CRAME_DLayer.CyclicLoop
+model_name: "CRAME_DLayer"
+
+# 2. Dynamic Data Inputs (Injected by adapter at runtime)
+num_links: ???
+num_od_pairs: ???
+delta_matrix: ???
+route_validity_mask: ???
+t0: ???
+capacity: ???
+route_masks: ???
+lanes: ???
+od_pair_indices: ???
+num_link_groups: ???
+link_group: ???
+
+# 3. Flattened Architecture Hyperparameters
+feature_dim: 512
+h_enc: 512       
+h_dec: 1024      
+max_routes_per_od: 10
+dropout: 0.0
+num_structures: 5 # Recovered for the GraphMatcher
+
+# 4. Loss Function Configuration
+loss:
+  _target_: src.components.models.CRAME_DLayer.Loss
+  w_flow: 1.0
+  w_od: 1.0
+  w_gradient : 1.0
+  
+  # Base scales (to be overridden by trainer)
+  link_scale: 1.0
+  od_scale: 1.0
+
+# 5. VDF Config (Injected by adapter at runtime)
+vdf_config: ${vdf}
+
+# 6. Diagnostics
+diagnostics:
+  _target_: src.components.models.CRAME_DLayer.TrainingDiagnostician
+  history_window: 100

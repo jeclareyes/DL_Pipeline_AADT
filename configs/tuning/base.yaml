@@ -1,0 +1,30 @@
+# configs/tuning/base.yaml
+# @package _global_
+
+# Estrategia "Target Explícito"
+# Evita componding errors al no usar la lista de defaults global para el sweeper.
+# Est/o es más seguro cuando se carga din/ámicamente con +tuning=...
+
+hydra:
+  sweeper:
+    _target_: hydra_plugins.hydra_optuna_sweeper.optuna_sweeper.OptunaSweeper
+    sampler:
+      _target_: optuna.samplers.TPESampler
+      seed: 123
+    
+    direction: minimize
+    study_name: traffic_assignment_optimization
+    storage: null
+    n_trials: 50
+    n_jobs: 1
+
+    # Parámetros COMUNES a todos los modelos
+    params:
+      training.lr: tag(log, interval(0.00001, 0.01))
+      training.weight_decay: interval(1e-6, 1e-3)
+      training.batch_size: choice(1, 2)
+
+  # Callback para generar reporte automático al terminar
+  callbacks:
+    optuna_report:
+      _target_: src.train.callbacks.OptunaReportCallback

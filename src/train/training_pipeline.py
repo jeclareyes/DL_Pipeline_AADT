@@ -86,7 +86,7 @@ def run_pipeline(cfg: DictConfig):
 
     # --- NUEVO: Inyectar en network_params ---
     # Lo metemos aquí para que viaje cómodamente hasta el Trainer
-    network_params['link_types_vis'] = link_types
+    network_params['link_types_vis'] = link_types # TODO: Verificar si esto no es redudante, puesto que en RouteModelAdapter también se inyecta link_types para el modelo. Podríamos unificarlo.
 
     logging.info("Data successfully adapted to PyTorch Tensors.")
 
@@ -108,7 +108,11 @@ def run_pipeline(cfg: DictConfig):
     # C.1: Prepare Flows
     link_df = raw_data['link_data']
     target_year = cfg.data.get('volume_year', 2022)
-    vol_col = f'Volume_{target_year}'
+    if target_year is False:
+        logging.info("No 'volume_year' specified. Going with default \"volume\" column.")
+        vol_col = f'volume'
+    else:  
+        vol_col = f'Volume_{target_year}'
 
     # Fallback mechanism if specific year column is missing
     if vol_col not in link_df.columns and 'flow' in link_df.columns:
@@ -353,7 +357,20 @@ def run_pipeline(cfg: DictConfig):
 
 @hydra.main(version_base=None, config_path="../../configs", config_name="config")
 def main(cfg: DictConfig):
-    run_pipeline(cfg)
+    # Para acceder a la configuración de Hydra en tiempo de ejecución, usamos HydraConfig
+    from hydra.core.hydra_config import HydraConfig
+    from hydra.types import RunMode
+    try:
+        hydra_cfg = HydraConfig.get()
+        # Verificar si mode es MULTIRUN (ya sea Enum o String, por seguridad)
+        is_multirun = hydra_cfg.mode == RunMode.MULTIRUN or str(hydra_cfg.mode) == "MULTIRUN"
+        
+        if cfg.training.get("tuning") and not is_multirun:
+            logging.warning("MODO TUNING ACTIVADO - MODO MULTIRUN (-m) NO ACTIVADO.")
+    except Exception:
+        pass
+
+    return run_pipeline(cfg)
 
 if __name__ == "__main__":
     main()

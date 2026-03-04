@@ -379,7 +379,6 @@ class AssignmentValidator(nn.Module):
 
 
         else:
-
             # Executed if loop finished without break
             if logger.isEnabledFor(logging.WARNING) and self.verbose:
                 logger.warning(
@@ -585,7 +584,7 @@ class StochasticAssignmentLayer(nn.Module):
         route_costs = route_costs_flat_t.transpose(0, 1).view(batch_size, self.num_od, self.k_paths)
 
         # =====================================================================
-        # PASO 2: Logit Probabilities (Igual que antes)
+        # PASO 2: Logit Probabilities
         # =====================================================================
 
         # Estabilización numérica
@@ -649,6 +648,9 @@ class CyclicODModel(nn.Module):
             **kwargs
     ):
         super().__init__()
+
+        logging.info(f"INITIALIZING: {kwargs.get('model_name', 'Unknown Model')}.")
+
 
         arch = architecture
         feature_dim = arch.feature_dim
@@ -1374,6 +1376,17 @@ class CGAMEDiagnosticTool:
             # --- 1. PLOT SPECTRAL DENSITY (HEATMAP) ---
             # Convertir lista de conteos a matriz (Epochs x Bins)
             density_matrix = np.array(data_struct['counts']).T  # Transponer para (Y=Bins, X=Epochs)
+
+            # 2. DATA CHECK: Calculate max before converting to NaN
+            v_max = np.max(density_matrix)
+
+            # If the matrix is all zeros (common when od_mask is 100% known), 
+            # v_max will be 0, which breaks LogNorm.
+            if v_max <= 0:
+                ax.text(0.5, 0.5, f"No active data for {key}\n(All values are 0 or mask is empty)", 
+                        ha='center', fontsize=12, color='gray')
+                ax.set_title(data_struct['label'])
+                continue
 
             # Reemplazar ceros con NaN para que el fondo sea transparente/blanco
             density_matrix = density_matrix.astype(float)

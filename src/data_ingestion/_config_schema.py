@@ -27,7 +27,7 @@ class DataProcessingConfig:
     dataset: str = MISSING
     random_seed: int = MISSING
     multiday_od: bool = MISSING
-    volume_year: Optional[Union[int, str]] = None
+    volume_year: Optional[Union[int, str, bool]] = None
     input_routes: InputRoutes = dataclasses.field(default_factory=InputRoutes)
     output_routes: OutputRoutes = dataclasses.field(default_factory=OutputRoutes)
     route_calculation: Dict[str, Any] = field(default_factory=dict)

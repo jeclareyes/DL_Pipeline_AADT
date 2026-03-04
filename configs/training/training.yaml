@@ -10,12 +10,10 @@ input_routes:
   od_matrix: ${data.base_path}/${data.od_matrix_file}
   link_df: ${data.base_path}/${data.link_data_file}
 
-k_folds: 1  # Número de folds para cross-validation
-
 # Hiperparámetros del Entrenamiento (Optimizador, Loops, etc.)
-epochs: 100
+epochs: 900
 batch_size: 1
-lr: 5.0e-4
+lr: 4.0e-3
 weight_decay: 1e-3
 
 # Warmup policy: controla si se utiliza warmup y cuántas épocas dura
@@ -24,7 +22,7 @@ warmup:
   epochs: 50
 
 # Configuración del Optimizador
-optimizer: "adam" # 'adam' | 'sgd' | 'adamw'
+optimizer: "adamw" # 'adam' | 'sgd' | 'adamw'
 
 # Scheduler (Control de tasa de aprendizaje)
 scheduler: "reduce_on_plateau"
@@ -41,7 +39,7 @@ early_stopping:
   min_delta: 0.0001
 
 # Configuración de Hardware
-device: "auto"  # 'cuda', 'cpu', o 'auto'
+device: "cuda"  # 'cuda', 'cpu', o 'auto'
 
 metrics_on_training: true # Calcular métricas durante el entrenamiento
 
@@ -50,3 +48,8 @@ scaling_strategy: max # standard | capacity | max
 
 # Validación
 val_frequency: 5
+
+# Tuning
+
+tuning: null # 'datadriven' | 'sue' | null (null para no tuning)
+k_folds: 1  # Número de folds para cross-validation

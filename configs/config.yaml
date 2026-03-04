@@ -4,7 +4,7 @@ defaults:
   - _self_ # Permit overrides in this file
 
   # 1. Dataset (Ahora buscará en configs/dataset/Linköping.yaml)
-  - dataset: Linköping
+  - dataset: Linköping # 'Linköping' | 'SiouxFalls' | 'Synthetic01' | 'Synthetic03'
 
 
   # 2. Data Processing (Rutas anidadas según tu estructura)
@@ -12,11 +12,11 @@ defaults:
   - data_ingestion/data_preprocessing: preprocessing_from_pkl
 
   # 3. Model (Busca en configs/model/CGAME_MLP_SUE.yaml)
-  - model: CGAME_MLP_SUE # 'CGME_MLP_SUE' | 'CGAME_MLP_SUE' | 'CGAME'
+  - model: CGAME_DataDriven # 'CGME_MLP_SUE' | 'CGAME_MLP_SUE' | 'CGAME_DataDriven' | 'CRAME_DataDriven' | 'CRAME_DLayer'
 
   # 4. Training (Busca en configs/training/training.yaml)
   - training: training
-  - tuning: optuna
+  # - tuning: optuna  <-- COMENTADO: Se activará manualmente con +tuning=...
 
   # 5. Sampling (Busca en configs/sampling/sampling.yaml)
   - sampling: sampling
@@ -49,6 +49,6 @@ paths:
   outputs: ${paths.root_dir}/outputs
 
 runs:
-  dir: outputs/runs/${model.model_name}\
+  dir: outputs/runs/${model.model_name}
   # /_Epochs_${training.epochs}_VDF_${network.cost_function}_Learning_Rate_${training.lr}_Flow_Sampling_Rate_${sampling.flow_rate}_Sampling_Strategy_${sampling.strategy}_Sampling_Basis_${sampling.sampling_basis}
 

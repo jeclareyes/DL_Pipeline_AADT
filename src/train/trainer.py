@@ -75,14 +75,22 @@ class TrafficTrainer:
         }
 
         # 3. Variables de Control
-        best_val_loss = float('inf')
+        best_monitored_loss = float('inf')
         early_stop = False
         epochs_no_improve = 0
         patience = self.cfg.training.early_stopping.patience
 
         # Herramienta de diagnóstico (opcional)
-        from src.components.models.CGAME_MLP_SUE import CGAMEDiagnosticTool
-        diagnostician = CGAMEDiagnosticTool(window_size=100)
+        #from src.components.models.CGAME_MLP_SUE import CGAMEDiagnosticTool
+        #diagnostician = CGAMEDiagnosticTool(window_size=100)
+
+        # AÑADIR ESTO (Carga dinámica desde el YAML):
+        if hasattr(self.cfg.model, 'diagnostics'):
+            diagnostician = hydra.utils.instantiate(self.cfg.model.diagnostics)
+        else:
+            # Fallback simple por si el YAML no tiene diagnostics
+            from src.components.models.CGAME_DataDriven import TrainingDiagnostician
+            diagnostician = TrainingDiagnostician(history_window=100)
 
         # --- BUCLE DE ÉPOCAS ---
         for epoch in range(self.cfg.training.epochs):
@@ -109,17 +117,39 @@ class TrafficTrainer:
                 # override_max_iters=current_iters TODO fix
             )
 
+            if hasattr(criterion, 'w_entropy'):
+                # --- NUEVA INVOCACIÓN DEL LOSS ---
+            # Preparamos los diccionarios que espera TopoLoss
+                outputs_dict = {
+                    'reconstructed_flows': outputs['reconstructed_flows'],
+                    'estimated_demand': outputs['estimated_demand'],
+                    'route_flows': outputs.get('route_flows') # Esencial para la Entropía
+                }
+                
+                targets_dict = {
+                    'flows': train_tensors['flows'],
+                    'od': train_tensors['od']
+                }
+                
+                masks_dict = {
+                    'flow_mask': train_tensors['mask'],
+                    'od_mask': train_tensors['od_mask'],
+                    'route_mask': network_params['route_validity_mask'] # <- Físicamente inyectada
+                }
 
-            loss_dict = criterion(
-                predicted_flows=outputs['reconstructed_flows'],
-                true_flows=train_tensors['flows'],
-                flow_mask=train_tensors['mask'],
-                predicted_od=outputs['estimated_demand'],
-                true_od=train_tensors['od'],
-                od_mask=train_tensors['od_mask'],
-                learned_alpha=outputs.get('learned_alpha'),
-                learned_beta=outputs.get('learned_beta')
-            )
+                loss_dict = criterion(outputs=outputs_dict, targets=targets_dict, masks=masks_dict)
+
+            else:
+                loss_dict = criterion(
+                    predicted_flows=outputs['reconstructed_flows'],
+                    true_flows=train_tensors['flows'],
+                    flow_mask=train_tensors['mask'],
+                    predicted_od=outputs['estimated_demand'],
+                    true_od=train_tensors['od'],
+                    od_mask=train_tensors['od_mask'],
+                    learned_alpha=outputs.get('learned_alpha'),
+                    learned_beta=outputs.get('learned_beta')
+                )
 
             loss_dict['total_loss'].backward()
 
@@ -143,53 +173,55 @@ class TrafficTrainer:
             # C. Validación
             val_loss, val_preds = self._validate(model, train_tensors['flows'], train_tensors['mask'], val_tensors['mask'])
 
-            # Solo aplicamos lógica de mejora si existe validación
-            if has_val:
-                # Scheduler Step
-                if scheduler:
-                    # Registrar LR antes de aplicar el scheduler
-                    pre_lrs = [pg.get('lr', None) for pg in optimizer.param_groups]
+            # Seleccionar métrica para scheduler/seguimiento
+            monitored_loss = val_loss if has_val else current_loss
+            monitor_name = "val_mse" if has_val else "train_loss"
 
-                    # Ejecutar el step del scheduler (mantener la llamada original con val_loss)
+            # Scheduler Step (siempre activo si existe scheduler)
+            if scheduler:
+                pre_lrs = [pg.get('lr', None) for pg in optimizer.param_groups]
+
+                try:
+                    scheduler.step(monitored_loss)
+                except TypeError:
+                    scheduler.step()
+
+                post_lrs = [pg.get('lr', None) for pg in optimizer.param_groups]
+
+                def _to_float(x):
                     try:
-                        scheduler.step(val_loss)
-                    except TypeError:
-                        # En caso de que el scheduler no acepte un argumento (defensivo), llamar sin args
-                        scheduler.step()
-
-                    # LR después de aplicar el scheduler
-                    post_lrs = [pg.get('lr', None) for pg in optimizer.param_groups]
-
-                    # Función auxiliar para convertir a float de forma segura
-                    def _to_float(x):
+                        return float(x)
+                    except Exception:
                         try:
-                            return float(x)
+                            return float(x.item())
                         except Exception:
-                            try:
-                                return float(x.item())
-                            except Exception:
-                                return None
+                            return None
 
-                    pre_f = [_to_float(x) for x in pre_lrs]
-                    post_f = [_to_float(x) for x in post_lrs]
+                pre_f = [_to_float(x) for x in pre_lrs]
+                post_f = [_to_float(x) for x in post_lrs]
 
-                    for i, (p, q) in enumerate(zip(pre_f, post_f)):
-                        if p is not None and q is not None and q < p:
-                            # Info sobre la reducción del learning rate
-                            self.logger.info(f"Scheduler reduced LR for param_group {i}: {p:.6e} -> {q:.6e}")
+                for i, (p, q) in enumerate(zip(pre_f, post_f)):
+                    if p is not None and q is not None and q < p:
+                        self.logger.info(
+                            f"Scheduler reduced LR for param_group {i}: {p:.6e} -> {q:.6e} "
+                            f"(monitor={monitor_name}, value={monitored_loss:.6f})"
+                        )
 
-                # Early Stopping Check
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
+            # Seguimiento de mejor métrica
+            prev_best_monitored_loss = best_monitored_loss
+            improved = monitored_loss < prev_best_monitored_loss
+            if improved:
+                best_monitored_loss = monitored_loss
+
+            # Early stopping solo aplica cuando hay validación
+            if has_val:
+                if improved:
                     epochs_no_improve = 0
                 else:
                     epochs_no_improve += 1
                     if self.cfg.training.early_stopping.enabled and epochs_no_improve >= patience:
                         early_stop = True
                         self.logger.info(f"Early stopping en época {epoch + 1}")
-            else:
-                # Si no hay validación, el "mejor" es simplemente el último
-                best_val_loss = val_loss
 
             # D. Logging & Saving
             log_freq = self.cfg.training.get('save_frequency', 10)
@@ -247,7 +279,7 @@ class TrafficTrainer:
         diagnostician.plot_physics("final_physics_report.png")
         diagnostician.plot_gradient_health("gradient_health_report.png")
 
-        return best_val_loss
+        return best_monitored_loss
 
     def _validate(self, model, all_flows, train_mask, val_mask):
         """
@@ -325,8 +357,9 @@ class TrafficTrainer:
     def _get_loss_function(self, model, t0_costs=None):
         # 1. Extraer escalas si el modelo las tiene (como buffers)
         # Si el modelo no las tiene, usamos 1.0 por defecto
-        l_scale = getattr(model, 'link_scale', torch.tensor(1.0)).item()
-        o_scale = getattr(model, 'od_scale', torch.tensor(1.0)).item()
+        # l_scale = getattr(model, 'link_scale', torch.tensor(1.0)).item() TODO: Esto no funciona si link_scale es un escalar float, así que lo hacemos más robusto:
+        l_scale = (v.detach().item() if torch.is_tensor(v := getattr(model, "link_scale", 1.0)) else float(v))
+        o_scale = (v.detach().item() if torch.is_tensor(v := getattr(model, "od_scale", 1.0)) else float(v))
 
         # 2. Instanciación general
         # Pasamos los escaladores como 'kwargs'. Si la clase Loss en el YAML
@@ -346,7 +379,8 @@ class TrafficTrainer:
         """
         Empaqueta tensores estáticos necesarios para reconstruir el escenario en Testing.
         """
-        return {
+
+        data_bundle = {
             # Ground Truth (para comparar en testing)
             'true_flows': train_t['flows'].cpu(),
             'true_od': train_t['od'].cpu(),
@@ -354,7 +388,6 @@ class TrafficTrainer:
             # Física de la red (necesaria para el simulador SUE en testing)
             'capacity': net_p['capacity'].cpu(),
             't0': net_p['t0'].cpu(),
-            'route_masks': net_p['route_masks'].cpu(),
             'od_pair_indices': net_p['od_pair_indices'].cpu(),
 
             'link_group': net_p['link_group'].cpu(),
@@ -369,6 +402,19 @@ class TrafficTrainer:
                 'od_mask': train_t['od_mask'].cpu().bool()
             }
         }
+
+
+        # --- NUEVO: Soporte Híbrido Topológico ---
+        if 'route_masks' in net_p: # Legado 3D
+            data_bundle['route_masks'] = net_p['route_masks'].cpu()
+        
+        if 'delta_matrix' in net_p: # Topo-CGAME 2D
+            data_bundle['delta_matrix'] = net_p['delta_matrix'].cpu()
+            
+        if 'route_validity_mask' in net_p: # Máscara de Atención
+            data_bundle['route_validity_mask'] = net_p['route_validity_mask'].cpu()
+
+        return data_bundle
 
 
     def _save_checkpoint(self, epoch, model, optimizer, loss, loss_dict, outputs,

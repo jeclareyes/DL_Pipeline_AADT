@@ -7,7 +7,7 @@ from networkx.algorithms.flow import capacity_scaling
 
 from .base import BaseCostFunction  # Asegúrate de tener esta base
 
-class BPRCostFunction(BaseCostFunction):
+class BPRCostFunction_old(BaseCostFunction):
     """
     Función de costo BPR modularizada.
     """
@@ -45,7 +45,7 @@ class BPRCostFunction(BaseCostFunction):
         alpha_links = alpha[self.link_group]
         beta_links = beta[self.link_group]
 
-        capacity_factor = 16 # Factor de escala para la capacidad según número de horas efectivas
+        capacity_factor = 1 # Factor de escala para la capacidad según número de horas efectivas
 
         # Evitar divisiones por cero y explosiones numéricas
         flow_ratio = torch.clamp(link_flows / ((self.capacity * capacity_factor) * self.lanes  + 1e-9), max=5.0)
@@ -58,3 +58,52 @@ class BPRCostFunction(BaseCostFunction):
 
         cost = self.t0 * (1 + alpha_links * flow_ratio ** beta_links)
         return cost
+    
+
+class BPRCostFunction(nn.Module):
+    """
+    Differentiable BPR Function.
+    Pragmatic modifications:
+    1. Safe capacity clamping to prevent division by zero (Logical Connectors).
+    2. V/C clamping to prevent gradient explosion early in training.
+    """
+    def __init__(self, t0: torch.Tensor, capacity: torch.Tensor, lanes: torch.Tensor, 
+                 num_link_groups: int, link_group: torch.Tensor, 
+                 learn_alpha: bool = True, learn_beta: bool = True, 
+                 alpha_init: float = 0.15, beta_init: float = 4.0, **kwargs):
+        super().__init__()
+        
+        self.register_buffer('t0', t0)
+        self.register_buffer('capacity', capacity)
+        
+        # Pragmatic initialization: using global parameters. 
+        # (Could be expanded to group-specific parameters using num_link_groups)
+        self.alpha = nn.Parameter(torch.tensor(float(alpha_init)), requires_grad=learn_alpha)
+        self.beta = nn.Parameter(torch.tensor(float(beta_init)), requires_grad=learn_beta)
+
+    def forward(self, link_flows: torch.Tensor) -> torch.Tensor:
+        """
+        Calculates dynamic link costs.
+        link_flows: [Batch, Num_Links]
+        """
+        # 1. Handle Logical Connectors (capacity == 0)
+        safe_capacity = torch.where(
+            self.capacity > 0, 
+            self.capacity, 
+            torch.tensor(1e9, device=self.capacity.device)
+        )
+        
+        # 2. Compute Volume/Capacity ratio
+        v_c = link_flows / safe_capacity
+        
+        # 3. Prevent Gradient Explosion (Crucial for early epochs)
+        v_c = torch.clamp(v_c, max=5.0)
+        
+        # 4. Mask connectors out of congestion calculation
+        is_regular_link = (self.capacity > 0).float()
+        
+        # 5. BPR Formula
+        delay = self.alpha * (v_c ** self.beta) * is_regular_link
+        link_costs = self.t0 * (1.0 + delay)
+        
+        return link_costs

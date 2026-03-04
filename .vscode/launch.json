@@ -1,0 +1,39 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: Train (Standard)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/src/train/training_pipeline.py",
+            "console": "integratedTerminal",
+            "args": []
+        },
+        {
+            "name": "Python: Tuning (Optuna - DataDriven)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/src/train/training_pipeline.py",
+            "console": "integratedTerminal",
+            "args": [
+                "-m",
+                "model=CGAME_DataDriven",
+                "training.k_folds=3",
+                "+tuning=datadriven"
+            ]
+        },
+        {
+            "name": "Python: Tuning (Optuna - SUE)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/src/train/training_pipeline.py",
+            "console": "integratedTerminal",
+            "args": [
+                "-m",
+                "model=CGAME_MLP_SUE",
+                "training.k_folds=3",
+                "+tuning=sue"
+            ]
+        }
+    ]
+}

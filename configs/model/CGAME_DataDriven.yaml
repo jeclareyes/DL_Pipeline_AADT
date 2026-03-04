@@ -1,21 +1,21 @@
-# configs/model/CGAME_MLP_SUE.yaml
+# configs/model/CGAME_DataDriven.yaml
 # =============================================================================
 
 # 1. Target
-_target_: src.components.models.CGAME_MLP_SUE.CyclicODModel
-model_name: "CGAME_MLP_SUE"
+_target_: src.components.models.CGAME_DataDriven.CyclicODModel
+model_name: "CGAME_DataDriven"
 
 # 2. Arquitectura (Hiperparámetros del modelo)
 architecture:
-  num_structures: 1
-  feature_dim: 64 # 2, 4, 8, 16, 32, 64, 128, 256, *512*
+  num_structures: 8
+  feature_dim: 512 # 2, 4, 8, 16, 32, 64, 128, 256, *512*
 
   # hidden dimensions for the MLPs
-  hidden_dim_from_link: 64 # Link to feature MLP 2, 4, 8, 16, 32, 64, 128, 256, *512*
+  hidden_dim_from_link: 512 # Link to feature MLP 2, 4, 8, 16, 32, 64, 128, 256, *512*
+  hidden_dim_to_link: 512   # Feature to link MLP 2, 4, 8, 16, 32, 64, 128, 256, *512*
 
-
-  hidden_dim_from_od: 128   # OD to feature MLP 2, 4, 8, 16, 32, 64, 128, 256, 512, *1024*
-  hidden_dim_to_od: 128   # Feature to OD MLP 2, 4, 8, 16, 32, 64, 128, 256, 512, *1024*
+  hidden_dim_from_od: 1024   # OD to feature MLP 2, 4, 8, 16, 32, 64, 128, 256, 512, *1024*
+  hidden_dim_to_od: 1024   # Feature to OD MLP 2, 4, 8, 16, 32, 64, 128, 256, 512, *1024*
 
   # dropout rates (Normalmente 0.0)
   dropout_from_od: 0.0
@@ -24,7 +24,7 @@ architecture:
 
 # 3. Pesos de la Función de Pérdida (Loss Weights)
 loss:
-  _target_: src.components.models.CGAME_MLP_SUE.Loss
+  _target_: src.components.models.CGAME_DataDriven.Loss
   w_flow: 1.0
   w_od: 1.0
   w_demand_reg: 0.1
@@ -33,6 +33,10 @@ loss:
   link_scale: 1.0
   od_scale: 1.0
 
+diagnostics:
+  _target_: src.components.models.CGAME_DataDriven.TrainingDiagnostician
+  history_window: 100
+
 # 4. Configuración de la Función de Costo (VDF)
 vdf_config: ${vdf}
 
@@ -40,12 +44,12 @@ vdf_config: ${vdf}
 # (???) Significa que son obligatorios
 num_links: ???
 num_od_pairs: ???
-t0: ???
-capacity: ???
-route_masks: ???
-od_pair_indices: ???
-num_link_groups: ???
-link_group: ???
+#t0: ???
+#capacity: ???
+#route_masks: ???
+#od_pair_indices: ???
+#num_link_groups: ???
+#link_group: ???
 
 # 6. Convergencia para AssignmentValidator (MSA)
 msa_convergence:
@@ -58,7 +62,7 @@ msa_convergence:
   min_iters: 5
   max_iters: 10
 
-  grad_steps: 2
+  grad_steps: 3
   eps: 1e-9
 
 verbose: true

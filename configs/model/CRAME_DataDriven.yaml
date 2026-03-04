@@ -1,0 +1,40 @@
+# configs/model/CRAME_DataDriven.yaml
+# =============================================================================
+
+# 1. Target
+_target_: src.components.models.CRAME_DataDriven.CyclicLoop
+model_name: "CRAME_DataDriven"
+
+# 2. Dynamic Data Inputs (Injected by adapter at runtime)
+# '???' means they are required but populated dynamically by **model_params
+num_links: ???
+num_od_pairs: ???
+delta_matrix: ???
+route_validity_mask: ???
+
+# 3. Flattened Architecture Hyperparameters
+# These now map directly to the CyclicLoop __init__ arguments
+feature_dim: 512
+h_enc: 512       # Replaces hidden_dim_from_link
+h_dec: 1024      # Replaces hidden_dim_to_od
+max_routes_per_od: 10
+dropout: 0.0
+
+# 4. Loss Function Configuration
+loss:
+  _target_: src.components.models.CRAME_DataDriven.Loss
+  w_flow: 1.0
+  w_od: 1.0
+  w_entropy: 0.01  # CRITICAL: Prevents route-assignment equifinality collapse
+  
+  # Base scales (to be overridden by trainer)
+  link_scale: 1.0
+  od_scale: 1.0
+
+# 5. Diagnostics
+diagnostics:
+  _target_: src.components.models.CRAME_DataDriven.TrainingDiagnostician
+  history_window: 100
+
+# Note: VDF Config and MSA Convergence blocks were removed as the Topo-CGAME 
+# handles physical projection via Delta matrix rather than cyclical MSA simulation.

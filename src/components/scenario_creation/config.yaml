@@ -1,0 +1,19 @@
+Defaults:
+  - _self_
+  - scenario: "Synthetic02"
+
+paths:
+  root_dir: ${hydra:runtime.cwd}
+  input_config: root_dir/scenarios_config/${scenario}.yaml
+
+  export_dirs:
+    nodes: ${paths.root_dir}/data/raw/${scenario}/${scenario}_node.tntp
+    network: ${paths.root_dir}/data/raw/${scenario}/${scenario}_network.tntp
+    trips: ${paths.root_dir}/data/raw/${scenario}/${scenario}_trips.tntp
+    routes: ${paths.root_dir}/data/raw/${scenario}/${scenario}_routes.tntp
+    flows: ${paths.root_dir}/data/raw/${scenario}/${scenario}_flows.tntp
+
+Num_decimals:
+  Coordinates: 0
+  Demand: 0
+  Flows: 1

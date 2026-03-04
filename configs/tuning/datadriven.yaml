@@ -1,0 +1,16 @@
+# configs/tuning/datadriven.yaml
+# @package _global_
+
+defaults:
+  - base
+
+hydra:
+  sweeper:
+    params:
+      # --- Arquitectura Específica de DataDriven ---
+      model.architecture.hidden_dim_from_link: choice(256, 512)
+      model.architecture.hidden_dim_to_link: choice(256, 512) # Exclusivo DataDriven
+      model.architecture.feature_dim: choice(128, 256, 512)
+      
+      model.architecture.dropout_from_link: interval(0.0, 0.4)
+      model.architecture.dropout_to_od: interval(0.0, 0.4)

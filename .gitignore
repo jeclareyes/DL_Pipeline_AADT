@@ -1,4 +1,6 @@
 __pycache__/
+notes/
+.env
 *.pyc
 *.md
 .env
@@ -8,6 +10,7 @@ venv/
 *.iml
 .DS_Store
 /data/processed/Link*ping/
+/data/processed/
 /data/interim/Link*ping/
 /data/external/Link*ping/
 /data/raw/Link*ping/
@@ -16,6 +19,7 @@ venv/
 /logs/
 /notebooks/
 /outputs/
+/multirun/
 /temp_bcn/
 /documentation/
 /drafts/
@@ -28,3 +32,7 @@ venv/
 /scripts/
 /tests/
 dl_pipeline_aadt.egg-info
+final_evolution_report.png
+final_physics_report.png
+final_training_report.png
+gradient_health_report.png

@@ -2,10 +2,10 @@
 # =============================================================================
 
 
-dataset: ${data.dataset}  # Nombre del dataset, viene de Linköping.yaml
-multiday_od: true # TODO esto depende del dataset, ¿debería ir en Linköping.yaml?
+dataset: ${data.dataset}  # Nombre del dataset, viene de data.dataset.yaml
+multiday_od: true # TODO esto depende del dataset, ¿debería ir en en cada data.dataset.yaml?
 random_seed: 42
-volume_year: 2022 # TODO esto depende del dataset, ¿debería ir en Linköping.yaml?
+volume_year: ${data.volume_year} # TODO esto depende del dataset, ¿debería ir en data.dataset.yaml?
                   # TODO Sin embargo,es el año que vamos a procesar. Todavía no se ha decido si dejar un solo año,
                   # TODO o si dejar múltiples años y que sea en el proceso de sampling o training donde se filtre
 
