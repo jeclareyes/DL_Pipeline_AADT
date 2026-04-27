@@ -4,7 +4,7 @@ defaults:
   - _self_ # Permit overrides in this file
 
   # 1. Dataset (Ahora buscará en configs/dataset/Linköping.yaml)
-  - dataset: Linköping # 'Linköping' | 'SiouxFalls' | 'Synthetic01' | 'Synthetic03'
+  - dataset: Synthetic03 # 'Linköping' | 'SiouxFalls' | 'Synthetic01' | 'Synthetic03'
 
 
   # 2. Data Processing (Rutas anidadas según tu estructura)
@@ -12,7 +12,11 @@ defaults:
   - data_ingestion/data_preprocessing: preprocessing_from_pkl
 
   # 3. Model (Busca en configs/model/CGAME_MLP_SUE.yaml)
-  - model: CGAME_DataDriven # 'CGME_MLP_SUE' | 'CGAME_MLP_SUE' | 'CGAME_DataDriven' | 'CRAME_DataDriven' | 'CRAME_DLayer'
+  - model: VI_Model 
+  #       'CGME_MLP_SUE' | 'CGAME_MLP_SUE' | 
+  #       'CGAME_DataDriven' | 'CRAME_DataDriven' | 'CRAME_DLayer'
+  #       'CGAME_PhysicsMirrorDescent' | 'CGAME_PhysicsMirrorDescent_IMD'
+  #        'VI_Model' |
 
   # 4. Training (Busca en configs/training/training.yaml)
   - training: training

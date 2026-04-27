@@ -51,6 +51,12 @@ from omegaconf import DictConfig
 from typing import Optional, Dict, Any
 import logging
 
+from src.contracts.runtime_contracts import (
+    ArtifactSchemaError,
+    ModelInputContractError,
+    require_keys,
+)
+
 
 class ODEncoder(nn.Module):
     """Takes the vehicle counts vector (how many cars passed each sensor)
@@ -585,8 +591,25 @@ class CyclicODModel(nn.Module):
             max_trips_scaler=max_trips_scaler
         )
 
-    def forward(self, observed_counts: torch.Tensor, true_od_demand: torch.Tensor = None,
-                warmup: bool = False) -> dict:
+        loss_cfg = kwargs.get("loss", {})
+        if isinstance(loss_cfg, DictConfig):
+            loss_cfg = dict(loss_cfg)
+        else:
+            loss_cfg = dict(loss_cfg) if isinstance(loss_cfg, dict) else {}
+        loss_cfg.pop("_target_", None)
+        self.loss_fn = LossCalculator(**loss_cfg)
+
+    def forward(self, observed_counts: torch.Tensor = None, true_od_demand: torch.Tensor = None,
+                warmup: bool = False, observed_flows: torch.Tensor = None,
+                flow_mask: torch.Tensor = None, od_mask: torch.Tensor = None, **kwargs) -> dict:
+
+        if observed_counts is None:
+            observed_counts = observed_flows
+        if observed_counts is None:
+            raise ModelInputContractError("observed_counts or observed_flows must be provided")
+
+        if flow_mask is not None:
+            observed_counts = observed_counts * flow_mask
 
         # Batch handling
         is_batched = observed_counts.dim() == 2
@@ -626,13 +649,48 @@ class CyclicODModel(nn.Module):
             if route_probs is not None:
                 route_probs = route_probs.squeeze(0)
 
-        return {
+        output = {
             "estimated_demand": estimated_demand,
             "reconstructed_flows": reconstructed_flows,
             "learned_alpha": learned_alpha,
             "learned_beta": learned_beta,
             "convergence_info": convergence_info,
             "route_probs": route_probs
+        }
+
+        if true_od_demand is not None:
+            if flow_mask is None:
+                flow_mask = torch.ones_like(observed_counts)
+            if od_mask is None:
+                od_mask = torch.ones_like(true_od_demand)
+
+            output["loss"] = self.loss_fn(
+                predicted_flows=reconstructed_flows,
+                true_flows=observed_counts,
+                flow_mask=flow_mask,
+                predicted_od=estimated_demand,
+                true_od=true_od_demand,
+                od_mask=od_mask,
+                learned_alpha=learned_alpha,
+                learned_beta=learned_beta,
+            )
+
+        return output
+
+    def get_evaluation_artifacts(self, outputs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        outputs_map = require_keys(
+            outputs,
+            ["reconstructed_flows", "estimated_demand"],
+            context="CGME_MLP_SUE.get_evaluation_artifacts outputs",
+            exc_type=ArtifactSchemaError,
+        )
+        return {
+            "pred_flows": outputs_map["reconstructed_flows"].detach().cpu(),
+            "pred_od": outputs_map["estimated_demand"].detach().cpu(),
+            "convergence": outputs_map.get("convergence_info", {}),
+            "learned_alpha": outputs_map.get("learned_alpha"),
+            "learned_beta": outputs_map.get("learned_beta"),
+            "route_probs": outputs_map.get("route_probs"),
         }
 
     def validate_latent_space_consistency(self, observed_counts, true_od_demand):
@@ -764,9 +822,12 @@ class CyclicODModelUltra(CyclicODModel):
         observed_counts = observed_flows_proc * flow_mask_proc
 
         # Call the Ultra forward (expects observed_counts)
-        outputs = super().forward(observed_counts=observed_counts,
-                                  true_od_demand=true_od_proc,
-                                  warmup=warmup)
+        outputs = super().forward(
+            observed_counts=observed_counts,
+            true_od_demand=true_od_proc,
+            warmup=warmup,
+            flow_mask=flow_mask_proc,
+        )
 
         # If it wasn't batched, undo the added dimension
         if not is_batched:

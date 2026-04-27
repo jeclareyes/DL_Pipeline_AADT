@@ -11,10 +11,11 @@ input_routes:
   link_df: ${data.base_path}/${data.link_data_file}
 
 # Hiperparámetros del Entrenamiento (Optimizador, Loops, etc.)
-epochs: 900
-batch_size: 1
-lr: 4.0e-3
-weight_decay: 1e-3
+epochs: 300
+batch_size: 2
+lr: 0.0018
+weight_decay: 4.5e-5
+assignment_lr_multiplier: 0.62
 
 # Warmup policy: controla si se utiliza warmup y cuántas épocas dura
 warmup:
@@ -22,34 +23,65 @@ warmup:
   epochs: 50
 
 # Configuración del Optimizador
-optimizer: "adamw" # 'adam' | 'sgd' | 'adamw'
+optimizer: "adamw" # 'adam' | 'sgd' | ''
 
 # Scheduler (Control de tasa de aprendizaje)
 scheduler: "reduce_on_plateau"
+scheduler_monitor: auto # auto | train | val
 grad_clip_norm: 0.5
+assignment_grad_clip_norm: 50.0
 scheduler_params:
   factor: 0.5
-  patience: 10
+  patience: 5
   min_lr: 1e-6
+  threshold: 1e-2
+  threshold_mode: rel # rel | abs
+  cooldown: 2
 
 # Early Stopping (Parada temprana si no mejora)
 early_stopping:
   enabled: false
-  patience: 20
+  patience: 15
   min_delta: 0.0001
+  monitor: auto # auto | train | val
 
 # Configuración de Hardware
 device: "cuda"  # 'cuda', 'cpu', o 'auto'
 
 metrics_on_training: true # Calcular métricas durante el entrenamiento
 
+# Data strictness policy:
+# - false: fallback when optional columns are missing (e.g., link_type -> Unknown)
+# - true: fail-fast if required runtime data contracts are not met
+strict_data: false
+
 # Prescaling strategy for inputs: 'standard' | 'capacity' | 'max'
-scaling_strategy: max # standard | capacity | max
+scaling_strategy: standard # standard | capacity | max
+
+# Optional OD prior from free-flow shortest-path costs.
+# Keep disabled by default because not all models consume this prior during training.
+compute_t0_od_cost_prior: false
+
+# OD initialization policy for models that support it (currently VI_Model).
+# - known_mean: initializes all OD with the known-demand mean behavior.
+# - low_unknown: initializes unknown OD pairs with a low value and keeps known OD at input target values.
+od_initialization:
+  mode: low_unknown # known_mean | low_unknown
+  low_unknown_value: 0.57
 
 # Validación
 val_frequency: 5
 
+# Post-training diagnostics CSV/metrics generation (without TA calibration).
+enable_post_training_diagnostics: true
+
+# Checkpoint retention policy:
+# - max_epochs_history: number of epoch entries kept in memory/disk history for both ckpt and eval bundles.
+# - Set 0 to disable pruning.
+checkpoint_retention:
+  max_epochs_history: 300
+
 # Tuning
 
-tuning: null # 'datadriven' | 'sue' | null (null para no tuning)
+tuning: null # 'datadriven' | 'sue' | 'vi_model' | null (null para no tuning)
 k_folds: 1  # Número de folds para cross-validation

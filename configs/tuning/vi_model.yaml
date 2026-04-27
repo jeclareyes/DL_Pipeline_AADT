@@ -1,0 +1,57 @@
+# configs/tuning/vi_model.yaml
+# @package _global_
+
+defaults:
+  - base
+
+hydra:
+  mode: MULTIRUN
+
+  sweeper:
+    params:
+      # ----------------------------------------------------------------------
+      # VI_MODEL SEARCH SPACE (TYPE-AWARE)
+      # - int    : choice(...)
+      # - float  : interval(...) or tag(log, interval(...)) for log-scale
+      # - bool   : choice(true, false)
+      # - string : choice(known_mean, low_unknown)
+      # ----------------------------------------------------------------------
+
+      # ===== Architecture =====
+      model.architecture.hidden_dim: choice(64, 96, 128, 160, 192, 256)  # int
+
+      # ===== Model LR multipliers =====
+      model.supply_lr_multiplier: tag(log, interval(0.05, 1.0))  # float
+      model.demand_lr_multiplier: tag(log, interval(0.25, 4.0))  # float
+
+      # ===== OD anchoring behavior =====
+      model.anchor_known_od_in_solver: choice(true, false)  # bool
+
+      # ===== Equilibrium solver =====
+      model.solver.eta: tag(log, interval(0.05, 1.5))  # float
+      model.solver.max_iterations: choice(8, 10, 12, 15, 20)  # int
+      model.solver.min_iterations: choice(2, 3, 4, 5)  # int
+      model.solver.tol_rel_flow: tag(log, interval(1e-5, 5e-3))  # float
+      model.solver.use_early_stop: choice(true, false)  # bool
+
+      # ===== IMD backward =====
+      model.solver.imd.enabled: choice(true, false)  # bool
+      model.solver.imd.backward_iters: choice(2, 3, 4, 6, 8)  # int
+      model.solver.imd.use_damping: choice(true, false)  # bool
+      model.solver.imd.damping: interval(0.2, 0.9)  # float
+      model.solver.imd.stationary_tail_steps: choice(0, 1, 2, 3, 4, 5)  # int
+      model.solver.imd.warm_start: choice(true, false)  # bool
+
+      # ===== Loss weights =====
+      model.loss.w_link: tag(log, interval(1.0, 30.0))  # float
+      model.loss.w_prior: tag(log, interval(0.1, 5.0))  # float
+      model.loss.w_reg: tag(log, interval(1e-3, 1.0))  # float
+      model.loss.huber_delta: interval(0.25, 3.0)  # float
+
+      # ===== BPR parameter bounds (safe subset) =====
+      model.alpha_max: interval(0.4, 1.5)  # float (alpha_min stays fixed)
+      model.beta_max: interval(4.0, 8.0)  # float (beta_min stays fixed)
+
+      # ===== VI OD initialization hook (training side) =====
+      training.od_initialization.mode: choice(known_mean, low_unknown)  # string
+      training.od_initialization.low_unknown_value: tag(log, interval(1e-3, 5.0))  # float

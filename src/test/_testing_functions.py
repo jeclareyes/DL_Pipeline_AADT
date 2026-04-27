@@ -12,7 +12,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, DictConfig
 import hydra
 
 import torch
@@ -20,6 +20,14 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
+
+from src.contracts.runtime_contracts import (
+    EvalBundleContractError,
+    TaskDispatchContractError,
+    resolve_testing_dispatch_plan,
+    validate_artifacts_contract,
+    validate_eval_bundle_contract,
+)
 
 # Imported here to avoid circular imports at package import time in some cases
 
@@ -387,39 +395,6 @@ def calculate_metrics(pred: np.ndarray, target: np.ndarray) -> Dict[str, float]:
     }
 
 
-def plot_link_histograms(df: pd.DataFrame, model_name: str, output_dir: str):
-    """
-    Genera histogramas de Volumen y V/C Ratio agrupados por Link Type.
-    Guarda dos imágenes separadas.
-    """
-    sns.set_style("whitegrid")
-
-    # 1. Histograma de Volumen
-    plt.figure(figsize=(12, 6))
-    sns.histplot(data=df, x="Pred_Volume", hue="Link_Type", element="step", bins=30, common_norm=False)
-    plt.title(f"Distribución de Flujos Predichos por Tipo de Link\n({model_name})")
-    plt.xlabel("Volumen (vech/h)")
-    plt.ylabel("Frecuencia")
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, f"{model_name}_hist_volume.png"))
-    plt.close()
-
-    # 2. Histograma de Volume/Capacity (V/C)
-    plt.figure(figsize=(12, 6))
-    # Filtramos outliers extremos de V/C para que el gráfico sea legible (ej. > 2.0)
-    df_filtered = df[df["VC_Ratio"] <= 2.0]
-
-    sns.histplot(data=df_filtered, x="VC_Ratio", hue="Link_Type", element="step", bins=30, common_norm=False)
-    plt.axvline(1.0, color='red', linestyle='--', label='Capacidad (1.0)')
-    plt.title(f"Distribución de V/C Ratio por Tipo de Link\n({model_name})")
-    plt.xlabel("Volume / Capacity Ratio")
-    plt.ylabel("Frecuencia")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, f"{model_name}_hist_vc_ratio.png"))
-    plt.close()
-
-
 # =============================================================================
 # FUNCIONES DE EXPORTACIÓN (Nuevas)
 # =============================================================================
@@ -563,180 +538,102 @@ def export_od_analysis_csv(
     logging.info(f"Análisis OD exportado a: {output_path}")
 
 
-def process_evaluation(file_path: str, output_dir: str):
-    """Función principal orquestadora (Actualizada con Scatter Plots)."""
+def process_evaluation(
+        file_path: str,
+        output_dir: str,
+        testing_cfg,
+        resolved_task_names: Optional[list[str]] = None,
+) -> None:
+    """Config-driven evaluation dispatcher.
+
+    The pipeline loads artifacts and runs task functions resolved from
+    capability-based dispatch in configs/testing/testing.yaml.
+
+    Args:
+        resolved_task_names: Optional preflight-resolved callable task list.
+            If omitted, tasks are resolved in-place with resolver safeguards.
+    """
+    from src.test import evaluation_tasks
 
     model_name = os.path.basename(file_path).replace("eval_", "").replace(".pt", "")
     bundle = load_eval_bundle(file_path)
+    bundle = validate_eval_bundle_contract(bundle)
 
-    static = bundle['static_data']
-    mask = static['masks']
-    epoch_num, dynamic = get_latest_epoch_data(bundle)
+    static = dict(bundle["static_data"])
+    masks = dict(static.get("masks", {}))
 
-    # --- DATOS FLOWS ---
-    pred_flows = dynamic['pred_flows'].numpy()
-    true_flows = static['true_flows'].numpy()
-    capacity = static['capacity'].numpy()
-    link_groups = static['link_group'].numpy()
-    mask_test = mask['flow_test'].numpy().astype(bool)
+    # Canonical OD mask convention: masks.od_mask (legacy alias: static.mask_od_known).
+    if "od_mask" not in masks and "mask_od_known" in static:
+        masks["od_mask"] = static["mask_od_known"]
+    if "mask_od_known" not in static and "od_mask" in masks:
+        static["mask_od_known"] = masks["od_mask"]
 
+    _, dynamic = get_latest_epoch_data(bundle)
 
-
-    # --- MÉTRICAS FLOWS ---
-    # Calcular métricas globales y específicas de Test
-    if np.any(mask_test):
-        link_metrics = calculate_metrics(pred_flows[mask_test], true_flows[mask_test])
-        subset_name = "TEST_SET"
-        scatter_mask = mask_test
-        scatter_label = "Test Links"
-    else:
-        link_metrics = calculate_metrics(pred_flows, true_flows)
-        subset_name = "FULL_SET"
-        scatter_mask = None
-        scatter_label = "All Links"
-
-    logging.info(f"Métricas Links ({subset_name}): {link_metrics}")
-
-    # GRÁFICO 1: Scatter Flows (Real vs Pred)
-    plot_scatter_comparison(
-        pred=pred_flows,
-        target=true_flows,
-        mask=scatter_mask,
-        mask_label=scatter_label,
-        title=f"Traffic Flows: True vs Estimated ({model_name})",
-        xlabel="True Flow (veh/h)",
-        ylabel="Estimated Flow (veh/h)",
-        output_path=os.path.join(output_dir, f"{model_name}_scatter_flows.png"),
-        log_scale=True  # Recomendado para flujos de tráfico
-    )
-
-    # --- DATOS OD ---
-    od_metrics = {}
-    if 'true_od' in static and static['true_od'] is not None:
-        true_od = static['true_od'].numpy()
-        pred_od = dynamic['pred_od'].numpy()
-
-        # Máscara de OD Conocidos
-        if 'mask_od_known' in static:
-            mask_od = static['mask_od_known'].numpy().astype(bool)
-        else:
-            mask_od = None
-
-        # Métricas sobre TODO el conjunto (generalmente queremos ver si recuperó la matriz entera)
-        od_metrics = calculate_metrics(pred_od, true_od)
-        logging.info(f"Métricas OD Matrix (Global): {od_metrics}")
-
-        # GRÁFICO 2: Scatter OD (Real vs Pred)
-        # Filtramos para resaltar los conocidos ("que solo se conocían obviamente")
-        plot_scatter_comparison(
-            pred=pred_od,
-            target=true_od,
-            mask=mask_od,
-            mask_label="Known OD (Input)",  # Etiqueta para los datos que SÍ se conocían
-            title=f"OD Demand: True vs Estimated ({model_name})",
-            xlabel="True Demand",
-            ylabel="Estimated Demand",
-            output_path=os.path.join(output_dir, f"{model_name}_scatter_od.png"),
-            log_scale=True
+    # Strict canonical artifacts contract (legacy fallback disabled by design).
+    artifacts = dynamic.get("artifacts")
+    if artifacts is None:
+        raise EvalBundleContractError(
+            "Evaluation bundle epoch payload missing required key 'artifacts'. "
+            "Legacy key fallback is disabled in strict mode."
         )
 
-    # 3. Guardar CSV (Igual que antes)
-    metrics_df = pd.DataFrame([link_metrics])
-    metrics_df['type'] = 'Links_Test'
-    metrics_df['model'] = model_name
+    artifacts = validate_artifacts_contract(artifacts)
 
-    if od_metrics:
-        od_df = pd.DataFrame([od_metrics])
-        od_df['type'] = 'OD_Pairs_Global'
-        od_df['model'] = model_name
-        metrics_df = pd.concat([metrics_df, od_df], ignore_index=True)
+    if resolved_task_names is not None:
+        task_names = [str(t).strip() for t in resolved_task_names if str(t).strip()]
+    else:
+        available_task_names = sorted(
+            name
+            for name, obj in vars(evaluation_tasks).items()
+            if callable(obj) and not name.startswith("_") and getattr(obj, "__module__", "") == evaluation_tasks.__name__
+        )
+        dispatch_plan = resolve_testing_dispatch_plan(
+            testing_cfg,
+            available_task_names=available_task_names,
+        )
+        task_names = list(dispatch_plan["tasks_callable"])
 
-    metrics_df.to_csv(os.path.join(output_dir, f"{model_name}_metrics.csv"), index=False)
-
-    # 4. Histogramas (Igual que antes)
-    group_map = {0: 'Multi-Lane', 1: 'Motorway', 2: 'Two_Lane', 3: 'Rural', 4: 'Connectors'}
-    link_types_mapped = [group_map.get(g, f'Type_{g}') for g in link_groups]
-    safe_capacity = capacity.copy()
-    safe_capacity[safe_capacity == 0] = 1.0
-
-    # Asegurar vectores 1-D antes de construir el DataFrame de visualización
-    pred_vec = _to_1d(pred_flows, name='pred_flows')
-    cap_vec = _to_1d(capacity, name='capacity')
-    safe_cap_vec = _to_1d(safe_capacity, name='safe_capacity')
-    mask_test_vec = _to_1d(mask_test, name='mask_test')
-
-    if not (pred_vec.shape == cap_vec.shape == safe_cap_vec.shape):
-        raise ValueError("pred_flows, capacity and safe_capacity must have the same shape for visualization")
-
-    if len(link_types_mapped) != pred_vec.shape[0]:
-        # try to coerce by repeating or trimming would be unsafe; raise and log
-        raise ValueError(f"Length of link_types_mapped ({len(link_types_mapped)}) doesn't match data length ({pred_vec.shape[0]})")
-
-    df_vis = pd.DataFrame({
-        'Pred_Volume': pred_vec,
-        'Capacity': cap_vec,
-        'VC_Ratio': pred_vec / safe_cap_vec,
-        'Link_Type': link_types_mapped,
-        'Is_Test': mask_test_vec
-    })
-
-    plot_link_histograms(df_vis, model_name, output_dir)
-    logging.info(f"Evaluación (Gráficos y Métricas) completada para: {model_name}")
-
-    # =====================================================
-    # NUEVO: EXPORTACIÓN DE FLUJOS (CSV)
-    # =====================================================
-    # Preparamos las variables opcionales del usuario
-    flow_extras = {
-        'capacity': static['capacity'].numpy(),
-        't0': static['t0'].numpy(),
-        'link_group': static['link_group'].numpy()
-    }
-
-    # Usamos la máscara de test como "is_observed" para distinguir
-    # OJO: Si tienes una máscara global de "sensores reales", úsala aquí.
-    # Usualmente mask_flow_train | mask_flow_test = todos los sensores.
-    mask_observed_total = (
-            static['masks']['flow_train'].numpy().astype(bool) |
-            static['masks']['flow_test'].numpy().astype(bool)
-    )
-
-    export_flows_csv(
-        pred_flows=pred_flows,
-        true_flows=true_flows,
-        mask_observed=mask_observed_total,
-        output_path=os.path.join(output_dir, f"{model_name}_flows_detailed.csv"),
-        extras=flow_extras
-    )
-
-    # =====================================================
-    # EXPORTACIÓN DE OD PAIRS (CSV) - ACTUALIZADO
-    # =====================================================
-    if 'true_od' in static and static['true_od'] is not None:
-
-        # VERIFICACIÓN: ¿Tenemos los índices guardados?
-        if 'od_pair_indices' in static:
-            od_indices = static['od_pair_indices'].numpy()
-            num_centroids = static.get('num_centroids', 0)  # Leemos del archivo, no del loader
-
-            true_od = static['true_od'].numpy()
-            pred_od = dynamic['pred_od'].numpy()
-
-            mask_od_known = None
-            if 'mask_od_known' in static:
-                mask_od_known = static['mask_od_known'].numpy()
-
-            export_od_analysis_csv(
-                pred_demand=pred_od,
-                true_demand=true_od,
-                od_indices=od_indices,
-                output_path=os.path.join(output_dir, f"{model_name}_od_analysis.csv"),
-                mask_known=mask_od_known,
-                num_centroids=num_centroids
-            )
-        else:
-            # Fallback por si intentas evaluar un modelo viejo que no tenía estos datos guardados
+        if dispatch_plan["tasks_unknown"]:
             logging.warning(
-                f"El archivo {model_name} no contiene 'od_indices'. No se puede exportar el análisis OD detallado. (Re-entrena el modelo con el nuevo pipeline).")
+                "Unknown tasks in capability_dispatch were ignored: %s",
+                dispatch_plan["tasks_unknown"],
+            )
+        if dispatch_plan["capabilities_unused"]:
+            logging.warning(
+                "Unused capabilities defined in capability_dispatch for model '%s': %s",
+                dispatch_plan["model_key"],
+                dispatch_plan["capabilities_unused"],
+            )
 
-    logging.info(f"Evaluación completa para: {model_name}")
+    task_names = list(dict.fromkeys(task_names))
+    if len(task_names) == 0:
+        raise TaskDispatchContractError(
+            f"No callable evaluation tasks resolved for model '{testing_cfg.model_to_test}'"
+        )
+
+    valid_task_count = 0
+    for task_name in task_names:
+        task_fn = getattr(evaluation_tasks, task_name, None)
+        if not callable(task_fn):
+            logging.warning(
+                "Configured task '%s' is not defined in src.test.evaluation_tasks. Skipping.",
+                task_name,
+            )
+            continue
+
+        valid_task_count += 1
+        task_fn(
+            artifacts=artifacts,
+            static=static,
+            masks=masks,
+            output_dir=output_dir,
+            model_name=model_name,
+        )
+
+    if valid_task_count == 0:
+        raise TaskDispatchContractError(
+            f"No callable evaluation tasks resolved for model '{testing_cfg.model_to_test}'"
+        )
+
+    logging.info(f"Evaluation completed for: {model_name}")

@@ -22,6 +22,13 @@ architecture:
   dropout_to_od: 0.0
   dropout_from_link: 0.0
 
+# 2.1 Hibridación de asignación (Warmup Data-Driven -> Physics SUE)
+hybrid_assignment:
+  use_physics: false # true | false
+  warmup_epochs: 70
+  hidden_dim_to_link: 128
+  dropout_to_link: 0.0
+
 # 3. Pesos de la Función de Pérdida (Loss Weights)
 loss:
   _target_: src.components.models.CGAME_MLP_SUE.Loss

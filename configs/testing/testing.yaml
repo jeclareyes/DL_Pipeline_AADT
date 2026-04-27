@@ -1,7 +1,53 @@
 
 root: outputs/runs
-model_to_test: "CGAME_DataDriven" # "CGAME_MLP_SUE" | "CGME_MLP_SUE" | "CGAME_DataDriven"
+model_to_test: "VI_Model" # "CGAME_MLP_SUE" | "CGME_MLP_SUE" | "CGAME_DataDriven" | "CRAME_DataDriven" | "CRAME_DLayer" | "VI_Model"
 
 eval_mode:
   single_model: true  # true | false
-  instance_to_test: "eval_Epochs_900_VDF_bpr_Learning_Rate_0.004_Flow_Rate_0.8_Strat_spatial_LHS_Basis_traffic_counts_based.pt"
+  instance_to_test: "eval_Epochs_300_VDF_bpr_Learning_Rate_0.0004_Flow_Rate_0.8_Strat_spatial_LHS_Basis_traffic_counts_based.pt"
+
+# Capability selection by model (runtime dispatch is capability-driven only).
+capabilities:
+  CGAME_DataDriven:
+    - flow_metrics
+    - link_distributions
+    - od_scatter
+    - export_csvs
+  CRAME_DataDriven:
+    - flow_metrics
+    - link_distributions
+    - od_scatter
+    - export_csvs
+  CRAME_DLayer:
+    - flow_metrics
+    - link_distributions
+    - od_scatter
+    - export_csvs
+  CGAME_MLP_SUE:
+    - flow_metrics
+    - link_distributions
+    - od_scatter
+    - export_csvs
+  CGME_MLP_SUE:
+    - flow_metrics
+    - link_distributions
+    - od_scatter
+    - export_csvs
+  VI_Model:
+    - flow_metrics
+    - link_distributions
+    - od_scatter
+    - export_csvs
+
+# Capability -> task-function mapping (task names must exist in src.test.evaluation_tasks).
+capability_dispatch:
+  flow_metrics:
+    - plot_standard_metrics
+  link_distributions:
+    - plot_link_distributions
+  od_scatter:
+    - plot_od_scatter
+  export_csvs:
+    - export_standard_csvs
+  cgame_penalty:
+    - plot_cgame_penalty

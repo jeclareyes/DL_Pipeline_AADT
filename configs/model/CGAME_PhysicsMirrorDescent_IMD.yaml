@@ -1,0 +1,71 @@
+# configs/model/CGAME_PhysicsMirrorDescent_IMD.yaml
+
+_target_: src.components.models.CGAME_PhysicsMirrorDescent_IMD.CyclicODModelIMD
+model_name: "CGAME_PhysicsMirrorDescent_IMD"
+
+architecture:
+  num_structures: 6
+  feature_dim: 256
+  hidden_dim_from_link: 512
+  hidden_dim_to_od: 512
+  hidden_dim_from_od: 512
+  hidden_dim_to_link: 512
+  inverse_demand_hidden_dim: 128
+  dropout: 0.0
+
+hybrid_assignment:
+  use_physics: true
+  warmup_epochs: 10
+
+mirror_descent:
+  eta: 1.0
+  max_iters: 30
+  min_iters: 5
+  tol_rel_flow: 1e-4
+  use_early_stop: true
+  warm_start: true
+  adaptive_n: true
+  adaptive_n_max: 80
+  adaptive_n_ramp_epochs: 100
+
+# IMD controls (new)
+imd:
+  backward_iters: 10
+  damping_factor: 0.5
+  current_forward_iters_default: 30
+  current_min_iters_default: 5
+  current_tol_rel_flow_default: 1e-4
+  preserve_early_stop: true
+
+physics:
+  attribute_net:
+    link_attr_dim: 4
+    node_attr_dim: 2
+    path_attr_dim: 2
+  weight_hidden_dim: 128
+
+loss:
+  _target_: src.components.models.CGAME_PhysicsMirrorDescent_IMD.LossIMD
+  w_flow: 1.0
+  w_od: 1.0
+  w_gap: 0.01
+  link_scale: 1.0
+  od_scale: 1.0
+
+diagnostics:
+  _target_: src.components.models.CGAME_PhysicsMirrorDescent_IMD.TrainingDiagnosticianIMD
+  history_window: 100
+
+vdf_config: ${vdf}
+
+# Dynamic runtime inputs from RouteModelAdapter and training pipeline.
+num_links: ???
+num_od_pairs: ???
+delta_matrix: ???
+route_validity_mask: ???
+od_pair_indices: ???
+t0: ???
+capacity: ???
+lanes: ???
+num_link_groups: ???
+link_group: ???

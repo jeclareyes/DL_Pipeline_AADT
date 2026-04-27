@@ -1,550 +1,277 @@
 """
-Modelo Deep Learning para Traffic Assignment con Datos Parciales.
-(Versión Modularizada con Hydra)
-
-Este modelo extiende la arquitectura cyclic para trabajar con:
-- Demandas OD parcialmente conocidas
-- Flujos de enlaces parcialmente observados
-
-Arquitectura:
-- ODEncoder: Codifica flujos observados a espacio latente
-- GraphMatcher: Alinea espacio latente con estructura de red
-- ODDecoder: Decodifica a demandas OD completas
-- AssignmentValidator: Valida equilibrio mediante SUE con función de costo inyectada dinámicamente
-
-Funciones de costo:
-- Se definen en src/components/vdf/ y se inyectan vía configuración.
+Hybrid Deep Learning Model for Traffic Assignment with Partial Data.
+Features: Deep Encoders, Attention-based Graph Matcher, and IFT-based SUE Validator.
 """
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import hydra
 from omegaconf import DictConfig
-from typing import Dict, Optional
+from typing import Dict, Optional, Callable
 import logging
 import numpy as np
 
-# Module logger for diagnostics
 logger = logging.getLogger(__name__)
 
-
 # =============================================================================
-# COMPONENTES DE RED NEURONAL (Encoder/Decoder/Matcher)
+# 1. DATA-DRIVEN COMPONENTS (Encoder / Decoder / Matcher)
 # =============================================================================
 
-class PaperMLP(nn.Module):
-    """
-    Two-layer MLP architecture based on Equations (6) and (8) from the paper.
-    Enhanced with optional LayerNorm for latent space stabilization.
-    """
-
-    def __init__(self, in_dim: int, hidden_dim: int, out_dim: int, dropout: float = 0.0,
-                 nonneg: bool = False, use_norm: bool = False):
+class ODEncoder(nn.Module):
+    def __init__(self, input_dim: int, hidden_dim: int, feature_dim: int, dropout: float = 0.1):
         super().__init__()
-
-        # Base architecture: Linear -> LeakyReLU -> Dropout -> Linear
-        layers = [
-            nn.Linear(in_dim, hidden_dim),
+        self.network = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.LeakyReLU(0.2),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, out_dim)
-        ]
-
-        # 1. LATENT STABILIZATION: LayerNorm is added before the final activation
-        # to ensure the latent features (hx, hy) are centered with unit variance.
-        if use_norm:
-            layers.append(nn.LayerNorm(out_dim))
-
-        # 2. FINAL ACTIVATION:
-        # - Softplus: Used for OD Demand estimation to ensure physical non-negativity.
-        # - LeakyReLU: Used for intermediate latent representations.
-        layers.append(nn.Softplus() if nonneg else nn.LeakyReLU(0.2))
-
-        self.net = nn.Sequential(*layers)
+            
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(dropout),
+            
+            nn.Linear(hidden_dim // 2, feature_dim),
+            nn.LayerNorm(feature_dim) 
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass through the MLP.
-        x shape: [Batch, in_dim]
-        """
-        return self.net(x)
+        return self.network(x)
+
+
+class ODDecoder(nn.Module):
+    def __init__(self, output_dim: int, hidden_dim: int, feature_dim: int, dropout: float = 0.1):
+        super().__init__()
+        self.network = nn.Sequential(
+            nn.Linear(feature_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(dropout),
+            
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(dropout),
+            
+            nn.Linear(hidden_dim // 2, output_dim),
+            nn.Softplus() 
+        )
+
+    def forward(self, g_x: torch.Tensor) -> torch.Tensor:
+        return self.network(g_x)
+
 
 class GraphMatcher(nn.Module):
-    """
-    Implements the structural matching logic between flow features (hx)
-    and OD features (hy) using the double-layer attention mechanism.
-
-    Ref: Equations (9), (10), and (11) from the paper.
-    """
-
-    def __init__(self, feature_dim: int, num_structures: int, m: float = 0.05, v: float = 0.05, eps: float = 1e-8):
+    def __init__(self, feature_dim: int, num_structures: int,
+                 lambda_m: float = 0.01, lambda_v: float = 0.01,
+                 reg_strength: float = 0.1):
         super().__init__()
         self.feature_dim = feature_dim
         self.num_structures = num_structures
-        self.lambda_m = m  # Similarity update rate (m in paper)
-        self.lambda_v = v  # Value decay/update rate (v in paper)
-        self.eps = eps
+        self.lambda_m = lambda_m
+        self.lambda_v = lambda_v
+        self.reg_strength = reg_strength
 
-        # M: Similarity Matrix [feature_dim, num_structures]
-        # V: Importance Vector [1, num_structures]
-        # Initialized to ones as per paper section 3.2.2
-        self.register_buffer("M", torch.ones(feature_dim, num_structures))
-        self.register_buffer("V", torch.ones(1, num_structures))
+        self.register_buffer('M', torch.randn(feature_dim, num_structures) * 0.1)
+        self.register_buffer('V', torch.ones(1, num_structures))
+        self.register_buffer('update_count', torch.tensor(0.0))
 
-        # Buffers to maintain history for sub-step updates (p batches concatenated)
-        self.history_hxy = []
-        self.history_hxh = []
-        self.history_hyh = []
+        self.attention_net = nn.Sequential(
+            nn.Linear(feature_dim, num_structures),
+            nn.Softmax(dim=-1)
+        )
+
+    def _ensure_batch_dim(self, h: torch.Tensor) -> torch.Tensor:
+        if h.dim() == 1:
+            return h.unsqueeze(0)
+        return h
 
     @torch.no_grad()
     def update(self, h_x: torch.Tensor, h_y: torch.Tensor):
-        """
-        Structural Calibration: Updates M and V based on cross-space correlations.
-        Calculates sub-step similarities for each of the ns structures.
-        """
-        # 1. Compute current batch statistics [feature_dim]
-        curr_hxy = (h_x * h_y).sum(dim=0)
-        curr_hxh = (h_x * h_x).sum(dim=0)
-        curr_hyh = (h_y * h_y).sum(dim=0)
+        h_x = self._ensure_batch_dim(h_x)
+        h_y = self._ensure_batch_dim(h_y)
+        
+        h_x_norm = F.normalize(h_x, p=2, dim=1)
+        h_y_norm = F.normalize(h_y, p=2, dim=1)
 
-        # 2. Update history buffer
-        self.history_hxy.append(curr_hxy)
-        self.history_hxh.append(curr_hxh)
-        self.history_hyh.append(curr_hyh)
+        similarity_vector = (h_x_norm * h_y_norm).mean(dim=0)
+        target_M = similarity_vector.unsqueeze(1).expand(-1, self.num_structures)
+        
+        noise = torch.randn_like(self.M) * 0.01
+        regularized_target = target_M + self.reg_strength * noise
 
-        if len(self.history_hxy) > self.num_structures:
-            self.history_hxy.pop(0)
-            self.history_hxh.pop(0)
-            self.history_hyh.pop(0)
+        momentum = min(self.lambda_m * (1 + self.update_count.item() * 0.001), 0.1)
+        self.M.data = (1 - momentum) * self.M.data + momentum * regularized_target
 
-        # 3. Structural update for each column p=1...ns
-        # Each structure p represents the average similarity over the last p batches.
-        for p in range(1, len(self.history_hxy) + 1):
-            sum_hxy = torch.stack(self.history_hxy[-p:]).sum(dim=0)
-            sum_hxh = torch.stack(self.history_hxh[-p:]).sum(dim=0)
-            sum_hyh = torch.stack(self.history_hyh[-p:]).sum(dim=0)
+        h_x_transformed = h_x.unsqueeze(2) * self.M 
+        h_y_expanded = h_y.unsqueeze(2)             
+        
+        num = (h_x_transformed * h_y_expanded).sum(dim=1) 
+        den = torch.norm(h_x_transformed, dim=1) * torch.norm(h_y_expanded, dim=1) + 1e-8
+        cosine_sim = (num / den).mean(dim=0) 
 
-            # Eq (9): Update Structural Match Matrix M
-            target_M_p = sum_hxy / (torch.sqrt(sum_hxh) * torch.sqrt(sum_hyh) + self.eps)
-            self.M[:, p - 1] = (1.0 - self.lambda_m) * self.M[:, p - 1] + self.lambda_m * target_M_p
+        target_V = torch.clamp(cosine_sim, min=0.1, max=2.0).unsqueeze(0) 
 
-            # Eq (10) & (11): Update Structural Value V
-            # First, decay the previous value (Eq 10 logic)
-            self.V[0, p - 1] *= (1.0 - self.lambda_m)
+        momentum_v = min(self.lambda_v * (1 + self.update_count.item() * 0.001), 0.1)
+        self.V.data = (1 - momentum_v) * self.V.data + momentum_v * target_V
 
-        # --- FUERA DEL BUCLE p ---
-        # Eq (11): Vectorized update for ALL V at once
-        # h_x: [B, F] -> [B, F, S] | h_y: [B, F] -> [B, F, 1]
-        hx_prime_all = h_x.unsqueeze(2) * self.M.unsqueeze(0)
-        hy_expanded = h_y.unsqueeze(2)
+        self.update_count += 1
 
-        num = (hx_prime_all * hy_expanded).sum(dim=1)  # [B, S]
-        den = torch.sqrt((hx_prime_all ** 2).sum(dim=1)) * \
-              torch.sqrt((h_y ** 2).sum(dim=1)).unsqueeze(1)
-        cos_sim_vec = (num / (den + self.eps)).mean(dim=0)  # [S]
-
-        # Actualización global del vector V
-        self.V = cos_sim_vec.unsqueeze(0) + self.lambda_v * self.V
-
-    def apply(self, h: torch.Tensor) -> torch.Tensor:
-        """
-        Filters latent features using a snapshot of M and V to avoid
-        in-place modification errors during backward pass.
-        """
-        # h: [B, F]
-        h_exp = h.unsqueeze(2)
-
-        # WE USE .clone() TO TAKE A SNAPSHOT FOR THE AUTOGRAD GRAPH
-        # This prevents the "variable modified by inplace operation" error
-        # when self.M and self.V are updated later in the same forward pass.
-        M_snapshot = self.M.clone().unsqueeze(0) # [1, F, S]
-        V_snapshot = self.V.clone().unsqueeze(0) # [1, 1, S]
-
-        # Hadamard product: h ⊙ M ⊙ V
-        g_structured = h_exp * M_snapshot * V_snapshot
-
-        return g_structured.mean(dim=2)
+    def forward(self, h_x: torch.Tensor) -> torch.Tensor:
+        h_x = self._ensure_batch_dim(h_x)
+        attn_weights = self.attention_net(h_x) 
+        
+        h_exp = h_x.unsqueeze(2) 
+        h_struct = h_exp * self.M.unsqueeze(0) 
+        h_weighted = h_struct * self.V.unsqueeze(0) 
+        
+        g_x = (h_weighted * attn_weights.unsqueeze(1)).sum(dim=2) 
+        return g_x
 
 # =============================================================================
-# ASSIGNMENT VALIDATOR (Con Inyección de VDF)
+# 2. PHYSICS-DRIVEN COMPONENTS (Implicit SUE & Krylov Solver)
 # =============================================================================
 
-class AssignmentValidator(nn.Module):
-    """
-    Valida asignación mediante SUE con optimizaciones de memoria:
-    1. Warm Start: Reutiliza flujos previos.
-    2. Truncated Backprop: Solo calcula gradientes al final.
-    3. Dynamic Iterations: Permite variar iteraciones durante entrenamiento.
-    """
+def pytorch_batched_gmres(linear_operator: Callable[[torch.Tensor], torch.Tensor],
+                          b: torch.Tensor, max_iter: int = 15, tol: float = 1e-4, eps: float = 1e-8) -> torch.Tensor:
+    batch_size, dim = b.shape
+    device, dtype = b.device, b.dtype
+    
+    x = torch.zeros_like(b)
+    r = b - linear_operator(x)
+    r_norm = torch.norm(r, p=2, dim=1, keepdim=True)
+    
+    if torch.max(r_norm) < tol:
+        return x
 
-    def __init__(self, num_links: int, t0: torch.Tensor, capacity: torch.Tensor,
-                 lanes: torch.Tensor, route_masks: torch.Tensor, od_pair_indices: torch.Tensor,
-                 num_od_pairs: int, num_link_groups: int, link_group: torch.Tensor,
-                 vdf_config: DictConfig, trips_scaler: float = 1.0,
-                 max_iters: int = 5, convergence_threshold: float = 1e-4,
-                 msa_convergence: Optional[Dict] = None):
+    V = torch.zeros(batch_size, dim, max_iter + 1, device=device, dtype=dtype)
+    V[:, :, 0] = r / (r_norm + eps)
+    H = torch.zeros(batch_size, max_iter + 1, max_iter, device=device, dtype=dtype)
+    cs = torch.zeros(batch_size, max_iter, device=device, dtype=dtype)
+    sn = torch.zeros(batch_size, max_iter, device=device, dtype=dtype)
+    beta = torch.zeros(batch_size, max_iter + 1, 1, device=device, dtype=dtype)
+    beta[:, 0, :] = r_norm
 
-        super().__init__()
-        self.max_iters = max_iters
-        self.convergence_threshold = convergence_threshold
-        self.register_buffer('t0', t0)
-        self.trips_scaler = trips_scaler
+    for k in range(max_iter):
+        v_k = V[:, :, k]
+        w = linear_operator(v_k)
+        
+        for j in range(k + 1):
+            v_j = V[:, :, j]
+            h_jk = torch.sum(w * v_j, dim=1, keepdim=True)
+            H[:, j, k] = h_jk.squeeze(1)
+            w = w - h_jk * v_j
+            
+        h_next = torch.norm(w, p=2, dim=1)
+        H[:, k + 1, k] = h_next
+        V[:, :, k + 1] = w / (h_next.unsqueeze(1) + eps)
+        
+        for j in range(k):
+            h_j_k = H[:, j, k].clone()
+            h_jp1_k = H[:, j + 1, k].clone()
+            H[:, j, k] = cs[:, j] * h_j_k + sn[:, j] * h_jp1_k
+            H[:, j + 1, k] = -sn[:, j] * h_j_k + cs[:, j] * h_jp1_k
+            
+        h_k_k = H[:, k, k].clone()
+        h_kp1_k = H[:, k + 1, k].clone()
+        
+        denom = torch.sqrt(h_k_k**2 + h_kp1_k**2 + eps)
+        cs[:, k] = h_k_k / denom
+        sn[:, k] = h_kp1_k / denom
+        
+        H[:, k, k] = cs[:, k] * h_k_k + sn[:, k] * h_kp1_k
+        H[:, k + 1, k] = 0.0
+        
+        beta_k = beta[:, k, 0].clone()
+        beta[:, k, 0] = cs[:, k] * beta_k
+        beta[:, k + 1, 0] = -sn[:, k] * beta_k
+        
+        if torch.max(torch.abs(beta[:, k + 1, 0])) < tol:
+            H = H[:, :k+1, :k+1]
+            beta = beta[:, :k+1, :]
+            V = V[:, :, :k+1]
+            break
+            
+    y = torch.linalg.solve_triangular(H, beta, upper=True)
+    x_k = torch.bmm(V, y).squeeze(2)
+    x = x + x_k
+    
+    return x
 
-        # Instanciación VDF (Igual que antes)
-        self.cost_function = hydra.utils.instantiate(
-            vdf_config,
-            t0=t0,
-            capacity=capacity,
-            lanes=lanes,
-            num_link_groups=num_link_groups,
-            link_group=link_group,
-            _recursive_=False
-        )
 
-        self.assignment_layer = StochasticAssignmentLayer(route_masks=route_masks, mu=1.0)
-        self.register_buffer('last_convergence_iter', torch.tensor(0.0))
-
-        # ESTRATEGIA 1: Buffer para Warm Start
-        # Guardamos el estado del flujo para reutilizarlo en la siguiente época
-        self.register_buffer('running_flows', None)
-
-        # --- Convergence configuration ---
-        # TODO estas configuraciones podrían moverse a un objeto aparte
-        cfg = msa_convergence or {}
-        self.strategy = cfg.get('strategy', 'relative_flow')
-        self.flow_tol = float(cfg.get('flow_tol', 1e-4))
-        self.gap_tol = float(cfg.get('gap_tol', 1e-4))
-        self.min_iters = int(cfg.get('min_iters', 1))
-        # override max_iters if provided in convergence cfg (keeps backward compat)
-        self.max_iters = int(cfg.get('max_iters', self.max_iters))
-        self.grad_steps = int(cfg.get('grad_steps', 10))
-        self.eps = float(cfg.get('eps', 1e-9))
-        # Verbose flag to control local logging from this class
-        self.verbose = bool(cfg.get('verbose', False))
-
-    # TODO: Mover estas funciones de convergencia a un módulo aparte si se vuelven más complejas
-    def _strategy_relative_flow_change(self, prev: torch.Tensor, cur: torch.Tensor) -> float:
-        # Compute batch-wise L2 relative change, return max across batch for conservative stop
-        prev_flat = prev.view(prev.shape[0], -1)
-        cur_flat = cur.view(cur.shape[0], -1)
-        num = torch.norm(cur_flat - prev_flat, p=2, dim=1)
-        den = torch.norm(prev_flat, p=2, dim=1).clamp(min=self.eps)
-        rel = (num / den)
-        return float(rel.max().item())
-
-    def _strategy_relative_gap(self, link_flows: torch.Tensor, link_costs: torch.Tensor, demands: torch.Tensor) -> float:
-        # link_flows: [B, L], link_costs: [B, L], demands: [B, OD]
-        # link_term = sum_l f_l * c_l
-        link_term = (link_flows * link_costs).sum(dim=1)  # [B]
-
-        # Compute per-route minimum cost per OD using sparse mask
-        # costs_t: [L, B]
-        costs_t = link_costs.transpose(0, 1)
-        route_costs_flat_t = torch.sparse.mm(self.assignment_layer.sparse_mask_2d, costs_t)  # [OD*K, B]
-        batch_size = link_flows.shape[0]
-        route_costs = route_costs_flat_t.transpose(0, 1).view(batch_size, self.assignment_layer.num_od, self.assignment_layer.k_paths)
-        c_min_od, _ = torch.min(route_costs, dim=2)  # [B, OD]
-
-        od_term = (demands * c_min_od).sum(dim=1)  # [B]
-
-        gap = (link_term - od_term) / (link_term.clamp(min=self.eps))
-        return float(gap.max().item())
-
-    def _msa_run(self, flows: torch.Tensor, real_estimated_demands: torch.Tensor, current_max_iters: int):
-        """
-        Encapsulated MSA driver implementing configurable stopping strategies.
-        Returns: flows, final_route_probs, converged(bool), actual_iters(int), rel_flow(float), rel_gap(float)
-        """
-        converged = False
-        actual_iters = 0
-        final_route_probs = None
-
-        # Initialize diagnostics
-        rel_flow = float('inf')
-        rel_gap = float('inf')
-
-        # Determine when to enable gradients (truncated backprop)
-        grad_start_iter = max(0, current_max_iters - self.grad_steps)
-
-        # Keep a snapshot of the previous flows for relative flow computation
-        last_prev_flows = None
-
-        # Log initial settings if verbose
-        if logger.isEnabledFor(logging.DEBUG) and self.verbose:
-            logger.debug(f"MSA start strategy={self.strategy} max_iters={current_max_iters} flow_tol={self.flow_tol} gap_tol={self.gap_tol} min_iters={self.min_iters} grad_steps={self.grad_steps} training={self.training}")
-
-        for it in range(1, current_max_iters + 1):
-            requires_grad = self.training and (it > grad_start_iter)
-
-            # Snapshot flows BEFORE the update for relative flow metric
-            last_prev_flows = flows.detach().clone()
-
-            # Forward MSA step (with or without grad)
-            with torch.set_grad_enabled(requires_grad):
-                costs = self.cost_function(flows)
-                new_flows, current_probs = self.assignment_layer(costs, real_estimated_demands)
-
-                final_route_probs = current_probs
+class ImplicitSUEFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, demands, cost_function, assignment_layer, max_iters, tol):
+        with torch.no_grad():
+            batch_size = demands.shape[0]
+            zero_link_flows = torch.zeros_like(cost_function.t0).unsqueeze(0).expand(batch_size, -1)
+            t0_costs = cost_function(zero_link_flows)
+            if t0_costs.dim() == 1:
+                t0_costs = t0_costs.unsqueeze(0).expand(batch_size, -1)
+                
+            flows, current_probs = assignment_layer(t0_costs, demands)
+            
+            converged = False
+            for it in range(1, max_iters + 1):
+                last_flows = flows.clone()
+                costs = cost_function(flows)
+                new_flows, current_probs = assignment_layer(costs, demands)
+                
                 alpha_msa = 1.0 / (it + 1)
-                updated_flows = flows + alpha_msa * (new_flows - flows)
+                flows = flows + alpha_msa * (new_flows - flows)
+                
+                rel_error = torch.norm(flows - last_flows, p=2, dim=1) / torch.norm(last_flows, p=2, dim=1).clamp(min=1e-8)
+                if torch.max(rel_error) <= tol:
+                    converged = True
+                    break
 
-            # Compute cheap relative flow change (no grad needed) using the last snapshot
-            with torch.no_grad():
-                try:
-                    rel_flow = self._strategy_relative_flow_change(last_prev_flows, updated_flows)
-                except Exception:
-                    rel_flow = float('inf')
+        ctx.save_for_backward(flows, demands)
+        ctx.cost_function = cost_function
+        ctx.assignment_layer = assignment_layer
+        ctx.converged = converged 
+        return flows
 
-            # Log iteration diagnostics
-            if logger.isEnabledFor(logging.DEBUG) and self.verbose:
-                logger.debug(f"MSA iter={it} alpha={alpha_msa:.6g} requires_grad={requires_grad} rel_flow={rel_flow:.6g}")
+    @staticmethod
+    def backward(ctx, grad_output):
+        if not ctx.converged:
+            return torch.zeros_like(ctx.saved_tensors[1]), None, None, None, None
 
-            # lazy gap computation: only compute when needed by strategy
-            need_gap = False
-            stop = False
-            if it >= self.min_iters:
-                if self.strategy == 'relative_flow':
-                    stop = rel_flow <= self.flow_tol
-                elif self.strategy == 'relative_gap':
-                    need_gap = True
-                elif self.strategy == 'hybrid':
-                    # first cheap check
-                    if rel_flow <= self.flow_tol:
-                        need_gap = True
-                    else:
-                        stop = False
-                else:
-                    # fallback legacy
-                    stop = rel_flow <= self.convergence_threshold
+        f_star, demands = ctx.saved_tensors
+        cost_func = ctx.cost_function
+        assign_layer = ctx.assignment_layer
+        
+        with torch.enable_grad():
+            f_req_grad = f_star.detach().requires_grad_(True)
+            d_req_grad = demands.detach().requires_grad_(True)
+            costs = cost_func(f_req_grad)
+            f_next, _ = assign_layer(costs, d_req_grad)
+            
+        def vjp_operator(v):
+            jvp_f = torch.autograd.grad(outputs=f_next, inputs=f_req_grad, grad_outputs=v, retain_graph=True)[0]
+            return v - jvp_f
 
-            if need_gap:
-                # compute costs at the updated flows for accurate gap
-                with torch.no_grad():
-                    try:
-                        costs_for_gap = self.cost_function(updated_flows)
-                        rel_gap = self._strategy_relative_gap(updated_flows.detach(), costs_for_gap.detach(), real_estimated_demands.detach())
-                    except Exception:
-                        rel_gap = float('inf')
-
-                if logger.isEnabledFor(logging.DEBUG) and self.verbose:
-                    logger.debug(f"MSA iter={it} computed_rel_gap={rel_gap:.6g}")
-
-                if self.strategy == 'relative_gap':
-                    stop = rel_gap <= self.gap_tol
-                elif self.strategy == 'hybrid':
-                    stop = rel_gap <= self.gap_tol
-
-            # Accept update
-            flows = updated_flows
-            actual_iters = it
-
-            if stop:
-                converged = True
-                # If training and the iteration we just ran had no grad, ensure one grad-enabled final iteration
-                if self.training and not requires_grad:
-                    # log that we force a final grad-enabled step
-                    if logger.isEnabledFor(logging.INFO) and self.verbose:
-                        logger.info(f"MSA converged at iter={it} without grad; forcing one final grad-enabled iteration")
-                    with torch.set_grad_enabled(True):
-                        try:
-                            costs = self.cost_function(flows)
-                            new_flows, current_probs = self.assignment_layer(costs, real_estimated_demands)
-                            final_route_probs = current_probs
-                            alpha_msa = 1.0 / (it + 2)
-                            flows = flows + alpha_msa * (new_flows - flows)
-                        except Exception:
-                            # if the forced grad step fails, keep the current flows
-                            pass
-
-                # Compute final diagnostics (rel_flow between last_prev_flows and flows, rel_gap at flows)
-                with torch.no_grad():
-                    try:
-                        if last_prev_flows is not None:
-                            rel_flow = self._strategy_relative_flow_change(last_prev_flows, flows)
-                    except Exception:
-                        rel_flow = float('inf')
-
-                    try:
-                        costs_final = self.cost_function(flows)
-                        rel_gap = self._strategy_relative_gap(flows.detach(), costs_final.detach(), real_estimated_demands.detach())
-                    except Exception:
-                        rel_gap = float('inf')
-
-                # Log convergence summary
-                if logger.isEnabledFor(logging.INFO) and self.verbose:
-                    logger.info(
-                        f"MSA stop strategy={self.strategy} converged=True iters={actual_iters} rel_flow={rel_flow:.6g} rel_gap={rel_gap:.6g} grad_was_enabled={requires_grad}"
-                    )
-                break
-
-
-        else:
-            # Executed if loop finished without break
-            if logger.isEnabledFor(logging.WARNING) and self.verbose:
-                logger.warning(
-                    f"MSA reached max_iters={current_max_iters} without meeting tolerance. last_rel_flow={rel_flow:.6g} last_rel_gap={rel_gap:.6g}"
-                )
-
-        # Ensure we always have sensible final diagnostics:
-        # If rel_flow or rel_gap were never computed, compute them now
-        need_final_metrics = (rel_gap is None) or (not torch.isfinite(torch.tensor(rel_flow))) or (
-            not torch.isfinite(torch.tensor(rel_gap if rel_gap is not None else float('nan'))))
-
-        if need_final_metrics:
-            with torch.no_grad():
-                try:
-                    costs_final = self.cost_function(flows)
-                    # Compute relative flow between last known previous state and final flows
-                    try:
-                        if last_prev_flows is not None:
-                            rel_flow = self._strategy_relative_flow_change(last_prev_flows, flows)
-                        else:
-                            rel_flow = float('inf')
-                    except Exception:
-                        rel_flow = float('inf')
-
-                    # Compute relative gap
-                    try:
-                        rel_gap = self._strategy_relative_gap(flows.detach(), costs_final.detach(), real_estimated_demands.detach())
-                    except Exception:
-                        rel_gap = float('inf')
-                except Exception:
-                    # Fail-safe: if cost_function or computations error, set infinities
-                    rel_flow = float('inf')
-                    rel_gap = float('inf')
-
-        # Final sanity defaults
-        if final_route_probs is None:
-            final_route_probs = None
-
-        # finalize metrics as plain floats
-        rel_flow = float(rel_flow) if rel_flow is not None else float('inf')
-        rel_gap = float(rel_gap) if rel_gap is not None else float('inf')
-
-        return flows, final_route_probs, converged, actual_iters, rel_flow, rel_gap
-
-    def forward(self, estimated_demands: torch.Tensor,
-                warmup: bool = False,
-                override_max_iters: Optional[int] = None) -> tuple:
-        """
-        Args:
-            override_max_iters: ESTRATEGIA 3 (Permite variar iters desde el training loop)
-        """
-
-
-        # Determinar iteraciones (Estrategia 3)
-        current_max_iters = override_max_iters if override_max_iters is not None else self.max_iters
-
-        batch_size = estimated_demands.shape[0] if estimated_demands.dim() == 2 else 1
-        if estimated_demands.dim() == 1: estimated_demands = estimated_demands.unsqueeze(0)
-
-        # Costos base
-        freeflow_costs_base = self.cost_function(torch.zeros_like(self.t0))
-        freeflow_costs = freeflow_costs_base.unsqueeze(0).expand(batch_size, -1)
-
-        # Aplicar escalador de viajes
-        real_estimated_demands = estimated_demands * self.trips_scaler
-
-        # --- ESTRATEGIA 1: LOGICA DE WARM START ---
-        # Si estamos entrenando y tenemos un historial válido, lo usamos.
-        # Si cambiamos batch_size (ej. último batch) o es warmup, reseteamos.
-
-        can_warm_start = (
-                self.training
-                and not warmup
-                and self.running_flows is not None
-                and self.running_flows.shape[0] == batch_size
-        )
-
-        if can_warm_start:
-            # Usamos .detach() para romper el grafo hacia el pasado lejano
-            flows = self.running_flows.detach().clone()
-        else:
-            # Cold Start (Flujo Libre)
-            flows, _ = self.assignment_layer(freeflow_costs, real_estimated_demands)
-
-        # Variable para almacenar las probs de la última iteración
-        final_route_probs = None
-
-        # default diagnostics metrics (safe if warmup used)
-        rel_flow = float('inf')
-        rel_gap = float('inf')
-
-        # --- BUCLE MSA ---
-        converged = False
-        actual_iters = 0
-
-        if warmup:
-            # En warmup solo hacemos 1 pasada rápida
-            reconstructed_flows, final_route_probs = self.assignment_layer(freeflow_costs, real_estimated_demands)
-            # Make warmup explicit in diagnostics
-            convergence_info = {"converged": False, "iterations": 0, "rel_flow": None, "rel_gap": None, "warmup": True}
-            # use the reconstructed flows as the flows to return
-            flows = reconstructed_flows
-        else:
-            # Use the encapsulated MSA driver
-            flows, final_route_probs, converged, actual_iters, rel_flow, rel_gap = self._msa_run(
-                flows, real_estimated_demands, current_max_iters
-            )
-
-        # Guardar estado para la siguiente época (Warm Start)
-        if self.training:
-            self.running_flows = flows.detach()
-
-        reconstructed_flows = flows
-        # attach final metrics for diagnostics
-        convergence_info = {"converged": converged, "iterations": int(actual_iters), "rel_flow": (float(rel_flow) if rel_flow not in (None, float('inf')) else None), "rel_gap": (float(rel_gap) if rel_gap not in (None, float('inf')) else None), "warmup": bool(warmup)}
-
-        # Log summary of convergence if verbose
-        if logger.isEnabledFor(logging.INFO) and getattr(self, 'verbose', False):
-            if warmup:
-                logger.info(f"AssignmentValidator forward (warmup) finished: warmup=True iterations=0")
-            else:
-                logger.info(f"AssignmentValidator forward finished strategy={self.strategy} convergence={convergence_info}")
-
-        # Extracción de parámetros aprendidos (Igual que antes)
-        learned_alpha = getattr(self.cost_function, 'get_alpha', lambda: None)()
-        learned_beta = getattr(self.cost_function, 'get_beta', lambda: None)()
-
-        return reconstructed_flows, learned_alpha, learned_beta, convergence_info, final_route_probs
+        v_star = pytorch_batched_gmres(linear_operator=vjp_operator, b=grad_output, max_iter=15, tol=1e-3)
+        grad_demands = torch.autograd.grad(outputs=f_next, inputs=d_req_grad, grad_outputs=v_star)[0]
+        
+        return grad_demands, None, None, None, None
 
 
 class StochasticAssignmentLayer(nn.Module):
-    """
-    Capa de Asignación Estocástica Vectorizada (Optimizada para Tensores Esparsos).
-    """
-
     def __init__(self, route_masks: torch.Tensor, mu: float = 1.0):
         super().__init__()
-
-        # 1. Procesar Máscara Esparsa
-        # Esperamos route_masks de tamaño (Num_OD, K_Paths, Num_Links)
         self.num_od, self.k_paths, self.num_links = route_masks.shape
 
-        # Aplanar las dos primeras dimensiones (OD y K) para hacerla 2D
-        # Nueva forma lógica: (Num_OD * K_Paths, Num_Links)
         if route_masks.is_sparse:
             route_masks = route_masks.coalesce()
             indices = route_masks.indices()
             values = route_masks.values()
-
-            # Calcular nuevos índices de fila: row = od_idx * K + k_idx
             new_rows = indices[0] * self.k_paths + indices[1]
-            new_cols = indices[2]  # Link index se mantiene
-
+            new_cols = indices[2]  
             new_indices = torch.stack([new_rows, new_cols])
 
-            # Matriz esparsa 2D: [Rows=RutasTotales, Cols=Links]
             self.register_buffer(
                 'sparse_mask_2d',
-                torch.sparse_coo_tensor(
-                    new_indices,
-                    values,
-                    size=(self.num_od * self.k_paths, self.num_links)
-                )
+                torch.sparse_coo_tensor(new_indices, values, size=(self.num_od * self.k_paths, self.num_links))
             )
         else:
-            # Fallback por si acaso le pasas un denso
             self.register_buffer('sparse_mask_2d', route_masks.reshape(-1, self.num_links).to_sparse())
 
         self.mu_raw = nn.Parameter(torch.tensor(float(mu)))
@@ -554,277 +281,342 @@ class StochasticAssignmentLayer(nn.Module):
         return torch.clamp(F.softplus(self.mu_raw), min=0.1, max=10.0)
 
     def forward(self, link_costs: torch.Tensor, demands: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            link_costs: [Batch, Num_Links]
-            demands: [Batch, Num_OD]
-        """
         batch_size = link_costs.shape[0]
-
-        # =====================================================================
-        # PASO 1: Calcular Costo de Ruta (Link -> Ruta)
-        # Queremos: route_costs [Batch, OD, K]
-        # Operación: Sumar costos de links para cada ruta.
-        # Matemáticamente: RouteCosts = LinkCosts @ Mask.T
-        # =====================================================================
-
-        # Truco para multiplicar (Batch, Link) x (Link, RutasTotales_Esparsa)
-        # PyTorch sparse.mm requiere (Sparse x Dense). Usamos transposición:
-        # (A @ B).T = B.T @ A.T
-        # Result.T = (LinkCosts @ Mask.T).T = Mask @ LinkCosts.T
-
-        # Mask [OD*K, L] (Sparse)
-        # LinkCosts.T [L, B] (Dense)
-        # Result_T [OD*K, B]
-
-        costs_t = torch.transpose(link_costs, 0, 1)  # [L, B]
-        route_costs_flat_t = torch.sparse.mm(self.sparse_mask_2d, costs_t)  # [OD*K, B]
-
-        # Volver a formato [Batch, OD, K]
+        costs_t = torch.transpose(link_costs, 0, 1)  
+        route_costs_flat_t = torch.sparse.mm(self.sparse_mask_2d, costs_t)  
         route_costs = route_costs_flat_t.transpose(0, 1).view(batch_size, self.num_od, self.k_paths)
 
-        # =====================================================================
-        # PASO 2: Logit Probabilities
-        # =====================================================================
-
-        # Estabilización numérica
         min_costs, _ = torch.min(route_costs, dim=2, keepdim=True)
         stable_costs = route_costs - min_costs.detach()
-        # Clamp para evitar exp() infinito
         stable_costs = torch.clamp(stable_costs, max=50.0)
 
         exp_utility = torch.exp(-self.mu * stable_costs)
         sum_utility = torch.sum(exp_utility, dim=2, keepdim=True)
         route_probs = exp_utility / (sum_utility + 1e-9)
 
-        # Asignar Demanda: [Batch, OD, K]
         route_flows = route_probs * demands.unsqueeze(2)
-
-        # =====================================================================
-        # PASO 3: Proyectar a Links (Ruta -> Link)
-        # Queremos: link_flows [Batch, Num_Links]
-        # Operación: Sumar flujos de rutas que pasan por cada link.
-        # Matemáticamente: LinkFlows = RouteFlowsFlat @ Mask
-        # =====================================================================
-
-        # RouteFlowsFlat: [Batch, OD*K]
         route_flows_flat = route_flows.view(batch_size, -1)
 
-        # De nuevo el truco de la transpuesta para usar Sparse.mm:
-        # Result.T = (RF @ Mask).T = Mask.T @ RF.T
-        # Pero Mask.T es (L, OD*K).
-        # Para hacer esto eficiente sin transponer la matriz esparsa explícitamente (que es lento),
-        # usamos torch.sparse.mm con la transpuesta lógica si es posible,
-        # o transponemos la esparsa una sola vez en __init__ si tenemos memoria.
-        # Pero PyTorch permite .t() en sparse tensors rápido (solo cambia índices).
-
-        mask_t = self.sparse_mask_2d.t()  # [L, OD*K] (Virtualmente gratis en sparse)
-        rf_t = torch.transpose(route_flows_flat, 0, 1)  # [OD*K, B]
-
-        link_flows_t = torch.sparse.mm(mask_t, rf_t)  # [L, B]
-
-        link_flows = link_flows_t.transpose(0, 1)  # [B, L]
+        mask_t = self.sparse_mask_2d.t()  
+        rf_t = torch.transpose(route_flows_flat, 0, 1)  
+        link_flows_t = torch.sparse.mm(mask_t, rf_t)  
+        link_flows = link_flows_t.transpose(0, 1)  
 
         return link_flows, route_probs
 
+
+class AssignmentValidator(nn.Module):
+    """ Strictly handles Physics (SUE). Neural routing is handled by CyclicODModel. """
+    def __init__(self, num_links: int, t0: torch.Tensor, capacity: torch.Tensor,
+                 lanes: torch.Tensor, route_masks: torch.Tensor, od_pair_indices: torch.Tensor,
+                 num_od_pairs: int, num_link_groups: int, link_group: torch.Tensor,
+                 vdf_config: dict, trips_scaler: float = 1.0,
+                 max_iters: int = 20, convergence_threshold: float = 1e-4):
+        super().__init__()
+        self.max_iters = max_iters
+        self.convergence_threshold = convergence_threshold
+        self.register_buffer('t0', t0)
+        self.trips_scaler = trips_scaler
+
+        self.cost_function = hydra.utils.instantiate(
+            vdf_config, t0=t0, capacity=capacity, lanes=lanes,
+            num_link_groups=num_link_groups, link_group=link_group, _recursive_=False
+        )
+        self.assignment_layer = StochasticAssignmentLayer(route_masks=route_masks, mu=1.0)
+
+    def forward(self, estimated_demands: torch.Tensor, override_max_iters: int = None) -> tuple:
+        current_max_iters = override_max_iters if override_max_iters is not None else self.max_iters
+        real_estimated_demands = estimated_demands * self.trips_scaler
+
+        with torch.no_grad():
+            test_flows = ImplicitSUEFunction.apply(
+                real_estimated_demands, self.cost_function, self.assignment_layer,
+                current_max_iters, self.convergence_threshold
+            )
+            
+        costs_check = self.cost_function(test_flows)
+        next_flows_check, final_probs = self.assignment_layer(costs_check, real_estimated_demands)
+        rel_gap = torch.norm(next_flows_check - test_flows, p=2, dim=1) / torch.norm(test_flows, p=2, dim=1).clamp(min=1e-8)
+        
+        is_converged = bool(torch.max(rel_gap) <= self.convergence_threshold * 10) 
+
+        if is_converged:
+            reconstructed_flows = ImplicitSUEFunction.apply(
+                real_estimated_demands, self.cost_function, self.assignment_layer,
+                current_max_iters, self.convergence_threshold
+            )
+            conv_info = {"converged": True, "iterations": current_max_iters, "implicit_grad": True, "mode": "physics"}
+        else:
+            fallback_steps = 5
+            flows = test_flows.detach() 
+            for it in range(fallback_steps):
+                costs = self.cost_function(flows)
+                new_flows, final_probs = self.assignment_layer(costs, real_estimated_demands)
+                alpha_msa = 1.0 / (current_max_iters + it + 1)
+                flows = flows + alpha_msa * (new_flows - flows)
+                
+            reconstructed_flows = flows
+            conv_info = {"converged": False, "iterations": current_max_iters + fallback_steps, "implicit_grad": False, "mode": "physics_fallback"}
+
+        learned_alpha = getattr(self.cost_function, 'get_alpha', lambda: None)()
+        learned_beta = getattr(self.cost_function, 'get_beta', lambda: None)()
+
+        return reconstructed_flows, learned_alpha, learned_beta, conv_info, final_probs
+
+
 # =============================================================================
-# MODELO PRINCIPAL
+# 3. MASTER ORCHESTRATOR (CyclicODModel - True Hybridization)
 # =============================================================================
 
 class CyclicODModel(nn.Module):
-    def __init__(
-            self,
-            num_links: int,
-            num_od_pairs: int,
-            architecture: DictConfig,
-            t0: torch.Tensor,
-            capacity: torch.Tensor,
-            lanes: torch.Tensor,
-            route_masks: torch.Tensor,
-            od_pair_indices: torch.Tensor,
-            num_link_groups: int,
-            link_group: torch.Tensor,
-            vdf_config: DictConfig,
-            **kwargs
-    ):
+    def __init__(self, num_links: int, num_od_pairs: int, architecture: DictConfig,
+                 t0: torch.Tensor, capacity: torch.Tensor, lanes: torch.Tensor,
+                 route_masks: torch.Tensor, od_pair_indices: torch.Tensor,
+                 num_link_groups: int, link_group: torch.Tensor,
+                 vdf_config: DictConfig, **kwargs):
         super().__init__()
-
-        logging.info(f"INITIALIZING: {kwargs.get('model_name', 'Unknown Model')}.")
-
+        logger.info(f"INIT: Hybrid CyclicODModel (Deep Encoders + optional SUE Validator).")
 
         arch = architecture
         feature_dim = arch.feature_dim
         num_structures = arch.num_structures
-        hidden_dim_from_link = arch.hidden_dim_from_link
-        hidden_dim_from_od = arch.hidden_dim_from_od
-        hidden_dim_to_od = arch.hidden_dim_to_od
-        dropout_from_od = arch.dropout_from_od
-        dropout_to_od = arch.dropout_to_od
-        dropout_from_link = arch.dropout_from_link
+        
+        h_enc = arch.hidden_dim_from_link
+        h_dec = arch.hidden_dim_to_od
+        h_bwd_enc = kwargs.get('hidden_dim_from_od', h_dec)
+        h_bwd_dec = kwargs.get('hidden_dim_to_link', h_enc)
+        dropout = arch.get('dropout', 0.1)
 
-        # 1. REGISTRO DE ESCALADORES (Buffers)
-        # link_scale: Basado en la capacidad media para normalizar flujos de entrada.
-        # od_scale: Basado en trips_scaler para normalizar demandas en el ciclo backward.
-        self.link_scale_val = kwargs.get('link_scale', 1.0)
-        self.od_scale_val = kwargs.get('od_scale', 1.0)
-        self.register_buffer("link_scale", torch.tensor(self.link_scale_val, dtype=torch.float32))
-        self.register_buffer("od_scale", torch.tensor(self.od_scale_val, dtype=torch.float32))
-        logging.info(f"Actual scalers: link_scale={self.link_scale}, od_scale={self.od_scale}")
+        hybrid_cfg = kwargs.get('hybrid_assignment', {})
+        self.hybrid_use_physics = bool(hybrid_cfg.get('use_physics', True))
+        self.hybrid_warmup_epochs = int(hybrid_cfg.get('warmup_epochs', 50))
 
-        # 2. INSTANCIACIÓN DE MLPs CON NORMALIZACIÓN LATENTE
-        # f_encoder: Recibe flujos escalados -> Salida hx normalizada (use_norm=True).
-        self.f_encoder = PaperMLP(num_links, hidden_dim_from_link, feature_dim, dropout_from_link, use_norm=True)
+        self.register_buffer("link_scale", torch.tensor(kwargs.get('link_scale', 1.0), dtype=torch.float32))
+        self.register_buffer("od_scale", torch.tensor(kwargs.get('od_scale', 1.0), dtype=torch.float32))
 
-        # f_decoder: Recibe gx normalizado -> Salida od_hat en ESCALA REAL (use_norm=False).
-        # Esto permite proyectar de un espacio [-1, 1] al dominio de miles de vehículos.
-        self.f_decoder = PaperMLP(feature_dim, hidden_dim_to_od, num_od_pairs, dropout_to_od, nonneg=True, use_norm=False)
+        # --- A. FORWARD NETWORK ---
+        self.f_encoder = ODEncoder(num_links, h_enc, feature_dim, dropout)
+        self.f_decoder = ODDecoder(num_od_pairs, h_dec, feature_dim, dropout)
 
-        # =====================================================================
-        # START: ESTRATEGIA COLD START INITIALIZATION
-        # =====================================================================
-        # Objetivo: Forzar que el modelo empiece con V/C muy bajo para evitar
-        # gradientes explosivos en el SUE durante las primeras épocas.
-        # ---------------------------------------------------------------------
-        import math
-        # 1. Recuperar la media real que viene del pipeline
-        # Si no llega, usamos 1.0 por seguridad.
-        real_mean_target = kwargs.get('initial_mean', 1.0)
+        # --- B. BACKWARD NETWORK (Data-Driven Branch) ---
+        self.b_encoder = ODEncoder(num_od_pairs, h_bwd_enc, feature_dim, dropout)
+        self.b_decoder = ODDecoder(num_links, h_bwd_dec, feature_dim, dropout)
 
-        # Recuperamos el scale (asegurando que sea float para matemáticas)
-        scale_val = kwargs.get('od_scale', 1.0)
-        if hasattr(scale_val, 'item'): scale_val = scale_val.item()
-        if scale_val <= 1e-5: scale_val = 1.0
-
-        # 2. Factor de Seguridad (El "Freno" Inicial)
-        # Empezamos con el 5% de la demanda promedio histórica.
-        safety_factor = 0.05
-
-        # Calculamos qué valor debe escupir la red ANTES de multiplicarse por od_scale
-        # Target_Net_Output * od_scale = Real_Mean * Safety_Factor
-        target_normalized = (real_mean_target * safety_factor) / scale_val
-
-        # Clamp para estabilidad numérica del logaritmo
-        target_normalized = max(target_normalized, 1e-5)
-
-        # 3. Calcular el Bias Inverso (Inverse Softplus)
-        # Softplus(x) = y  =>  x = ln(exp(y) - 1)
-        if target_normalized > 20:
-            bias_init = target_normalized  # Para valores grandes es lineal
-        else:
-            bias_init = math.log(math.exp(target_normalized) - 1)
-
-        logging.info(
-            f"Cold Start Init: Real Mean={real_mean_target:.2f} | "
-            f"OD Scale={scale_val:.2f} | Safety Factor={safety_factor} -> "
-            f"Init Bias={bias_init:.4f}"
-        )
-
-        # 4. Inyectar en la última capa lineal del Decoder
-        # PaperMLP.net es un Sequential.
-        # [-1] es Softplus
-        # [-2] es la Capa Lineal Final que queremos tocar
-        final_linear = self.f_decoder.net[-2]
-
-        if isinstance(final_linear, nn.Linear):
-            # A. Fijar el bias calculado
-            nn.init.constant_(final_linear.bias, bias_init)
-
-            # B. Silenciar los pesos (Weights)
-            # Usamos una desviación estándar minúscula para que el input (gx)
-            # apenas afecte la salida en la primera época. El bias manda.
-            nn.init.normal_(final_linear.weight, mean=0.0, std=0.0001)
-        else:
-            logging.warning("No se pudo inicializar bias: La capa -2 no es Linear.")
-        # END: ESTRATEGIA COLD START INITIALIZATION
-        # =====================================================================
-
-        # b_encoder: Recibe demanda escalada -> Salida hy normalizada (use_norm=True).
-        self.b_encoder = PaperMLP(num_od_pairs, hidden_dim_from_od, feature_dim, dropout_from_od, use_norm=True)
-
+        # --- C. MATCHER ---
         self.matcher = GraphMatcher(feature_dim, num_structures)
 
-        # 3. VALIDADOR FÍSICO (AssignmentValidator)
-        # Sigue trabajando con trips_scaler para sus cálculos internos de costo.
-        convergence_cfg = kwargs.get('msa_convergence', None)
+        # --- D. SUE VALIDATOR (Physics-Driven Branch, optional) ---
+        self.validator = None
+        if self.hybrid_use_physics:
+            max_iters = kwargs.get('msa_convergence', {}).get('max_iters', 20)
+            flow_tol = kwargs.get('msa_convergence', {}).get('flow_tol', 1e-4)
 
-        self.validator = AssignmentValidator(
-            num_links=num_links,
-            num_od_pairs=num_od_pairs,
-            t0=t0,
-            capacity=capacity,
-            lanes=lanes,
-            route_masks=route_masks,
-            od_pair_indices=od_pair_indices,
-            num_link_groups=num_link_groups,
-            link_group=link_group,
-            vdf_config=vdf_config,
-            msa_convergence=convergence_cfg
+            self.validator = AssignmentValidator(
+                num_links=num_links, t0=t0, capacity=capacity, lanes=lanes,
+                route_masks=route_masks, od_pair_indices=od_pair_indices, num_od_pairs=num_od_pairs,
+                num_link_groups=num_link_groups, link_group=link_group, vdf_config=vdf_config,
+                trips_scaler=kwargs.get('od_scale', 1.0), max_iters=max_iters, convergence_threshold=flow_tol
+            )
+
+        loss_cfg = kwargs.get("loss", {})
+        if isinstance(loss_cfg, DictConfig):
+            loss_cfg = dict(loss_cfg)
+        else:
+            loss_cfg = dict(loss_cfg) if isinstance(loss_cfg, dict) else {}
+        loss_cfg.pop("_target_", None)
+
+        # Priority: loss YAML -> model kwargs -> safe fallback (1.0)
+        link_scale_cfg = loss_cfg.pop("link_scale", None)
+        od_scale_cfg = loss_cfg.pop("od_scale", None)
+
+        if link_scale_cfg is None:
+            link_scale_cfg = kwargs.get("link_scale", None)
+            if link_scale_cfg is None:
+                link_scale_cfg = 1.0
+                logger.warning("link_scale was not provided in model loss config or kwargs. Falling back to 1.0.")
+
+        if od_scale_cfg is None:
+            od_scale_cfg = kwargs.get("od_scale", None)
+            if od_scale_cfg is None:
+                od_scale_cfg = 1.0
+                logger.warning("od_scale was not provided in model loss config or kwargs. Falling back to 1.0.")
+
+        self.link_scale.fill_(float(link_scale_cfg))
+        self.od_scale.fill_(float(od_scale_cfg))
+
+        self.loss_fn = Loss(
+            link_scale=float(self.link_scale.detach().item()),
+            od_scale=float(self.od_scale.detach().item()),
+            **loss_cfg,
         )
 
-    def forward(
-            self,
-            observed_flows: torch.Tensor,
-            flow_mask: torch.Tensor,
-            true_od_demand: Optional[torch.Tensor] = None,
-            od_mask: Optional[torch.Tensor] = None,
-            warmup: bool = False,
-            current_iter_count: Optional[int] = None,
-            **kwargs
-    ) -> Dict[str, torch.Tensor]:
+    def _forward_data_driven(self,
+                             observed_flows: torch.Tensor,
+                             flow_mask: Optional[torch.Tensor] = None,
+                             true_od_demand: Optional[torch.Tensor] = None,
+                             od_mask: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+        """Data-driven path intentionally mirrors CGAME_DataDriven behavior."""
+        if flow_mask is None:
+            flow_mask = torch.ones_like(observed_flows)
 
-        # Manejo de dimensiones de lote (batch)
+        x_in = (observed_flows / self.link_scale) * flow_mask
+
+        hx = self.f_encoder(x_in)
+        gx = self.matcher(hx)
+        raw_od_hat = self.f_decoder(gx)
+        od_hat = raw_od_hat * self.od_scale
+
+        use_teacher_forcing = self.training and (true_od_demand is not None)
+        if use_teacher_forcing:
+            true_od_norm = true_od_demand / self.od_scale
+            if od_mask is not None:
+                od_input_mix = (true_od_norm * od_mask) + (raw_od_hat.detach() * (1.0 - od_mask))
+            else:
+                od_input_mix = true_od_norm
+        else:
+            od_input_mix = raw_od_hat
+
+        hy = self.b_encoder(od_input_mix)
+        gy = self.matcher(hy)
+        raw_flow_hat = self.b_decoder(gy)
+        flow_hat = raw_flow_hat * self.link_scale
+
+        if self.training:
+            self.matcher.update(hx.detach(), hy.detach())
+
+        output = {
+            "estimated_demand": od_hat,
+            "reconstructed_flows": flow_hat,
+            "convergence_info": {"converged": True, "iterations": 0, "implicit_grad": False, "mode": "data_driven"},
+            "learned_alpha": None,
+            "learned_beta": None,
+            "route_probs": None,
+            "hx": hx, "gx": gx,
+            "hy": hy, "gy": gy
+        }
+
+        if true_od_demand is not None:
+            output["loss"] = self.loss_fn(
+                predicted_flows=flow_hat,
+                true_flows=observed_flows,
+                flow_mask=flow_mask,
+                predicted_od=od_hat,
+                true_od=true_od_demand,
+                od_mask=od_mask,
+                learned_alpha=output.get("learned_alpha"),
+                learned_beta=output.get("learned_beta"),
+            )
+
+        return output
+
+    def forward(self, observed_flows: torch.Tensor, flow_mask: Optional[torch.Tensor] = None,
+                true_od_demand: Optional[torch.Tensor] = None, od_mask: Optional[torch.Tensor] = None,
+                warmup: bool = False, current_epoch: Optional[int] = None,
+                current_iter_count: Optional[int] = None, **kwargs) -> Dict[str, torch.Tensor]:
+
+        # If physics is disabled, behave like CGAME_DataDriven.
+        if not self.hybrid_use_physics:
+            return self._forward_data_driven(
+                observed_flows=observed_flows,
+                flow_mask=flow_mask,
+                true_od_demand=true_od_demand,
+                od_mask=od_mask
+            )
+
         is_batched = observed_flows.dim() == 2
         if not is_batched:
             observed_flows = observed_flows.unsqueeze(0)
-            flow_mask = flow_mask.unsqueeze(0)
+            if flow_mask is not None: flow_mask = flow_mask.unsqueeze(0)
             if true_od_demand is not None: true_od_demand = true_od_demand.unsqueeze(0)
             if od_mask is not None: od_mask = od_mask.unsqueeze(0)
 
-        # --- PASO 1: ENTRADA ESCALADA PARA RED NEURONAL ---
-        # Escalamos por link_scale para que el encoder no reciba valores masivos.
-        hx = self.f_encoder((observed_flows / self.link_scale) * flow_mask)
-        gx = self.matcher.apply(hx)
-        raw_normalized_od = self.f_decoder(gx)
-        od_hat = raw_normalized_od * self.od_scale  # Escalamos de vuelta a escala real
+        if flow_mask is None: flow_mask = torch.ones_like(observed_flows)
 
-        # --- PASO 2: HIBRIDACIÓN Y CALIBRACIÓN DEL MATCHER ---
-        if self.training and true_od_demand is not None and od_mask is not None:
-            # Hibridación para el ciclo backward (Escala Real)
-            true_od_normalized = true_od_demand / self.od_scale
-            demand_hybrid_norm = (true_od_normalized * od_mask) + (raw_normalized_od.detach() * (1.0 - od_mask))
+        # 1. FORWARD PASS
+        x_in = (observed_flows / self.link_scale) * flow_mask
+        hx = self.f_encoder(x_in)
+        gx = self.matcher(hx)      
+        raw_od_hat = self.f_decoder(gx)
+        od_hat = raw_od_hat * self.od_scale
 
-            # El b_encoder recibe la demanda ESCALADA por od_scale para producir hy normalizado
-            hy_ref = self.b_encoder(demand_hybrid_norm)
-            self.matcher.update(hx.detach(), hy_ref.detach())
-
-            # Demanda con gradiente para el SUE (Escala Real)
-            demand_for_sue = od_hat
-
+        # 2. MATCHING & LATENT CALIBRATION (Always runs to keep spaces aligned)
+        use_teacher_forcing = self.training and (true_od_demand is not None)
+        if use_teacher_forcing:
+            true_od_norm = true_od_demand / self.od_scale
+            if od_mask is not None:
+                od_input_mix = (true_od_norm * od_mask) + (raw_od_hat.detach() * (1.0 - od_mask))
+            else:
+                od_input_mix = true_od_norm
         else:
-            demand_for_sue = od_hat
+            od_input_mix = raw_od_hat
 
-        # --- PASO 3: VALIDACIÓN FÍSICA (SUE) ---
-        # El SUE recibe demanda en ESCALA REAL (vehículos).
-        reconstructed_flows, learned_alpha, learned_beta, conv_info, route_probs = self.validator(
-            demand_for_sue,
-            warmup=warmup,
-            override_max_iters=current_iter_count
-        )
+        hy = self.b_encoder(od_input_mix)
+        gy = self.matcher(hy)      
+
+        if self.training:
+            self.matcher.update(hx.detach(), hy.detach())
+
+        # 3. HYBRID DECISION: Neural vs Physics
+        epoch_in_warmup = (current_epoch is not None) and (current_epoch < self.hybrid_warmup_epochs)
+        use_physics = not (epoch_in_warmup or warmup)
+
+        if not use_physics:
+            # DATA-DRIVEN BRANCH
+            raw_flow_hat = self.b_decoder(gy)
+            flow_hat = raw_flow_hat * self.link_scale
+            
+            conv_info = {"converged": True, "iterations": 0, "implicit_grad": False, "mode": "neural_warmup"}
+            learned_alpha, learned_beta, route_probs = None, None, None
+        else:
+            # PHYSICS-DRIVEN BRANCH (SUE)
+            # SUE expects demands in REAL scale, not normalized.
+            if self.validator is None:
+                raise RuntimeError("SUE validator is not initialized while use_physics is enabled.")
+            flow_hat, learned_alpha, learned_beta, conv_info, route_probs = self.validator(
+                od_hat, override_max_iters=current_iter_count
+            )
 
         if not is_batched:
             od_hat = od_hat.squeeze(0)
-            reconstructed_flows = reconstructed_flows.squeeze(0)
+            flow_hat = flow_hat.squeeze(0)
             if route_probs is not None: route_probs = route_probs.squeeze(0)
 
-        return {
+        output = {
             "estimated_demand": od_hat,
-            "reconstructed_flows": reconstructed_flows,  # Flujos en Escala Real
+            "reconstructed_flows": flow_hat,
             "convergence_info": conv_info,
             "learned_alpha": learned_alpha,
             "learned_beta": learned_beta,
             "route_probs": route_probs,
-            "hx": hx,  # hx está normalizado por f_encoder
-            "gx": gx  # gx está normalizado por el matcher
+            "hx": hx, "gx": gx,
+            "hy": hy, "gy": gy
+        }
+
+        if true_od_demand is not None:
+            output["loss"] = self.loss_fn(
+                predicted_flows=flow_hat,
+                true_flows=observed_flows,
+                flow_mask=flow_mask,
+                predicted_od=od_hat,
+                true_od=true_od_demand,
+                od_mask=od_mask,
+                learned_alpha=learned_alpha,
+                learned_beta=learned_beta,
+            )
+
+        return output
+
+    def get_evaluation_artifacts(self, outputs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        assert isinstance(outputs, dict), "outputs must be a dict"
+        assert "reconstructed_flows" in outputs, "Missing key 'reconstructed_flows'"
+        assert "estimated_demand" in outputs, "Missing key 'estimated_demand'"
+        return {
+            "pred_flows": outputs["reconstructed_flows"].detach().cpu(),
+            "pred_od": outputs["estimated_demand"].detach().cpu(),
+            "convergence": outputs.get("convergence_info", {}),
+            "learned_alpha": outputs.get("learned_alpha"),
+            "learned_beta": outputs.get("learned_beta"),
+            "route_probs": outputs.get("route_probs"),
         }
 
 # =============================================================================

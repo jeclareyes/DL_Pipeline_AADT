@@ -1,0 +1,36 @@
+name: CI Minimal Contracts
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  contracts-and-regressions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install base dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install hydra-core omegaconf seaborn
+
+      - name: Install PyTorch CPU
+        run: |
+          pip install --index-url https://download.pytorch.org/whl/cpu torch
+
+      - name: Run minimal CI checks
+        run: |
+          python src/test/ci_minimal_runner.py

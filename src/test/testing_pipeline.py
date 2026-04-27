@@ -2,8 +2,7 @@
 Testing pipeline entrypoint.
 Reads configs/testing/testing.yaml via hydra, finds checkpoint files under
 outputs/runs/{model_to_test}, and evaluates one or multiple models using the
-functions in _testing_functions.py. It reuses the data loader from the training
-pipeline to prepare tensors but does not run training.
+functions in _testing_functions.py using capability-based task dispatch.
 """
 import logging
 import os
@@ -11,8 +10,8 @@ from glob import glob
 
 import hydra
 from omegaconf import DictConfig
-import torch
-import hydra.utils
+
+from src.contracts.runtime_contracts import ContractError, resolve_testing_dispatch_plan
 
 # Importamos la función orquestadora desde tu archivo de funciones
 from src.test._testing_functions import process_evaluation
@@ -35,6 +34,40 @@ def main(cfg: DictConfig):
     os.makedirs(results_dir, exist_ok=True)
 
     logging.info(f"Iniciando Testing Pipeline en: {model_dir}")
+
+    # Dispatch preflight: resolve callable tasks once before processing files.
+    from src.test import evaluation_tasks
+
+    available_task_names = sorted(
+        name
+        for name, obj in vars(evaluation_tasks).items()
+        if callable(obj) and not name.startswith("_") and getattr(obj, "__module__", "") == evaluation_tasks.__name__
+    )
+
+    dispatch_plan = resolve_testing_dispatch_plan(
+        cfg.testing,
+        available_task_names=available_task_names,
+    )
+    resolved_task_names = list(dispatch_plan["tasks_callable"])
+
+    if dispatch_plan["tasks_unknown"]:
+        logging.warning(
+            "Unknown tasks in capability_dispatch were ignored: %s",
+            dispatch_plan["tasks_unknown"],
+        )
+    if dispatch_plan["capabilities_unused"]:
+        logging.warning(
+            "Unused capabilities defined in capability_dispatch for model '%s': %s",
+            dispatch_plan["model_key"],
+            dispatch_plan["capabilities_unused"],
+        )
+
+    logging.info(
+        "Dispatch preflight | model=%s | capabilities=%s | tasks=%s",
+        dispatch_plan["model_key"],
+        dispatch_plan["capabilities_selected"],
+        resolved_task_names,
+    )
 
     target_files = []
 
@@ -73,7 +106,14 @@ def main(cfg: DictConfig):
     # 3. Ejecución del Test
     for pt_file in target_files:
         try:
-            process_evaluation(pt_file, results_dir)
+            process_evaluation(
+                pt_file,
+                results_dir,
+                cfg.testing,
+                resolved_task_names=resolved_task_names,
+            )
+        except ContractError as e:
+            logging.error(f"Contract violation evaluating {os.path.basename(pt_file)}: {str(e)}")
         except Exception as e:
             logging.error(f"Error evaluando {os.path.basename(pt_file)}: {str(e)}")
             import traceback

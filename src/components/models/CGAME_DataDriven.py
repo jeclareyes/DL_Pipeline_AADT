@@ -7,6 +7,10 @@ import logging
 from omegaconf import DictConfig
 from typing import Dict, Optional
 import os
+import csv
+import json
+
+from src.contracts.runtime_contracts import ArtifactSchemaError, require_keys
 
 logger = logging.getLogger(__name__)
 
@@ -192,6 +196,38 @@ class CyclicODModel(nn.Module):
         # --- C. MATCHER ---
         self.matcher = GraphMatcher(feature_dim, num_structures)
 
+        loss_cfg = kwargs.get("loss", {})
+        if isinstance(loss_cfg, DictConfig):
+            loss_cfg = dict(loss_cfg)
+        else:
+            loss_cfg = dict(loss_cfg) if isinstance(loss_cfg, dict) else {}
+        loss_cfg.pop("_target_", None)
+
+        # Priority: loss YAML -> model kwargs -> safe fallback (1.0)
+        link_scale_cfg = loss_cfg.pop("link_scale", None)
+        od_scale_cfg = loss_cfg.pop("od_scale", None)
+
+        if link_scale_cfg is None:
+            link_scale_cfg = kwargs.get("link_scale", None)
+            if link_scale_cfg is None:
+                link_scale_cfg = 1.0
+                logger.warning("link_scale was not provided in model loss config or kwargs. Falling back to 1.0.")
+
+        if od_scale_cfg is None:
+            od_scale_cfg = kwargs.get("od_scale", None)
+            if od_scale_cfg is None:
+                od_scale_cfg = 1.0
+                logger.warning("od_scale was not provided in model loss config or kwargs. Falling back to 1.0.")
+
+        self.link_scale.fill_(float(link_scale_cfg))
+        self.od_scale.fill_(float(od_scale_cfg))
+
+        self.loss_fn = Loss(
+            link_scale=float(self.link_scale.detach().item()),
+            od_scale=float(self.od_scale.detach().item()),
+            **loss_cfg,
+        )
+
     def forward(
             self,
             observed_flows: torch.Tensor,
@@ -231,11 +267,39 @@ class CyclicODModel(nn.Module):
         if self.training:
             self.matcher.update(hx.detach(), hy.detach())
 
-        return {
+        output = {
             "estimated_demand": od_hat,
             "reconstructed_flows": flow_hat,
             "hx": hx, "gx": gx,
             "hy": hy, "gy": gy
+        }
+
+        if true_od_demand is not None:
+            output["loss"] = self.loss_fn(
+                predicted_flows=flow_hat,
+                true_flows=observed_flows,
+                flow_mask=flow_mask,
+                predicted_od=od_hat,
+                true_od=true_od_demand,
+                od_mask=od_mask,
+            )
+
+        return output
+
+    def get_evaluation_artifacts(self, outputs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        outputs_map = require_keys(
+            outputs,
+            ["reconstructed_flows", "estimated_demand"],
+            context="CGAME_DataDriven.get_evaluation_artifacts outputs",
+            exc_type=ArtifactSchemaError,
+        )
+        return {
+            "pred_flows": outputs_map["reconstructed_flows"].detach().cpu(),
+            "pred_od": outputs_map["estimated_demand"].detach().cpu(),
+            "hx": outputs_map.get("hx"),
+            "gx": outputs_map.get("gx"),
+            "hy": outputs_map.get("hy"),
+            "gy": outputs_map.get("gy"),
         }
 
 # =============================================================================
@@ -322,13 +386,15 @@ class TrainingDiagnostician:
         self.window_history = {
             'r2_flow': [], 'mae_flow': []
         }
+        self.flow_comparison_rows = []
+        self.demand_comparison_rows = []
 
     def update(self, outputs: Dict, targets: Dict, model=None, **kwargs):
         """Actualiza métricas ignorando parámetros extra del trainer."""
         with torch.no_grad():
             pred_flow = outputs.get('reconstructed_flows')
             true_flow = targets.get('flows')
-            mask_flow = targets.get('flow_mask')
+            mask_flow = targets.get('mask', targets.get('flow_mask'))
 
             if pred_flow is None or true_flow is None: return
             if mask_flow is None: mask_flow = torch.ones_like(true_flow)
@@ -356,6 +422,147 @@ class TrainingDiagnostician:
                 self.full_history['mae_flow'].append(mae)
                 self._push_window('r2_flow', r2)
                 self._push_window('mae_flow', mae)
+
+            epoch = kwargs.get('epoch', len(self.full_history['r2_flow']))
+            static_info = kwargs.get('static_info', {})
+            self._collect_flow_demand_rows(
+                epoch=epoch,
+                outputs=outputs,
+                targets=targets,
+                static_info=static_info,
+            )
+
+    def _collect_flow_demand_rows(self, epoch: int, outputs: Dict, targets: Dict, static_info: Dict):
+        """Guarda comparaciones por fila de aforos y demanda para exportar a CSV."""
+        pred_flow = outputs.get('reconstructed_flows')
+        true_flow = targets.get('flows')
+        flow_mask = targets.get('mask', targets.get('flow_mask', None))
+
+        if pred_flow is not None and true_flow is not None:
+            pred_flow_np = pred_flow.detach().cpu().numpy().reshape(-1)
+            true_flow_np = true_flow.detach().cpu().numpy().reshape(-1)
+            n = min(len(pred_flow_np), len(true_flow_np))
+
+            if n > 0:
+                if flow_mask is not None:
+                    flow_mask_np = flow_mask.detach().cpu().numpy().reshape(-1)
+                else:
+                    flow_mask_np = np.ones(n, dtype=np.float32)
+
+                flow_mask_np = np.asarray(flow_mask_np).reshape(-1)
+                m = min(n, len(flow_mask_np))
+
+                for i in range(m):
+                    self.flow_comparison_rows.append(
+                        {
+                            'epoch': int(epoch),
+                            'link_id': int(i),
+                            'real_flow': float(true_flow_np[i]),
+                            'estimated_flow': float(pred_flow_np[i]),
+                            'is_observed_link': bool(flow_mask_np[i] > 0.5),
+                        }
+                    )
+
+        pred_od = outputs.get('estimated_demand')
+        true_od = targets.get('od')
+        od_mask = targets.get('od_mask')
+        od_pair_indices = static_info.get('od_pair_indices', None)
+
+        if pred_od is not None and true_od is not None:
+            pred_od_np = pred_od.detach().cpu().numpy().reshape(-1)
+            true_od_np = true_od.detach().cpu().numpy().reshape(-1)
+            n = min(len(pred_od_np), len(true_od_np))
+
+            if n > 0:
+                if od_mask is not None:
+                    od_mask_np = od_mask.detach().cpu().numpy().reshape(-1)
+                else:
+                    od_mask_np = np.ones(n, dtype=np.float32)
+
+                od_mask_np = np.asarray(od_mask_np).reshape(-1)
+                m = min(n, len(od_mask_np))
+
+                od_labels = None
+                if od_pair_indices is not None:
+                    try:
+                        if torch.is_tensor(od_pair_indices):
+                            od_pairs_np = od_pair_indices.detach().cpu().numpy()
+                        else:
+                            od_pairs_np = np.asarray(od_pair_indices)
+                        if od_pairs_np.ndim == 2 and od_pairs_np.shape[0] == 2 and od_pairs_np.shape[1] != 2:
+                            od_pairs_np = od_pairs_np.T
+                        if od_pairs_np.ndim == 2 and od_pairs_np.shape[1] >= 2:
+                            od_labels = [f"{int(o)}-{int(d)}" for o, d in od_pairs_np[:m, :2]]
+                    except Exception:
+                        od_labels = None
+
+                for i in range(m):
+                    od_id = od_labels[i] if od_labels is not None and i < len(od_labels) else int(i)
+                    self.demand_comparison_rows.append(
+                        {
+                            'epoch': int(epoch),
+                            'od_index': int(i),
+                            'od_pair_id': od_id,
+                            'real_demand': float(true_od_np[i]),
+                            'estimated_demand': float(pred_od_np[i]),
+                            'is_known_demand': bool(od_mask_np[i] > 0.5),
+                        }
+                    )
+
+    def _write_csv(self, path: str, fieldnames, rows):
+        out_dir = os.path.dirname(path)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        with open(path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(row)
+
+    def save_summary(self, filename: str):
+        """Guarda resumen JSON y CSVs de comparación solicitados."""
+        out_dir = os.path.dirname(filename)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+
+        summary = {
+            'steps': len(self.full_history.get('r2_flow', [])),
+            'metrics': {
+                'r2_flow_mean': float(np.mean(self.full_history.get('r2_flow', [0.0]))),
+                'mae_flow_mean': float(np.mean(self.full_history.get('mae_flow', [0.0]))),
+            },
+            'rows': {
+                'flow_rows': len(self.flow_comparison_rows),
+                'demand_rows': len(self.demand_comparison_rows),
+            },
+        }
+
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump(summary, f, indent=2)
+
+        latest_flow_rows = self.flow_comparison_rows
+        if latest_flow_rows:
+            latest_epoch = max(int(r.get('epoch', 0)) for r in latest_flow_rows)
+            latest_flow_rows = [r for r in latest_flow_rows if int(r.get('epoch', 0)) == latest_epoch]
+
+        flow_csv = os.path.join(out_dir, 'estimated_vs_real_flows.csv')
+        self._write_csv(
+            flow_csv,
+            fieldnames=['epoch', 'link_id', 'real_flow', 'estimated_flow', 'is_observed_link'],
+            rows=latest_flow_rows,
+        )
+
+        latest_demand_rows = self.demand_comparison_rows
+        if latest_demand_rows:
+            latest_epoch = max(int(r.get('epoch', 0)) for r in latest_demand_rows)
+            latest_demand_rows = [r for r in latest_demand_rows if int(r.get('epoch', 0)) == latest_epoch]
+
+        demand_csv = os.path.join(out_dir, 'estimated_vs_real_demand.csv')
+        self._write_csv(
+            demand_csv,
+            fieldnames=['epoch', 'od_index', 'od_pair_id', 'real_demand', 'estimated_demand', 'is_known_demand'],
+            rows=latest_demand_rows,
+        )
 
     def check_gradients(self, model: nn.Module) -> str:
         max_grad = 0.0

@@ -3,3 +3,15 @@ _target_: src.components.vdf.bpr.BPRCostFunction
 
 # Parámetro opcional que controla la clase
 learnable_params: true
+learn_alpha: true
+learn_beta: true
+
+# Physical bounds applied inside BPR forward (hard clamp)
+alpha_min: 0.1
+alpha_max: 0.5
+beta_min: 1.0
+beta_max: 6.0
+
+# Per-parameter calibration gradient clipping (hooks on alpha/beta)
+alpha_grad_clip: 500.0
+beta_grad_clip: 500.0

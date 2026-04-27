@@ -1,9 +1,229 @@
 # python
 # File: src/train/_pipeline_utils.py
 import logging
+import json
+import os
 import numpy as np
 import torch
-from typing import Any
+from typing import Any, Dict, Iterator
+from sklearn.model_selection import KFold
+import hydra
+
+from src.contracts.runtime_contracts import ConfigurationContractError, ModelInputContractError
+
+
+def extract_link_types_for_visualization(link_df, strict_data: bool = False) -> np.ndarray:
+    """Extract link types from link_df, with configurable strictness."""
+    if link_df is None:
+        raise ModelInputContractError("link_df must not be None")
+
+    if 'link_type' not in link_df.columns:
+        if strict_data:
+            raise ModelInputContractError("Column 'link_type' is required when training.strict_data=true")
+        logging.warning("Column 'link_type' not found. Falling back to 'Unknown'.")
+        return np.array(['Unknown'] * len(link_df), dtype=str)
+
+    try:
+        return link_df['link_type'].astype(str).values
+    except Exception as exc:
+        if strict_data:
+            raise ModelInputContractError(f"Failed to extract 'link_type': {exc}") from exc
+        logging.warning("Could not extract link_type values. Falling back to 'Unknown'.")
+        return np.array(['Unknown'] * len(link_df), dtype=str)
+
+
+def maybe_compute_t0_od_cost_prior(cfg, raw_data: dict, network_params: dict, device):
+    """Compute t0 OD prior only when explicitly enabled in config."""
+    compute_prior = bool(cfg.training.get('compute_t0_od_cost_prior', False))
+    if not compute_prior:
+        return None
+
+    graph_obj = raw_data['graph']
+    od_indices = network_params['od_pair_indices']
+    return compute_od_cost_prior(
+        link_df=raw_data['link_data'],
+        od_indices_tensor=od_indices,
+        graph_obj=graph_obj,
+        device=device,
+    )
+
+
+def compute_initial_demand_mean(
+    od_vector_np: np.ndarray,
+    observed_od_mask_np: np.ndarray,
+    fallback_value: float = 1.0,
+) -> float:
+    """Compute initial mean demand over observed OD entries."""
+    sum_known = float((od_vector_np * observed_od_mask_np).sum())
+    count_known = float(observed_od_mask_np.sum())
+    if count_known > 0:
+        return float(sum_known / count_known)
+
+    logging.warning("No observed ODs available to compute initial mean demand. Using fallback value.")
+    return float(fallback_value)
+
+
+def vi_od_initialization_hook(cfg, model_params: dict, context: dict | None = None) -> dict:
+    """Model hook for VI OD initialization policy without model-name branching in pipeline."""
+    _ = model_params  # kept for hook signature consistency
+    _ = context
+    od_init_cfg = cfg.training.get('od_initialization', {})
+    od_init_mode = str(od_init_cfg.get('mode', 'known_mean')).lower()
+
+    if od_init_mode == 'low_unknown':
+        low_unknown_val = float(od_init_cfg.get('low_unknown_value', 0.01))
+        return {
+            'init_unknown_od_low': True,
+            'unknown_od_init_value': low_unknown_val,
+        }
+    if od_init_mode == 'known_mean':
+        return {'init_unknown_od_low': False}
+
+    raise ConfigurationContractError(
+        f"Unknown training.od_initialization.mode='{od_init_mode}'. "
+        "Allowed values: known_mean|low_unknown"
+    )
+
+
+def apply_model_pre_instantiate_hook(cfg, model_params: dict, context: dict | None = None) -> dict:
+    """Apply an optional pre-instantiation hook declared in model config."""
+    hook_path = None
+    if hasattr(cfg, 'model'):
+        hook_path = cfg.model.get('pipeline_pre_instantiate_hook', None)
+
+    if not hook_path:
+        return {}
+
+    try:
+        hook_fn = hydra.utils.get_method(str(hook_path))
+    except Exception as exc:
+        raise ConfigurationContractError(
+            f"Could not resolve model hook '{hook_path}'"
+        ) from exc
+
+    if not callable(hook_fn):
+        raise ConfigurationContractError(f"Configured model hook '{hook_path}' is not callable")
+
+    updates = hook_fn(cfg=cfg, model_params=model_params, context=context or {})
+    if updates is None:
+        updates = {}
+    if not isinstance(updates, dict):
+        raise ConfigurationContractError(
+            f"Model hook '{hook_path}' must return dict or None, got {type(updates)}"
+        )
+
+    model_params.update(updates)
+    return updates
+
+
+def evaluate_holdout_metrics(model, true_flows_t, train_mask_np, test_mask_np, device):
+    """Evaluate hold-out metrics in a dedicated reusable function."""
+    with torch.no_grad():
+        model.eval()
+        test_results = model(
+            observed_flows=true_flows_t,
+            flow_mask=torch.FloatTensor(train_mask_np).to(device),
+        )
+
+        y_pred_all = test_results['reconstructed_flows'].detach().cpu().numpy().flatten()
+        y_true_all = true_flows_t.detach().cpu().numpy().flatten()
+        test_mask = np.asarray(test_mask_np).flatten().astype(bool)
+
+        y_pred = y_pred_all[test_mask]
+        y_true = y_true_all[test_mask]
+
+        if len(y_true) == 0:
+            return {'has_holdout': False, 'count': 0}
+
+        mae = float(np.mean(np.abs(y_pred - y_true)))
+        mse = float(np.mean((y_true - y_pred) ** 2))
+        rmse = float(np.sqrt(mse))
+
+        ss_res = float(np.sum((y_true - y_pred) ** 2))
+        ss_tot = float(np.sum((y_true - np.mean(y_true)) ** 2))
+        r2 = float(1 - (ss_res / (ss_tot + 1e-8)))
+
+        non_zero = y_true != 0
+        mape = float(np.mean(np.abs((y_true[non_zero] - y_pred[non_zero]) / y_true[non_zero])) * 100) if np.any(non_zero) else 0.0
+
+        return {
+            'has_holdout': True,
+            'count': int(len(y_true)),
+            'r2': r2,
+            'mae': mae,
+            'rmse': rmse,
+            'mape': mape,
+        }
+
+
+def persist_pipeline_summary(output_dir: str, summary: dict, filename: str = 'pipeline_summary.json') -> str:
+    """Persist pipeline summary metadata to JSON file and return its path."""
+    os.makedirs(output_dir, exist_ok=True)
+    out_path = os.path.join(output_dir, filename)
+    with open(out_path, 'w', encoding='utf-8') as fh:
+        json.dump(summary, fh, indent=2)
+    return out_path
+
+
+def generate_training_tasks(
+    train_mask_global: np.ndarray,
+    k_folds: int,
+    random_seed: int,
+) -> Iterator[Dict[str, Any]]:
+    """Yield training tasks for standard training or k-fold cross-validation.
+
+    Contract:
+    - If k_folds <= 1, yields one task with an empty validation mask.
+    - If k_folds > 1, yields one task per fold.
+    """
+    if train_mask_global is None:
+        raise ModelInputContractError("train_mask_global must not be None")
+    if not isinstance(k_folds, int):
+        raise ConfigurationContractError(f"k_folds must be int, got {type(k_folds)}")
+    if k_folds < 1:
+        raise ConfigurationContractError(f"k_folds must be >= 1, got {k_folds}")
+
+    train_mask_global = np.asarray(train_mask_global, dtype=np.float32)
+    if train_mask_global.ndim != 1:
+        raise ModelInputContractError("train_mask_global must be a 1D mask")
+
+    train_indices = np.where(train_mask_global > 0)[0]
+    if train_indices.size <= 0:
+        raise ModelInputContractError("Global training mask is empty")
+
+    if k_folds <= 1:
+        yield {
+            "name": "Standard Run",
+            "suffix": ".pt",
+            "train_mask": train_mask_global.copy(),
+            "val_mask": np.zeros_like(train_mask_global, dtype=np.float32),
+        }
+        return
+
+    if k_folds > train_indices.size:
+        raise ConfigurationContractError(
+            f"k_folds ({k_folds}) cannot exceed available training samples ({train_indices.size})"
+        )
+
+    splitter = KFold(n_splits=k_folds, shuffle=True, random_state=random_seed)
+    for fold_idx, (train_idx, val_idx) in enumerate(splitter.split(train_indices), start=1):
+        fold_train_mask = np.zeros_like(train_mask_global, dtype=np.float32)
+        fold_val_mask = np.zeros_like(train_mask_global, dtype=np.float32)
+
+        fold_train_mask[train_indices[train_idx]] = 1.0
+        fold_val_mask[train_indices[val_idx]] = 1.0
+
+        if fold_train_mask.shape != fold_val_mask.shape:
+            raise ModelInputContractError("Fold masks shape mismatch")
+        if fold_train_mask.sum() <= 0:
+            raise ModelInputContractError(f"Fold {fold_idx} has empty training mask")
+
+        yield {
+            "name": f"Fold {fold_idx}",
+            "suffix": f"_fold{fold_idx - 1}.pt",
+            "train_mask": fold_train_mask,
+            "val_mask": fold_val_mask,
+        }
 
 ### Funciones de estadísticas para máscaras de sampleo ###
 

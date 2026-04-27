@@ -1,0 +1,94 @@
+# configs/model/VI_Model.yaml
+
+_target_: src.components.models.VI_Model.VariationalInferenceModel
+model_name: "VI_Model"
+pipeline_pre_instantiate_hook: src.train._pipeline_utils.vi_od_initialization_hook
+
+# Use sparse OD targets aligned to OD pairs with available routes.
+od_target_sparse: true
+k_paths: 10
+
+architecture:
+  hidden_dim: 160
+
+# Decoupled optimization rates relative to training.lr
+# Example with training.lr=4e-3:
+#   supply_lr ≈ 2e-4, demand_lr ≈ 1e-2
+supply_lr_multiplier: 0.6
+demand_lr_multiplier: 0.4
+anchor_known_od_in_solver: true
+
+solver:
+  eta: 0.057
+  max_iterations: 8
+  min_iterations: 3
+  tol_rel_flow: 0.0005
+  use_early_stop: false
+  imd:
+    enabled: false
+    backward_iters: 2
+    # IMD backward can become unstable (oscillation/NaN) on some runs.
+    # If use_damping=true, update is damped as: z <- (1-d)*z + d*(g + J^T z).
+    # Keep this switch in YAML to toggle stability vs. pure JFB without code edits.
+    use_damping: false
+    damping: 0.5
+    stationary_tail_steps: 0
+    warm_start: false
+
+loss:
+  _target_: src.components.models.VI_Model.Loss
+  w_link: 1.0
+  w_prior: 1.0
+  w_reg: 0.002
+  link_scale: 1.0
+  od_scale: 1.0
+  huber_delta: 2.8
+
+diagnostics:
+  _target_: src.components.models.VI_Model.VIDiagnostician
+  history_window: 100
+  gap_alert_threshold: 5.0e-3
+  od_grad_low_threshold: 1.0e-8
+  r2_stall_window: 10
+  r2_stall_delta: 1.0e-4
+
+# Optional bounds for PINN BPR parameters.
+alpha_min: 0.1
+alpha_max: 1.4
+beta_min: 1.0
+beta_max: 5.0
+
+# --- Capacity Correction ---
+capacity_correction:  
+  enabled: true # Habilita la corrección de capacidad durante el entrenamiento.
+  # Modos de corrección de capacidad:
+      # 1. 'spatial': Utiliza un MLP para inferir correcciones enlace por enlace basándose 
+      #               en sus características físicas (Longitud, Vmax, etc.). Útil para errores locales.
+      # 2. 'group':   Aprende un multiplicador único para cada jerarquía vial (Link Group).
+      #               Útil si las autopistas y las calles locales tienen factores diarios distintos.
+      # 3. 'global':  Aprende un único multiplicador para toda la red. Es el modo más restrictivo
+      #               y estable, ideal para calibrar el factor de expansión diaria general.
+  mode: "group" # 'spatial' | 'group' | 'global'
+
+  # Rangos de búsqueda física para el multiplicador
+  # Para datos diarios, se sugiere un rango que cubra el inverso del factor K (ej. 10.0 a 16.0)
+  # Para ajuste local, el rango puede ser más amplio (ej. 0.5 a 20.0) para capturar sub o sobreestimaciones significativas.
+  min_value: 12
+  max_value: 16
+
+  # Configuración del MLP (Solo se usa si mode: 'spatial')
+  mlp_hidden_dim: 64
+
+# Dynamic runtime inputs from RouteModelAdapter and training pipeline.
+num_links: ???
+num_od_pairs: ???
+delta_matrix: ???
+route_validity_mask: ???
+od_pair_indices: ???
+t0: ???
+capacity: ???
+length: ???
+lanes: ???
+speed: ???
+num_link_groups: ???
+link_group: ???

@@ -1,0 +1,25 @@
+phase5_model_contract_checklist:
+  required_forward_inputs:
+    - observed_flows
+    - flow_mask
+    - true_od_demand
+    - od_mask
+  required_model_outputs:
+    - reconstructed_flows
+    - estimated_demand
+    - loss.total_loss_when_supervised
+  required_eval_artifacts:
+    - pred_flows
+    - pred_od
+  required_eval_bundle:
+    - schema_version_gte_1
+    - static_data_mapping
+    - epochs_history_non_empty
+  testing_capabilities_integration:
+    - declare_capability_in_configs_testing_testing_yaml
+    - map_capability_in_capability_dispatch
+    - implement_callable_task_in_src_test_evaluation_tasks_py
+  mandatory_pre_merge_commands:
+    - python src/test/model_contract_regression.py
+    - python src/test/ci_minimal_runner.py
+  governance_update_required: true

@@ -1,0 +1,15 @@
+# configs/config_train.yaml
+
+# Operational profile: standard single-run training/evaluation.
+# Usage:
+#   python src/train/training_pipeline.py --config-name config_train
+
+defaults:
+  - config
+  - _self_
+
+hydra:
+  mode: RUN
+
+training:
+  tuning: null

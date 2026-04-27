@@ -30,7 +30,7 @@ class RouteModelAdapter:
         >>> model = CyclicModel(**model_inputs)
     """
 
-    def __init__(self, device: str = "cpu"):
+    def __init__(self, device: str = "cpu", k_paths: int = 10):
         """
         Initialize the adapter with target computation device.
 
@@ -39,6 +39,7 @@ class RouteModelAdapter:
                          'cuda:0', etc. Default is 'cpu'.
         """
         self.device = device
+        self.k_paths = int(k_paths)
 
     def transform(self, graph: nx.DiGraph, routes_data: Dict[str, Any]) -> Dict[str, torch.Tensor]:
         """
@@ -102,12 +103,18 @@ class RouteModelAdapter:
             routes_data, graph, edge_to_idx
         )
 
+        # Keep raw OD node labels so downstream code can align with OD matrix space
+        # even when graph node indexing differs from OD matrix indexing.
+        raw_routes = routes_data if 'routes' not in routes_data else self._convert_tensor_to_dict(routes_data, graph)
+        od_pair_node_labels = [[str(u), str(v)] for (u, v) in raw_routes.keys()]
+
         # 4. Assemble final model input package
         model_inputs = {
             'num_links': len(edge_list),
             'num_od_pairs': masks.shape[0],
             'route_masks': masks.to(self.device),
             'od_pair_indices': od_indices.to(self.device),
+            'od_pair_node_labels': od_pair_node_labels,
             'delta_matrix': delta_matrix.to(self.device), # NEW: Transpose incidence for efficient link-based computations
             'route_validity_mask': validity_mask.to(self.device), # NEW: 2D boolean mask indicating valid routes per OD pair
             **physics_tensors  # Unpacks t0, capacity, link_group, etc.
@@ -190,7 +197,7 @@ class RouteModelAdapter:
         2. 'delta_matrix' (2D Sparse Transposed) -> [num_links, num_od * k_limit]
            - Required by Topo-CGAME (CRAME_DataDriven) physics-informed architecture.
            - Flattens the [OD, K] dimensions into a single continuous route index (r).
-           - Pragmatic design: allows ultra-fast $x = \Delta f$ projection on GPUs 
+           - Pragmatic design: allows ultra-fast x = Delta*f projection on GPUs 
              using standard 2D sparse matrix multiplication without OOM errors.
              
         3. 'route_validity_mask' (2D Dense Boolean) -> [num_od, k_limit]
@@ -208,7 +215,7 @@ class RouteModelAdapter:
         """
         raw_routes = routes_data if 'routes' not in routes_data else self._convert_tensor_to_dict(routes_data, graph)
 
-        k_limit = 10
+        k_limit = self.k_paths
         num_od = len(raw_routes)
         num_links = len(edge_to_idx)
         

@@ -174,10 +174,44 @@ class CyclicLoop(nn.Module):
         # Translates OD latent features to Route distribution probabilities
         self.route_attention = RouteAttention(feature_dim, num_od_pairs, max_routes_per_od)
 
+        loss_cfg = kwargs.get("loss", {})
+        if isinstance(loss_cfg, DictConfig):
+            loss_cfg = dict(loss_cfg)
+        else:
+            loss_cfg = dict(loss_cfg) if isinstance(loss_cfg, dict) else {}
+        loss_cfg.pop("_target_", None)
+
+        # Priority: loss YAML -> model kwargs -> safe fallback (1.0)
+        link_scale_cfg = loss_cfg.pop("link_scale", None)
+        od_scale_cfg = loss_cfg.pop("od_scale", None)
+
+        if link_scale_cfg is None:
+            link_scale_cfg = kwargs.get("link_scale", None)
+            if link_scale_cfg is None:
+                link_scale_cfg = 1.0
+                logger.warning("link_scale was not provided in model loss config or kwargs. Falling back to 1.0.")
+
+        if od_scale_cfg is None:
+            od_scale_cfg = kwargs.get("od_scale", None)
+            if od_scale_cfg is None:
+                od_scale_cfg = 1.0
+                logger.warning("od_scale was not provided in model loss config or kwargs. Falling back to 1.0.")
+
+        self.link_scale = float(link_scale_cfg)
+        self.od_scale = float(od_scale_cfg)
+
+        self.loss_fn = Loss(
+            link_scale=float(self.link_scale),
+            od_scale=float(self.od_scale),
+            **loss_cfg,
+        )
+
     def forward(
             self,
             observed_flows: torch.Tensor,
             flow_mask: Optional[torch.Tensor] = None,
+            true_od_demand: Optional[torch.Tensor] = None,
+            od_mask: Optional[torch.Tensor] = None,
             **kwargs
     ) -> Dict[str, torch.Tensor]:
         """
@@ -211,11 +245,42 @@ class CyclicLoop(nn.Module):
         # Resultado de sparse.mm: [A, B] -> Transpuesto final: [B, A]
         reconstructed_flows = torch.sparse.mm(self.delta_matrix, f_r.t()).t()
 
-        return {
+        output = {
             "estimated_demand": od_hat,
             "route_flows": f_r,
             "reconstructed_flows": reconstructed_flows,
             "h_od": h_od
+        }
+
+        if true_od_demand is not None:
+            output["loss"] = self.loss_fn(
+                outputs={
+                    "reconstructed_flows": reconstructed_flows,
+                    "estimated_demand": od_hat,
+                    "route_flows": f_r,
+                },
+                targets={
+                    "flows": observed_flows,
+                    "od": true_od_demand,
+                },
+                masks={
+                    "flow_mask": flow_mask,
+                    "od_mask": od_mask,
+                    "route_mask": self.route_mask,
+                },
+            )
+
+        return output
+
+    def get_evaluation_artifacts(self, outputs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        assert isinstance(outputs, dict), "outputs must be a dict"
+        assert "reconstructed_flows" in outputs, "Missing key 'reconstructed_flows'"
+        assert "estimated_demand" in outputs, "Missing key 'estimated_demand'"
+        return {
+            "pred_flows": outputs["reconstructed_flows"].detach().cpu(),
+            "pred_od": outputs["estimated_demand"].detach().cpu(),
+            "route_flows": outputs.get("route_flows"),
+            "h_od": outputs.get("h_od"),
         }
 
 # =============================================================================

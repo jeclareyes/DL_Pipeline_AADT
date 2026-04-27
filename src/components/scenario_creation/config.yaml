@@ -1,6 +1,6 @@
 Defaults:
   - _self_
-  - scenario: "Synthetic02"
+  - scenario: "Synthetic_Temporal"
 
 paths:
   root_dir: ${hydra:runtime.cwd}

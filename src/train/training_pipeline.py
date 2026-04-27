@@ -5,15 +5,23 @@ import io
 import numpy as np
 import torch
 import hydra
-from omegaconf import DictConfig, OmegaConf
-from sklearn.model_selection import KFold
+from omegaconf import DictConfig
 
 # --- Custom Modules ---
 from src.data_ingestion._artifact_loader import TrafficArtifactLoader
 from src.components.models.common.adapters import RouteModelAdapter
 from src.components.sampling.engine import SamplingEngine
 from src.train.trainer import TrafficTrainer
-from src.train._pipeline_utils import get_run_filenames, compute_od_cost_prior
+from src.train._pipeline_utils import (
+    get_run_filenames,
+    generate_training_tasks,
+    _inject_prescaling,
+    extract_link_types_for_visualization,
+    compute_initial_demand_mean,
+    apply_model_pre_instantiate_hook,
+    evaluate_holdout_metrics,
+    persist_pipeline_summary,
+)
 
 # Fix for Windows console encoding
 if os.name == 'nt':
@@ -62,23 +70,17 @@ def run_pipeline(cfg: DictConfig):
     loader = TrafficArtifactLoader(cfg.data.base_path)
     raw_data = loader.load_all()  # Returns dict with 'graph', 'od_matrix', 'link_data', 'routes_data'
 
-    # --- NUEVO: Extraer Link Types para Visualización ---
-    # Intentamos extraer la columna, con un fallback por si no existe en el dataset
-    try:
-        if 'link_type' in raw_data['link_data'].columns:
-            link_types = raw_data['link_data']['link_type'].values.astype(str)
-        else:
-            logging.warning("Columna 'link_type' no encontrada. Usando 'Unknown'.")
-            link_types = np.array(['Unknown'] * len(raw_data['link_data']))
-    except Exception as e:
-        logging.warning(f"No se pudieron extraer link_types: {e}")
-        link_types = np.array(['Unknown'] * len(raw_data['link_data']))
-    # ----------------------------------------------------
+    strict_data = bool(cfg.training.get("strict_data", False))
+    link_types = extract_link_types_for_visualization(
+        raw_data['link_data'],
+        strict_data=strict_data,
+    )
 
     # B) Model Adaptation (Tensor Layer)
     # The Adapter converts raw objects into the specific tensors required by Route-Based models.
     # It handles sparse matrix creation and physical attribute extraction (t0, capacity).
-    adapter = RouteModelAdapter(device=device)
+    model_k_paths = int(cfg.model.get('k_paths', 10)) if hasattr(cfg, 'model') else 10
+    adapter = RouteModelAdapter(device=device, k_paths=model_k_paths)
     network_params = adapter.transform(
         graph=raw_data['graph'],
         routes_data=raw_data['routes_data']
@@ -89,18 +91,6 @@ def run_pipeline(cfg: DictConfig):
     network_params['link_types_vis'] = link_types # TODO: Verificar si esto no es redudante, puesto que en RouteModelAdapter también se inyecta link_types para el modelo. Podríamos unificarlo.
 
     logging.info("Data successfully adapted to PyTorch Tensors.")
-
-    # Extraer num_nodes del grafo o link_data
-    graph_obj = raw_data['graph']  # El objeto NetworkX original  # O max(max(u), max(v)) + 1
-    od_indices = network_params['od_pair_indices']  # Tensor [Num_OD, 2]
-
-    # Calcular el vector de costos
-    t0_od_costs = compute_od_cost_prior(
-        link_df=raw_data['link_data'],
-        od_indices_tensor=od_indices,
-        graph_obj=graph_obj,  # Pasamos el grafo entero
-        device=device
-    )
 
     # C) Global Vector Preparation (Standardization)
     # We extract the observed flows and OD demands into flat vectors for the Loss function.
@@ -135,13 +125,72 @@ def run_pipeline(cfg: DictConfig):
 
     # Move global reference tensors to GPU once
     true_flows_t = torch.FloatTensor(all_flows_np).to(device)
-    true_od_t = torch.FloatTensor(od_vector_np).to(device)
 
-    # We always use the global observed OD mask for loss (assuming we trust known ODs)
-    observed_od_mask_t = torch.FloatTensor(observed_od_mask_np).to(device)
+    # Optional OD-space projection: dense [N_nodes^2] -> sparse [N_OD with routes]
+    # Enabled per-model to preserve backwards compatibility with legacy models.
+    use_sparse_od_targets = bool(cfg.model.get('od_target_sparse', False)) if hasattr(cfg, 'model') else False
+    if use_sparse_od_targets:
+        num_nodes = int(raw_data['od_matrix'].shape[0])
+        flat_idx = None
+        valid_idx = None
+
+        # Preferred path: map OD pairs using raw node labels from routes.
+        # This keeps OD projection in the same space as the OD matrix when graph node indexing differs.
+        od_pair_node_labels = network_params.get('od_pair_node_labels', None)
+        if od_pair_node_labels is not None and len(od_pair_node_labels) > 0:
+            labels_flat = [str(x) for pair in od_pair_node_labels for x in pair]
+
+            def _sort_key(label: str):
+                return (0, int(label)) if label.isdigit() else (1, label)
+
+            unique_labels = sorted(set(labels_flat), key=_sort_key)
+
+            if len(unique_labels) == num_nodes:
+                label_to_idx = {label: idx for idx, label in enumerate(unique_labels)}
+                pair_idx = []
+                pair_valid = []
+                for u, v in od_pair_node_labels:
+                    su, sv = str(u), str(v)
+                    if su in label_to_idx and sv in label_to_idx:
+                        i = label_to_idx[su]
+                        j = label_to_idx[sv]
+                        pair_idx.append(i * num_nodes + j)
+                        pair_valid.append(True)
+                    else:
+                        pair_idx.append(0)
+                        pair_valid.append(False)
+
+                flat_idx = np.asarray(pair_idx, dtype=np.int64)
+                valid_idx = np.asarray(pair_valid, dtype=bool)
+
+        # Fallback path: map using graph node index space.
+        if flat_idx is None or valid_idx is None:
+            od_pair_indices_np = network_params['od_pair_indices'].detach().cpu().numpy()  # [N_OD, 2]
+            flat_idx = (od_pair_indices_np[:, 0] * num_nodes + od_pair_indices_np[:, 1]).astype(np.int64)
+            valid_idx = (
+                (od_pair_indices_np[:, 0] >= 0) & (od_pair_indices_np[:, 0] < num_nodes) &
+                (od_pair_indices_np[:, 1] >= 0) & (od_pair_indices_np[:, 1] < num_nodes) &
+                (flat_idx >= 0) & (flat_idx < od_vector_np.shape[0])
+            )
+
+        od_vector_for_training_np = np.zeros(len(flat_idx), dtype=np.float32)
+        observed_od_mask_for_training_np = np.zeros(len(flat_idx), dtype=np.float32)
+        od_vector_for_training_np[valid_idx] = od_vector_np[flat_idx[valid_idx]].astype(np.float32)
+        observed_od_mask_for_training_np[valid_idx] = observed_od_mask_np[flat_idx[valid_idx]].astype(np.float32)
+
+        invalid_count = int((~valid_idx).sum())
+        if invalid_count > 0:
+            logging.warning(
+                f"Sparse OD projection dropped {invalid_count} invalid OD pairs (outside OD dense matrix range)."
+            )
+    else:
+        od_vector_for_training_np = od_vector_np.astype(np.float32)
+        observed_od_mask_for_training_np = observed_od_mask_np.astype(np.float32)
+
+    true_od_t = torch.FloatTensor(od_vector_for_training_np).to(device)
 
     logging.info(f"Observed Links: {int(observed_flow_mask_np.sum())} / {len(all_flows_np)}")
-    logging.info(f"Observed OD Pairs: {int(observed_od_mask_np.sum())}")
+    logging.info(f"Observed OD Pairs: {int(observed_od_mask_for_training_np.sum())}")
 
     # ---------------------------------------------------------
     # 2. GLOBAL SAMPLING
@@ -156,12 +205,42 @@ def run_pipeline(cfg: DictConfig):
         override_observed_od_mask=observed_od_mask_np
     )
 
+    # Align sampled OD supervision mask to the OD space used by the model.
+    if train_od_mask_global is None:
+        train_od_mask_for_training_np = observed_od_mask_for_training_np.astype(np.float32)
+    else:
+        sampled_od_mask_np = np.asarray(train_od_mask_global, dtype=np.float32).reshape(-1)
+        if use_sparse_od_targets:
+            if sampled_od_mask_np.shape[0] == od_vector_np.shape[0]:
+                train_od_mask_for_training_np = np.zeros(len(flat_idx), dtype=np.float32)
+                train_od_mask_for_training_np[valid_idx] = sampled_od_mask_np[flat_idx[valid_idx]]
+            elif sampled_od_mask_np.shape[0] == od_vector_for_training_np.shape[0]:
+                train_od_mask_for_training_np = sampled_od_mask_np.astype(np.float32)
+            else:
+                logging.warning(
+                    "Sampled OD mask size does not match dense/sparse OD spaces. Falling back to observed OD mask."
+                )
+                train_od_mask_for_training_np = observed_od_mask_for_training_np.astype(np.float32)
+        else:
+            if sampled_od_mask_np.shape[0] == od_vector_for_training_np.shape[0]:
+                train_od_mask_for_training_np = sampled_od_mask_np.astype(np.float32)
+            else:
+                logging.warning(
+                    "Sampled OD mask size does not match OD vector. Falling back to observed OD mask."
+                )
+                train_od_mask_for_training_np = observed_od_mask_for_training_np.astype(np.float32)
+
+    train_od_mask_for_training_np = np.clip(train_od_mask_for_training_np, 0.0, 1.0)
+    train_od_mask_for_training_np = train_od_mask_for_training_np * observed_od_mask_for_training_np
+    train_od_mask_t = torch.FloatTensor(train_od_mask_for_training_np).to(device)
+
     # Calculate Global Test Mask (Hold-out set)
     # Logic: Test = Observed - Train
     test_mask_global = np.clip(observed_flow_mask_np - train_mask_global, 0.0, 1.0)
 
     logging.info(f"Global Train Set size: {int(train_mask_global.sum())} links")
     logging.info(f"Global Test Set size:  {int(test_mask_global.sum())} links")
+    logging.info(f"Supervised OD Pairs (Train): {int(train_od_mask_for_training_np.sum())}")
 
     # ---------------------------------------------------------
     # 3. SPLIT GENERATION STRATEGY
@@ -169,45 +248,26 @@ def run_pipeline(cfg: DictConfig):
     # Here we unify the logic. We create a list of 'tasks'.
     # Each task contains: (suffix, train_mask, val_mask)
 
-    k_folds = cfg.training.get("k_folds", 1)
-    training_tasks = []
-
+    k_folds = int(cfg.training.get("k_folds", 1))
+    random_seed = int(cfg.data.get("random_seed", 42))
     if k_folds > 1:
         logging.info(f"Strategy: K-Fold Cross Validation (K={k_folds})")
-        # In K-Fold, we split the Global Train set into Sub-Train and Validation
-        train_indices = np.where(train_mask_global > 0)[0]
-
-        kf = KFold(n_splits=k_folds, shuffle=True, random_state=cfg.data.get("random_seed", 42))
-
-        for fold, (t_idx, v_idx) in enumerate(kf.split(train_indices)):
-            # Create Fold Masks
-            sub_train_mask = np.zeros_like(train_mask_global)
-            val_mask = np.zeros_like(train_mask_global)
-
-            sub_train_mask[train_indices[t_idx]] = 1.0
-            val_mask[train_indices[v_idx]] = 1.0
-
-            # Append Task
-            training_tasks.append({
-                "name": f"Fold {fold+1}",
-                "suffix": f"_fold{fold}.pt",
-                "train_mask": sub_train_mask,
-                "val_mask": val_mask
-            })
     else:
-        logging.info("Strategy: Standard Training (Global Train, NO Validation, Global Test as Hold-out)")
-        # En Standard mode (K=1), entrenamos sin validación
-        training_tasks.append({
-            "name": "Standard Run",
-            "suffix": ".pt",
-            "train_mask": train_mask_global,
-            "val_mask": np.zeros_like(train_mask_global)  # 0.0 para indicar que no hay validación
-        })
+        logging.info("Strategy: Standard Training (global train, no validation fold)")
+
+    training_tasks = list(
+        generate_training_tasks(
+            train_mask_global=train_mask_global,
+            k_folds=k_folds,
+            random_seed=random_seed,
+        )
+    )
 
     # ---------------------------------------------------------
     # 4. UNIFIED EXECUTION LOOP
     # ---------------------------------------------------------
     metrics_history = []
+    holdout_history = []
 
     for task in training_tasks:
         logging.info(f"--- Starting: {task['name']} ---")
@@ -221,7 +281,7 @@ def run_pipeline(cfg: DictConfig):
             'flows': true_flows_t,
             'od': true_od_t,
             'mask': torch.FloatTensor(task['train_mask']).to(device),
-            'od_mask': observed_od_mask_t # Usually we use all known ODs for training
+            'od_mask': train_od_mask_t,
         }
 
         task_val_tensors = {
@@ -231,44 +291,43 @@ def run_pipeline(cfg: DictConfig):
         # C. Instantiate a Fresh Model (Reset weights)
         # We use **network_params to automatically inject the physics (t0, capacity, masks)
 
-        # --- CALCULAR EL PROMEDIO INICIAL ---
-        # Solo sumamos los valores conocidos y dividimos por la cantidad de conocidos
-        # Evitamos dividir por cero con epsilon
-        sum_known = (od_vector_np * observed_od_mask_np).sum()
-        count_known = observed_od_mask_np.sum()
-        # Evitar división por cero explícita
-        if count_known > 0:
-            initial_demand_mean = float(sum_known / count_known)
-        else:
-            initial_demand_mean = 1.0  # Fallback seguro
-            logging.warning("No hay ODs observados para calcular la media inicial.")
+        initial_demand_mean = compute_initial_demand_mean(
+            od_vector_np=od_vector_for_training_np,
+            observed_od_mask_np=observed_od_mask_for_training_np,
+            fallback_value=1.0,
+        )
 
         logging.info(f"Demanda promedio en fracción conocida: {initial_demand_mean:.4f}")
 
         model_params = network_params.copy()
         model_params['initial_mean'] = initial_demand_mean
 
+        hook_updates = apply_model_pre_instantiate_hook(
+            cfg=cfg,
+            model_params=model_params,
+            context={
+                'task': task,
+                'network_params': network_params,
+                'raw_data': raw_data,
+                'initial_demand_mean': initial_demand_mean,
+            },
+        )
+        if hook_updates:
+            logging.info(f"Applied model pre-instantiation hook updates: {hook_updates}")
+
         # task_train_tensors['od'][task_train_tensors['od_mask'] == 0] = initial_demand_mean
 
-        # --- NUEVO: INJECTAR PRE-SCALING SEGUN ESTRATEGIA CONFIGURADA ---
-        try:
-            from src.train._pipeline_utils import _inject_prescaling
-            # Inject prescaling using numpy arrays prepared earlier
-            link_scale_val, od_scale_val = _inject_prescaling(
-                cfg=cfg,
-                model_params=model_params,
-                all_flows_np=all_flows_np,
-                observed_flow_mask_np=observed_flow_mask_np,
-                od_vector_np=od_vector_np,
-                observed_od_mask_np=observed_od_mask_np,
-                network_params=network_params
-            )
-            # model_params['link_scale'] = link_scale_val
-            # model_params['od_scale'] = od_scale_val
-            model_params['link_scale'] = 1.0
-            model_params['od_scale'] = 1.0
-        except Exception as e:
-            logging.warning(f"Could not inject prescaling: {e}")
+        # Inject prescaling using numpy arrays prepared earlier.
+        # In strict mode this must fail-fast on errors.
+        _inject_prescaling(
+            cfg=cfg,
+            model_params=model_params,
+            all_flows_np=all_flows_np,
+            observed_flow_mask_np=observed_flow_mask_np,
+            od_vector_np=od_vector_for_training_np,
+            observed_od_mask_np=observed_od_mask_for_training_np,
+            network_params=network_params
+        )
 
         model = hydra.utils.instantiate(
             cfg.model,
@@ -280,67 +339,41 @@ def run_pipeline(cfg: DictConfig):
         trainer = TrafficTrainer(cfg, device, output_dir, current_model_name, current_eval_name)
 
         # The .fit() method handles the loop, early stopping, and saving
-        best_mse = trainer.fit(model,
-                               network_params,
-                               task_train_tensors,
-                               task_val_tensors,
-                               t0_od_costs=t0_od_costs)
+        task_score = trainer.fit(
+            model,
+            network_params,
+            task_train_tensors,
+            task_val_tensors,
+        )
+        metrics_history.append(float(task_score))
 
-        metrics_history.append(best_mse)
-
-        # --- NUEVO: EVALUACIÓN FINAL DE HOLD-OUT (UNBIASED) ---
         logging.info("--- Phase 5: Final Hold-out Evaluation ---")
-        with torch.no_grad():
-            model.eval()  # Aseguramos modo evaluación
+        holdout_metrics = evaluate_holdout_metrics(
+            model=model,
+            true_flows_t=true_flows_t,
+            train_mask_np=task['train_mask'],
+            test_mask_np=test_mask_global,
+            device=device,
+        )
+        holdout_metrics['task'] = task['name']
+        holdout_history.append(holdout_metrics)
 
-            # 1. Forward pass completo
-            test_results = model(
-                observed_flows=true_flows_t,
-                flow_mask=torch.FloatTensor(task['train_mask']).to(device)
-            )
-
-            y_pred_all = test_results['reconstructed_flows'].detach().cpu().numpy().flatten()  #
-            y_true_all = true_flows_t.detach().cpu().numpy().flatten()
-            test_mask = test_mask_global.flatten().astype(bool)  # El hold-out puro
-
-            # 2. Filtrar solo los datos del Hold-out (links que el modelo nunca vio)
-            y_pred = y_pred_all[test_mask]
-            y_true = y_true_all[test_mask]
-
-            if len(y_true) > 0:
-                # --- Cálculo de Métricas ---
-                # MAE (Mean Absolute Error)
-                mae = np.mean(np.abs(y_pred - y_true))
-
-                # RMSE (Root Mean Squared Error)
-                mse = np.mean((y_true - y_pred) ** 2)
-                rmse = np.sqrt(mse)
-
-                # R2 (Coefficient of Determination)
-                ss_res = np.sum((y_true - y_pred) ** 2)
-                ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
-                r2 = 1 - (ss_res / (ss_tot + 1e-8))
-
-                # MAPE (Mean Absolute Percentage Error)
-                non_zero = y_true != 0
-                mape = np.mean(np.abs((y_true[non_zero] - y_pred[non_zero]) / y_true[non_zero])) * 100 if np.any(
-                    non_zero) else 0.0
-
-                # --- Reporte Final ---
-                logging.info("\n" + "*" * 30)
-                logging.info("  FINAL EVALUATION (HOLD-OUT)")
-                logging.info("*" * 30)
-                logging.info(f"  >> R2:   {r2:.4f}")
-                logging.info(f"  >> MAE:  {mae:.2f}")
-                logging.info(f"  >> RMSE: {rmse:.2f}")
-                logging.info(f"  >> MAPE: {mape:.2f}%")
-                logging.info("*" * 30)
-            else:
-                logging.warning("No se encontraron datos en el test_mask_global para evaluar.")
+        if holdout_metrics.get('has_holdout', False):
+            logging.info("\n" + "*" * 30)
+            logging.info("  FINAL EVALUATION (HOLD-OUT)")
+            logging.info("*" * 30)
+            logging.info(f"  >> R2:   {holdout_metrics['r2']:.4f}")
+            logging.info(f"  >> MAE:  {holdout_metrics['mae']:.2f}")
+            logging.info(f"  >> RMSE: {holdout_metrics['rmse']:.2f}")
+            logging.info(f"  >> MAPE: {holdout_metrics['mape']:.2f}%")
+            logging.info("*" * 30)
+        else:
+            logging.warning("No hold-out links were available for evaluation.")
 
         # E. Cleanup to prevent memory leaks in loop
         del model, trainer
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available() and str(device).startswith("cuda"):
+            torch.cuda.empty_cache()
 
     # ---------------------------------------------------------
     # 5. FINAL REPORTING
@@ -353,7 +386,22 @@ def run_pipeline(cfg: DictConfig):
     logging.info(f"Final Average MSE: {final_score:.6f} (+/- {std_score:.6f})")
     logging.info("="*40)
 
-    return final_score
+    summary = {
+        'schema_version': 1,
+        'base_model_name': base_model_name,
+        'base_eval_name': base_eval_name,
+        'device': str(device),
+        'k_folds': int(k_folds),
+        'num_tasks': int(len(training_tasks)),
+        'task_scores': [float(x) for x in metrics_history],
+        'score_mean': float(final_score),
+        'score_std': float(std_score),
+        'holdout_metrics': holdout_history,
+    }
+    summary_path = persist_pipeline_summary(output_dir, summary)
+    logging.info(f"Pipeline metadata saved to: {summary_path}")
+
+    return float(final_score)
 
 @hydra.main(version_base=None, config_path="../../configs", config_name="config")
 def main(cfg: DictConfig):

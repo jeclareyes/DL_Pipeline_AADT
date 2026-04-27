@@ -12,13 +12,13 @@ import os
 logger = logging.getLogger(__name__)
 
 # =============================================================================
-# 1. COMPONENTES DE RED NEURONAL (Encoder/Decoder/Matcher)
+# 1. NEURAL NETWORK COMPONENTS (Encoder/Decoder/Matcher)
 # =============================================================================
 
 class ODEncoder(nn.Module):
     """
-    Codifica vectores de entrada (Aforos u ODs) en características latentes.
-    Arquitectura Profunda: [Input -> H -> H/2 -> Feature]
+    Encodes input vectors (link flows or ODs) into latent features.
+    Deep architecture: [Input -> H -> H/2 -> Feature]
     """
     def __init__(self, input_dim: int, hidden_dim: int, feature_dim: int, dropout: float = 0.1):
         super().__init__()
@@ -43,8 +43,8 @@ class ODEncoder(nn.Module):
 
 class ODDecoder(nn.Module):
     """
-    Decodifica el vector latente a salida física (ODs o Aforos).
-    Arquitectura Profunda: [Feature -> H -> H/2 -> Output]
+    Decodes the latent vector into physical outputs (ODs or link flows).
+    Deep architecture: [Feature -> H -> H/2 -> Output]
     """
     def __init__(self, output_dim: int, hidden_dim: int, feature_dim: int, dropout: float = 0.1):
         super().__init__()
@@ -59,7 +59,7 @@ class ODDecoder(nn.Module):
             nn.Dropout(dropout),
             
             nn.Linear(hidden_dim // 2, output_dim),
-            nn.Softplus() # Asegura valores positivos (física)
+            nn.Softplus() # Ensures positive values (physical realism)
         )
 
     def forward(self, g_x: torch.Tensor) -> torch.Tensor:
@@ -67,9 +67,9 @@ class ODDecoder(nn.Module):
 
 class GraphMatcher(nn.Module):
     """
-    Graph Matcher Mejorado (Sustituye a ImprovedGraphMatcher).
-    - Incluye método 'forward' (requerido por PyTorch).
-    - Desacopla la actualización de matrices (update) del forward pass.
+    Enhanced Graph Matcher (replaces ImprovedGraphMatcher).
+    - Includes a 'forward' method (required by PyTorch).
+    - Separates matrix updates (update) from the forward pass.
     """
     def __init__(self, feature_dim: int, num_structures: int,
                  lambda_m: float = 0.01, lambda_v: float = 0.01,
@@ -81,7 +81,7 @@ class GraphMatcher(nn.Module):
         self.lambda_v = lambda_v
         self.reg_strength = reg_strength
 
-        # Matrices M y V con inicialización suave
+        # M and V matrices with soft initialization
         self.register_buffer('M', torch.randn(feature_dim, num_structures) * 0.1)
         self.register_buffer('V', torch.ones(1, num_structures))
         self.register_buffer('update_count', torch.tensor(0.0))
@@ -99,30 +99,30 @@ class GraphMatcher(nn.Module):
 
     @torch.no_grad()
     def update(self, h_x: torch.Tensor, h_y: torch.Tensor):
-        """Actualización explícita de matrices M y V."""
+        """Explicit update of matrices M and V."""
         h_x = self._ensure_batch_dim(h_x)
         h_y = self._ensure_batch_dim(h_y)
-        
-        # Normalización
+
+        # Normalization
         h_x_norm = F.normalize(h_x, p=2, dim=1)
         h_y_norm = F.normalize(h_y, p=2, dim=1)
 
-        # 1. Actualizar M (Proyección Estructural)
+        # 1. Update M (Structural Projection)
         similarity_vector = (h_x_norm * h_y_norm).mean(dim=0)
         target_M = similarity_vector.unsqueeze(1).expand(-1, self.num_structures)
-        
-        # Regularización
+
+        # Regularization
         noise = torch.randn_like(self.M) * 0.01
         regularized_target = target_M + self.reg_strength * noise
 
-        # Momento adaptativo
+        # Adaptive momentum
         momentum = min(self.lambda_m * (1 + self.update_count.item() * 0.001), 0.1)
         self.M.data = (1 - momentum) * self.M.data + momentum * regularized_target
 
-        # 2. Actualizar V (Atención Global)
+        # 2. Update V (Global Attention)
         h_x_transformed = h_x.unsqueeze(2) * self.M 
         h_y_expanded = h_y.unsqueeze(2)             
-        
+
         num = (h_x_transformed * h_y_expanded).sum(dim=1) 
         den = torch.norm(h_x_transformed, dim=1) * torch.norm(h_y_expanded, dim=1) + 1e-8
         cosine_sim = (num / den).mean(dim=0) 
@@ -135,183 +135,214 @@ class GraphMatcher(nn.Module):
         self.update_count += 1
 
     def forward(self, h_x: torch.Tensor) -> torch.Tensor:
-        """Aplica la transformación aprendida."""
+        """Apply the learned transformation."""
         h_x = self._ensure_batch_dim(h_x)
         
-        # Atención neuronal
+        # Learned attention
         attn_weights = self.attention_net(h_x) # [B, S]
         
-        # Proyección
+        # Projection
         h_exp = h_x.unsqueeze(2) # [B, F, 1]
         h_struct = h_exp * self.M.unsqueeze(0) # [B, F, S]
         h_weighted = h_struct * self.V.unsqueeze(0) # [B, F, S]
         
-        # Combinación ponderada
+        # Weighted combination
         g_x = (h_weighted * attn_weights.unsqueeze(1)).sum(dim=2) # [B, F]
         
         return g_x
 
 
-class ProjectedAssignmentValidator(nn.Module):
-    """
-    Replaces the stochastic MSA loop with Projected Gradient Descent (PGD) 
-    over the simplex of route flows, achieving physical User Equilibrium.
-    """
-    def __init__(self, num_links: int, t0: torch.Tensor, capacity: torch.Tensor,
-                 lanes: torch.Tensor, route_masks: torch.Tensor, od_pair_indices: torch.Tensor,
-                 num_od_pairs: int, num_link_groups: int, link_group: torch.Tensor,
-                 vdf_config: DictConfig, trips_scaler: float = 1.0,
-                 max_iters: int = 50, grad_steps: int = 5, step_size: float = 0.01,
-                 convergence_threshold: float = 1e-4, **kwargs):
+class PhysicsAwareAssignment(nn.Module):
+    def __init__(self, num_links, delta_matrix, vdf_config, 
+                 t0, capacity, route_masks, lanes,
+                 od_pair_indices, num_link_groups, link_group, route_validity_mask,
+                 init_alpha=0.15, init_beta=4.0, num_iterations=100):
+        
         super().__init__()
-        
-        self.max_iters = max_iters
-        self.grad_steps = grad_steps
-        self.step_size = step_size
-        self.tol = convergence_threshold
-        self.trips_scaler = trips_scaler
-        
-        # Instantiate VDF
-        self.cost_function = hydra.utils.instantiate(
-            vdf_config, t0=t0, capacity=capacity, lanes=lanes,
-            num_link_groups=num_link_groups, link_group=link_group, _recursive_=False
+
+        # 2. Instantiate VDF with learnable parameters
+        self.vdf = hydra.utils.instantiate(
+            vdf_config,
+            t0=t0, 
+            capacity=capacity, 
+            lanes=lanes,
+            num_link_groups=num_link_groups, 
+            link_group=link_group
         )
-        
-        # Process Route Masks to create the Sparse Delta Matrix and Validity Mask
-        self._initialize_topology(route_masks)
-        
-        # Warm Start Buffer
-        self.register_buffer('running_route_flows', None)
 
-    def _initialize_topology(self, route_masks: torch.Tensor):
-        # route_masks is expected as [Num_OD, K_Paths, Num_Links]
-        self.num_od, self.k_paths, self.num_links = route_masks.shape
-        
-        # 1. Create Route Validity Mask [Num_OD, K_Paths]
-        # A route is valid if it has at least one link
-        dense_masks = route_masks.to_dense() if route_masks.is_sparse else route_masks
-        self.register_buffer('route_validity_mask', (dense_masks.sum(dim=-1) > 0).bool())
-        
-        # 2. Create 2D Sparse Delta Matrix [Num_OD * K_Paths, Num_Links]
-        if route_masks.is_sparse:
-            route_masks = route_masks.coalesce()
-            indices = route_masks.indices()
-            values = route_masks.values()
-            new_rows = indices[0] * self.k_paths + indices[1]
-            new_cols = indices[2]
-            new_indices = torch.stack([new_rows, new_cols])
-            sparse_2d = torch.sparse_coo_tensor(new_indices, values, size=(self.num_od * self.k_paths, self.num_links))
-        else:
-            sparse_2d = route_masks.reshape(-1, self.num_links).to_sparse()
-            
-        self.register_buffer('sparse_delta_2d', sparse_2d)
+        # 3. Register structural tensors as buffers (so they travel to the GPU)
+        self.register_buffer("delta", delta_matrix) 
+        self.register_buffer("validity_mask", route_validity_mask) # [OD, K]
+        self.num_iterations = num_iterations
 
-    def _simplex_projection(self, v: torch.Tensor, z: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    def initialize_routes(self, od_demand: torch.Tensor, K: int) -> torch.Tensor:
         """
-        Fast, vectorized projection onto the probability simplex {x | sum(x) = z, x >= 0}.
-        v: [B, OD, K] - unprojected flows
-        z: [B, OD] - target OD demand
-        mask: [B, OD, K] - boolean mask of valid routes
+        Initialize route proportions uniformly, assigning 0 to physically non-existent routes.
         """
-        v_masked = v.masked_fill(~mask, float('-inf'))
-        u, _ = torch.sort(v_masked, dim=-1, descending=True)
+        # batch_size = od_demand.shape[0]
+        batch_size = 1
+
+        # Count how many valid routes each OD pair has [OD, 1]
+        valid_count = self.validity_mask.sum(dim=1, keepdim=True).float()
+        valid_count = torch.clamp(valid_count, min=1.0) # Avoid div/0
         
-        cssv = torch.cumsum(torch.where(mask, u, torch.zeros_like(u)), dim=-1)
-        idx = torch.arange(1, v.shape[-1] + 1, device=v.device, dtype=v.dtype)
+        # Compute base proportion: e.g., if there are 4 routes, each gets 0.25
+        # [OD, K]
+        base_props = self.validity_mask.float() / valid_count
         
-        cond = (u - (cssv - z.unsqueeze(-1)) / idx > 0) & mask
-        rho = cond.sum(dim=-1, keepdim=True).clamp(min=1)
+        # Expand to batch size and flatten to [Batch, OD * K]
+        base_props = base_props.unsqueeze(0).expand(batch_size, -1, -1)
+        return base_props.reshape(batch_size, -1)
+
+    def simplex_projection(self, p_tilde: torch.Tensor, q: torch.Tensor, num_ods: int, K: int) -> torch.Tensor:
+        """
+        Proyecta proporciones no restringidas (p_tilde) al simplex donde suman q.
+        """
+        batch_size = p_tilde.shape[0]
         
-        theta = (torch.gather(cssv, 2, (rho - 1).clamp(min=0).long()) - z.unsqueeze(-1)) / rho.float()
+        # 1. Reshape and strong masking
+        # [Batch * OD, K]
+        v = p_tilde.view(-1, K)
+        
+        # Expand the validity mask to cover the full batch
+        # mask_expanded: [Batch * OD, K]
+        mask_expanded = self.validity_mask.unsqueeze(0).expand(batch_size, -1, -1).reshape(-1, K)
+        
+        # Replace invalid routes with -inf so they always come last when sorting
+        v = v.masked_fill(~mask_expanded, float('-inf'))
+        
+        q_flat = q.view(-1, 1)
+        valid_demand_mask = (q_flat > 0).float()
+        
+        # 2. Sort v in descending order
+        u, _ = torch.sort(v, descending=True, dim=1)
+        
+        # Temporarily remove -inf for the cumulative sum
+        u_safe = torch.clamp(u, min=-1e9) 
+        
+        # 3. Cumulative sum of the sorted array
+        cssv = torch.cumsum(u_safe, dim=1)
+        
+        # 4. Create an index vector [1, 2, ..., K]
+        j = torch.arange(1, K + 1, device=v.device, dtype=v.dtype)
+        
+        # 5. Find the number of strictly positive components (rho)
+        condition = (u_safe - (cssv - q_flat) / j) > 0
+        rho = (condition * j).max(dim=1, keepdim=True)[0]
+        rho = torch.clamp(rho, min=1.0) # Seguro contra fallos numéricos
+        
+        # 6. Compute the threshold (theta)
+        rho_idx = (rho - 1).long()
+        cssv_rho = torch.gather(cssv, 1, rho_idx)
+        theta = (cssv_rho - q_flat) / rho
+        
+        # 7. Apply the projection
         w = torch.clamp(v - theta, min=0.0)
         
-        return w * mask
+        # Double-check that invalid routes and ODs with no demand are zero
+        w = w * mask_expanded.float()
+        w = w * valid_demand_mask
+        
+        return w.view(batch_size, num_ods * K)
 
-    def forward(self, estimated_demands: torch.Tensor, warmup: bool = False, override_max_iters: int = None):
-        max_iters = override_max_iters if override_max_iters is not None else self.max_iters
-        real_demands = estimated_demands * self.trips_scaler
+    def forward(self, estimated_od: torch.Tensor):
+        batch_size, num_ods = estimated_od.shape
+        K = self.validity_mask.shape[1]
         
-        B = real_demands.shape[0]
-        expanded_mask = self.route_validity_mask.unsqueeze(0).expand(B, -1, -1)
+        # 1. Initialize PROPORTIONS
+        p = self.initialize_routes(estimated_od, K)
         
-        # --- INITIALIZATION (Warm Start vs Cold Start) ---
-        can_warm_start = (self.training and not warmup and 
-                          self.running_route_flows is not None and 
-                          self.running_route_flows.shape[0] == B)
+        theta = 5.0 
         
-        if can_warm_start:
-            route_flows = self.running_route_flows.detach().clone()
-        else:
-            # Uniform initial distribution across valid routes
-            valid_counts = expanded_mask.sum(dim=2, keepdim=True).clamp(min=1)
-            route_flows = (real_demands.unsqueeze(-1) / valid_counts) * expanded_mask
+        # We set a very high safety limit to allow convergence,
+        # but rely on early stopping to stop much earlier.
+        max_safety_iters = 1000 
+        
+        # Expand the validity mask once
+        mask_expanded = self.validity_mask.unsqueeze(0).expand(batch_size, -1, -1)
 
-        # --- DYNAMIC PROJECTED GRADIENT DESCENT LOOP ---
-        grad_start_iter = max(0, max_iters - self.grad_steps)
-        converged = False
-        actual_iters = 0
-        
-        for it in range(1, max_iters + 1):
-            # TRUNCATED BACKPROP: Only track gradients in the last steps to save memory
-            requires_grad = self.training and (it > grad_start_iter)
+        for n in range(1, max_safety_iters + 1):
+            gamma_n = 1.0 / n 
             
-            with torch.set_grad_enabled(requires_grad):
-                # 1. Route Flows -> Link Flows (v = Delta * h)
-                rf_flat = route_flows.view(B, -1)
-                rf_t = torch.transpose(rf_flat, 0, 1) # [OD*K, B]
-                link_flows_t = torch.sparse.mm(self.sparse_delta_2d.t(), rf_t) # [L, B]
-                link_flows = link_flows_t.transpose(0, 1) # [B, L]
-                
-                # 2. Dynamic Costs
-                link_costs = self.cost_function(link_flows)
-                
-                # 3. Link Costs -> Route Costs (c = Delta^T * t)
-                costs_t = torch.transpose(link_costs, 0, 1) # [L, B]
-                route_costs_flat_t = torch.sparse.mm(self.sparse_delta_2d, costs_t) # [OD*K, B]
-                route_costs = route_costs_flat_t.transpose(0, 1).view(B, self.num_od, self.k_paths)
-                
-                # 4. Gradient Step
-                unprojected_flows = route_flows - self.step_size * route_costs
-                
-                # 5. Projection
-                new_route_flows = self._simplex_projection(unprojected_flows, real_demands, expanded_mask)
-                
-            # Convergence check (no grad needed)
+            # A. Link flows
+            h_absolute = p * estimated_od.unsqueeze(-1).expand(-1, -1, K).reshape(batch_size, -1)
+            v = torch.sparse.mm(self.delta, h_absolute.t()).t()
+            
+            # B. Compute costs
+            t_links = self.vdf(v)
+            c_routes = torch.sparse.mm(self.delta.t(), t_links.t()).t()
+            
+            # C. SEARCH DIRECTION
+            c_routes_3d = c_routes.view(batch_size, num_ods, K)
+            c_routes_3d_masked = c_routes_3d.masked_fill(~mask_expanded, float('inf'))
+            
+            c_min = c_routes_3d_masked.min(dim=2, keepdim=True)[0]
+            c_shifted = c_routes_3d_masked - c_min
+            
+            p_target = torch.softmax(-theta * c_shifted, dim=2)
+            p_target = p_target * mask_expanded.float()
+            p_target = p_target.view(batch_size, -1)
+            
+            # D. MSA update
+            p = (1 - gamma_n) * p + gamma_n * p_target
+
+            # -----------------------------------------------------------------
+            # E. EARLY STOPPING CRITERION AND LOGGING (1% tolerance)
+            # -----------------------------------------------------------------
             with torch.no_grad():
-                shift = torch.max(torch.abs(new_route_flows - route_flows))
-                if shift <= self.tol and it >= 5: # Force at least 5 iterations
-                    converged = True
-                    route_flows = new_route_flows
-                    actual_iters = it
+                p_3d = p.view(batch_size, num_ods, K)
+                
+                # Define a route "in use" if it has more than 1% of the flow proportion
+                used_mask = (p_3d > 0.01) & mask_expanded
+                
+                # Only evaluate ODs that have MORE THAN ONE route in use
+                multi_route_mask = used_mask.sum(dim=2) > 1 
+                
+                if multi_route_mask.any():
+                    # Find max and min cost only over USED routes
+                    c_used_max = torch.where(used_mask, c_routes_3d, torch.tensor(-float('inf'), device=p.device)).max(dim=2)[0]
+                    c_used_min = torch.where(used_mask, c_routes_3d, torch.tensor(float('inf'), device=p.device)).min(dim=2)[0]
                     
-                    # Ensure at least one grad step if it converged too early
-                    if self.training and not requires_grad:
-                        with torch.set_grad_enabled(True):
-                            link_flows_t = torch.sparse.mm(self.sparse_delta_2d.t(), torch.transpose(route_flows.view(B, -1), 0, 1))
-                            link_costs = self.cost_function(link_flows_t.transpose(0, 1))
-                            route_costs_flat_t = torch.sparse.mm(self.sparse_delta_2d, torch.transpose(link_costs, 0, 1))
-                            route_costs = route_costs_flat_t.transpose(0, 1).view(B, self.num_od, self.k_paths)
-                            unprojected_flows = route_flows - self.step_size * route_costs
-                            route_flows = self._simplex_projection(unprojected_flows, real_demands, expanded_mask)
-                            # Re-compute link_flows for output
-                            rf_flat = route_flows.view(B, -1)
-                            link_flows = torch.sparse.mm(self.sparse_delta_2d.t(), torch.transpose(rf_flat, 0, 1)).transpose(0, 1)
-                    break
+                    c_used_min_safe = torch.clamp(c_used_min, min=1e-6) 
                     
-            route_flows = new_route_flows
-            actual_iters = it
-            
-        if self.training:
-            self.running_route_flows = route_flows.detach()
+                    # Relative difference (1% tolerance = 0.01)
+                    rel_diff = (c_used_max - c_used_min) / c_used_min_safe
+                    
+                    # --- LOGGING EVERY 50 ITERATIONS ---
+                    if n % 50 == 0:
+                        # Filter errors only for ODs with multiple used routes
+                        valid_errors = torch.where(multi_route_mask, rel_diff, torch.zeros_like(rel_diff))
+                        max_gap = valid_errors.max().item() * 100 # Convert to percent
+                        print(f"  [MSA Assignment] Iter {n:4d} | Worst Relative Gap: {max_gap:.2f}%")
+                    # -----------------------------------------------------
 
-        conv_info = {"converged": converged, "iterations": actual_iters}
-        learned_alpha = self.cost_function.alpha
-        learned_beta = self.cost_function.beta
+                    # There is a violation if the difference > 0.01 AND the OD has multiple used routes
+                    violations = (rel_diff > 0.01) & multi_route_mask
+                    
+                    # If no violations and we've passed the first 5 iterations
+                    if not violations.any() and n > 5:
+                        print(f"\n⚡ Forced equilibrium reached. Tolerance < 1% satisfied at iteration {n}.")
+                        break
+                else:
+                    # Edge case: all ODs use a single route
+                    if n > 5:
+                        print(f"\n⚡ Forced equilibrium reached. Single-route dominance at iteration {n}.")
+                        break
+
+        # If the loop finishes without breaking, print a warning
+        if n == max_safety_iters:
+            print(f"\n⚠️ Warning: Safety limit reached ({max_safety_iters} iters) without achieving 1% tolerance.")
+
+        # Reconstrucción final
+        h_final = p * estimated_od.unsqueeze(-1).expand(-1, -1, K).reshape(batch_size, -1)
+        final_link_flows = torch.sparse.mm(self.delta, h_final.t()).t()
+        final_t_links = self.vdf(final_link_flows)
+        final_c_routes = torch.sparse.mm(self.delta.t(), final_t_links.t()).t()
         
-        return link_flows, learned_alpha, learned_beta, conv_info, route_flows
+        return final_link_flows, h_final, final_c_routes
 
 # =============================================================================
-# 2. MODELO PRINCIPAL (CRAME - Differential Layer)
+# 2. MAIN MODEL (CRAME - Differential Layer)
 # =============================================================================
 
 class CyclicLoop(nn.Module):
@@ -351,26 +382,55 @@ class CyclicLoop(nn.Module):
         # 2. Physical Verification (Projected Gradient Descent Assignment)
         convergence_cfg = vdf_config.get('convergence', {})
         
-        self.validator = ProjectedAssignmentValidator(
+        self.traffic_assignment = PhysicsAwareAssignment(
             num_links=num_links,
-            num_od_pairs=num_od_pairs,
-            t0=t0,
-            capacity=capacity,
-            lanes=lanes,
-            route_masks=route_masks,
-            od_pair_indices=od_pair_indices,
-            num_link_groups=num_link_groups,
-            link_group=link_group,
+            delta_matrix=delta_matrix,
             vdf_config=vdf_config,
-            max_iters=convergence_cfg.get('max_iters', 50),
-            grad_steps=convergence_cfg.get('grad_steps', 5),
-            convergence_threshold=convergence_cfg.get('flow_tol', 1e-4)
+            t0=t0, capacity=capacity, route_masks=route_masks, lanes=lanes,
+            od_pair_indices=od_pair_indices, num_link_groups=num_link_groups, link_group=link_group, route_validity_mask=route_validity_mask,
+            init_alpha=vdf_config.get('init_alpha', 0.15),
+            init_beta=vdf_config.get('init_beta', 4.0),
+            num_iterations=convergence_cfg.get('max_iters', 20)
+        )
+
+        loss_cfg = kwargs.get("loss", {})
+        if isinstance(loss_cfg, DictConfig):
+            loss_cfg = dict(loss_cfg)
+        else:
+            loss_cfg = dict(loss_cfg) if isinstance(loss_cfg, dict) else {}
+        loss_cfg.pop("_target_", None)
+
+        # Priority: loss YAML -> model kwargs -> safe fallback (1.0)
+        link_scale_cfg = loss_cfg.pop("link_scale", None)
+        od_scale_cfg = loss_cfg.pop("od_scale", None)
+
+        if link_scale_cfg is None:
+            link_scale_cfg = kwargs.get("link_scale", None)
+            if link_scale_cfg is None:
+                link_scale_cfg = 1.0
+                logger.warning("link_scale was not provided in model loss config or kwargs. Falling back to 1.0.")
+
+        if od_scale_cfg is None:
+            od_scale_cfg = kwargs.get("od_scale", None)
+            if od_scale_cfg is None:
+                od_scale_cfg = 1.0
+                logger.warning("od_scale was not provided in model loss config or kwargs. Falling back to 1.0.")
+
+        self.link_scale = float(link_scale_cfg)
+        self.od_scale = float(od_scale_cfg)
+
+        self.loss_fn = Loss(
+            link_scale=float(self.link_scale),
+            od_scale=float(self.od_scale),
+            **loss_cfg,
         )
 
     def forward(
             self,
             observed_flows: torch.Tensor,
             flow_mask: Optional[torch.Tensor] = None,
+            true_od_demand: Optional[torch.Tensor] = None,
+            od_mask: Optional[torch.Tensor] = None,
             **kwargs
     ) -> Dict[str, torch.Tensor]:
         
@@ -386,21 +446,47 @@ class CyclicLoop(nn.Module):
         od_hat = raw_od_hat * self.od_scale
 
         # Physical Verification
-        link_flows, alpha, beta, conv_info, route_flows = self.validator(
-            estimated_demands=od_hat,
-            warmup=kwargs.get('warmup', False),
-            override_max_iters=kwargs.get('current_iter_count', None)
-        )
+        # link_flows, alpha, beta, conv_info, route_flows = self.traffic_assignment(od_hat, kwargs.get('link_features', {}))
+        link_flows, route_flows, route_costs = self.traffic_assignment(od_hat)
 
-        return {
+
+
+        output = {
             "estimated_demand": od_hat,
-            "route_flows": route_flows,
+            #"route_flows": route_flows,
             "reconstructed_flows": link_flows,
-            "convergence_info": conv_info,
-            "learned_alpha": alpha,
-            "learned_beta": beta,
+            #"convergence_info": conv_info,
+            #"learned_alpha": alpha,
+            #"learned_beta": beta,
             "h_od": hx,
-            "g_od": gx
+            "g_od": gx,
+            "route_flows": route_flows,
+            "route_costs": route_costs
+        }
+
+        if true_od_demand is not None:
+            output["loss"] = self.loss_fn(
+                predicted_flows=link_flows,
+                true_flows=observed_flows,
+                flow_mask=flow_mask,
+                predicted_od=od_hat,
+                true_od=true_od_demand,
+                od_mask=od_mask,
+            )
+
+        return output
+
+    def get_evaluation_artifacts(self, outputs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        assert isinstance(outputs, dict), "outputs must be a dict"
+        assert "reconstructed_flows" in outputs, "Missing key 'reconstructed_flows'"
+        assert "estimated_demand" in outputs, "Missing key 'estimated_demand'"
+        return {
+            "pred_flows": outputs["reconstructed_flows"].detach().cpu(),
+            "pred_od": outputs["estimated_demand"].detach().cpu(),
+            "route_flows": outputs.get("route_flows"),
+            "route_costs": outputs.get("route_costs"),
+            "h_od": outputs.get("h_od"),
+            "g_od": outputs.get("g_od"),
         }
 
 # =============================================================================
@@ -474,8 +560,8 @@ class TrainingDiagnostician:
             'r2_flow': [], 'mae_flow': []
         }
 
-    def update(self, outputs: Dict, targets: Dict, model=None, **kwargs):
-        """Actualiza métricas ignorando parámetros extra del trainer."""
+    def update(self, outputs: Dict, targets: Dict, model=None, is_final=False, **kwargs):
+        """Update metrics while ignoring extra trainer parameters."""
         with torch.no_grad():
             pred_flow = outputs.get('reconstructed_flows')
             true_flow = targets.get('flows')
@@ -507,6 +593,9 @@ class TrainingDiagnostician:
                 self.full_history['mae_flow'].append(mae)
                 self._push_window('r2_flow', r2)
                 self._push_window('mae_flow', mae)
+        
+        if is_final:
+            self.audit_equilibrium(outputs)
 
     def check_gradients(self, model: nn.Module) -> str:
         max_grad = 0.0
@@ -605,3 +694,115 @@ class TrainingDiagnostician:
         plt.title('Gradient Health')
         plt.savefig(filename)
         plt.close()
+
+    def audit_equilibrium(self, outputs: Dict, filename_prefix="audit"):
+            print("\n" + "="*60)
+            print("🚀 RUNNING FINAL EPOCH EQUILIBRIUM AUDIT")
+            print("="*60)
+            
+            est_demand = outputs.get("estimated_demand").detach().cpu().numpy()
+            r_flows = outputs.get("route_flows").detach().cpu().numpy()
+            r_costs = outputs.get("route_costs").detach().cpu().numpy()
+            
+            if est_demand is None or r_flows is None:
+                return
+                
+            batch_size, num_ods = est_demand.shape
+            K = r_flows.shape[1] // num_ods
+            
+            # Work assuming batch=1 for diagnostics
+            demands = est_demand[0]
+            flows_3d = r_flows[0].reshape(num_ods, K)
+            costs_3d = r_costs[0].reshape(num_ods, K)
+            
+            # ---------------------------------------------------------
+            # 1. DEMAND CONSERVATION AUDIT
+            # ---------------------------------------------------------
+            sum_flows = np.sum(flows_3d, axis=1)
+            demand_diff = np.abs(sum_flows - demands)
+            failed_demand_mask = demand_diff > 1.0 
+            
+            if np.any(failed_demand_mask):
+                print(f"⚠️ {np.sum(failed_demand_mask)} OD pairs failed demand conservation:")
+                for od_idx in np.where(failed_demand_mask)[0]:
+                    print(f"  - OD {od_idx}: Estimated={demands[od_idx]:.2f}, Sum={sum_flows[od_idx]:.2f}")
+            else:
+                print("✅ All OD pairs strictly conserved estimated demand.")
+                
+            plt.figure(figsize=(8, 8))
+            plt.scatter(demands, sum_flows, alpha=0.5, color='blue', edgecolor='k')
+            max_val = max(np.max(demands), np.max(sum_flows))
+            plt.plot([0, max_val], [0, max_val], 'r--', label='y = x (Perfect Conservation)')
+            plt.xlabel("Estimated Demand (MLP)")
+            plt.ylabel("Sum of Assigned Route Flows")
+            plt.title("Demand Conservation Check")
+            plt.legend()
+            plt.grid(alpha=0.3)
+            plt.savefig(f"{filename_prefix}_demand_scatter.png")
+            plt.close()
+
+            # ---------------------------------------------------------
+            # 2. TRAVEL TIME AUDIT (Wardrop 5% Tolerance)
+            # ---------------------------------------------------------
+            print("\nAuditing Travel Times (5% tolerance on USED routes)...")
+            failed_cost_ods = 0
+            plot_data = [] 
+            
+            for od_idx in range(num_ods):
+                od_flows = flows_3d[od_idx]
+                od_costs = costs_3d[od_idx]
+                od_demand = demands[od_idx]
+                
+                # Dynamic threshold.
+                # A route is considered "used" only if it carries more than 0.5 units OR more than 1% of the OD demand.
+                # This removes numerical noise from the ML model.
+                dynamic_threshold = max(0.5, od_demand * 0.01) 
+                
+                used_mask = od_flows > dynamic_threshold
+                
+                # If for some reason no route exceeds the threshold (very rare), take the highest-flow route
+                if not np.any(used_mask):
+                    best_route_idx = np.argmax(od_flows)
+                    used_mask[best_route_idx] = True
+                    
+                used_costs = od_costs[used_mask]
+                
+                # Only audit if more than one route is used (if 1, it's trivially in equilibrium)
+                if np.sum(used_mask) > 1:
+                    mean_cost = np.mean(used_costs)
+                    lower_bound = mean_cost * 0.95
+                    upper_bound = mean_cost * 1.05
+                    
+                    violators = (used_costs < lower_bound) | (used_costs > upper_bound)
+                    
+                    if np.any(violators):
+                        failed_cost_ods += 1
+                        print(f"  - OD {od_idx} Violations. Mean Cost: {mean_cost:.2f}. Used Route Costs: {np.round(used_costs, 2)}")
+                    
+                    plot_data.append((od_idx, used_costs))
+                    
+            if failed_cost_ods == 0:
+                print("✅ All OD pairs satisfy Wardrop's User Equilibrium (within 5% tolerance on effectively used routes).")
+                
+            if plot_data:
+                # Limit to 50 OD pairs so the plot remains readable
+                plot_data = plot_data[:50]
+                plt.figure(figsize=(14, 6))
+                
+                for i, (od_idx, costs) in enumerate(plot_data):
+                    x_vals = np.full_like(costs, i)
+                    plt.scatter(x_vals, costs, alpha=0.7, color='purple', edgecolor='w')
+                    
+                    # Baseline line connecting the mean
+                    plt.plot([i-0.2, i+0.2], [np.mean(costs), np.mean(costs)], color='black', alpha=0.5)
+                
+                plt.xticks(range(len(plot_data)), [str(d[0]) for d in plot_data], rotation=90)
+                plt.xlabel("OD Pair Index (Sample of 50 multi-route pairs)")
+                plt.ylabel("Travel Time (Used Routes Only)")
+                plt.title("Travel Time Dispersion per OD Pair (Points should tightly cluster vertically)")
+                plt.grid(axis='y', alpha=0.3)
+                plt.tight_layout()
+                plt.savefig(f"{filename_prefix}_cost_dispersion.png")
+                plt.close()
+                
+            print("="*60 + "\n")
