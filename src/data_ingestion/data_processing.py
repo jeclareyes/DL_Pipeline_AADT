@@ -1,176 +1,56 @@
+# src/data_ingestion/data_processing.py
+
 """
-Descripción
+Data Processing Entrypoint
+==========================
+
+This script is the Hydra entrypoint for building a unified training artifact
+from TNTP files.
+
+It intentionally delegates all processing logic to TrainingArtifactBuilder.
 """
 
-import pandas as pd
-from pathlib import Path
-from typing import Optional, Union, Tuple, Dict
-from scipy import sparse
+import logging
 import sys
-import numpy as np
+from pathlib import Path
+# Add project root to sys.path to enable absolute imports starting with 'src'
+_project_root = str(Path(__file__).resolve().parents[2])
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
 
-# Importaciones de módulos 'data_processing'
-from processing_modules._data_loader import DataLoader
-
-# Importaciones de Hydra para gestión de configuraciones
 import hydra
-from hydra.utils import to_absolute_path
 from omegaconf import DictConfig, OmegaConf
 
+from src.data_ingestion.artifact_builders.training_artifact_builder import (
+    build_training_artifact,
+)
+
+logger = logging.getLogger(__name__)
 
 
-
-# Definición de PROYECT_ROOT para que siempre se ejecute desde la raíz del proyecto
-
-class DataManager:
+@hydra.main(config_path="../../configs", config_name="config", version_base=None)
+def main(cfg: DictConfig) -> None:
     """
-    Gestor centralizado de datos para Barcelona GNN (generalizado para múltiples redes).
-
-    Mantengo el nombre de la clase `DataManager` para compatibilidad con código
-    existente; el módulo ahora se llama `data_processing`.
+    Build the training artifact from the configured TNTP inputs.
     """
 
-    def __init__(self,
-                 cfg: Optional[DictConfig] = None):
-        """
-        If cfg is provided, it overrides individual path parameters.
-        """
+    # Resolve the entire configuration first to prevent InterpolationResolutionError
+    # when sub-configurations contain interpolations referencing outer scope parameters.
+    OmegaConf.resolve(cfg)
 
-        #%% Cargando configuración desde Hydra
-
-        self.config = cfg # TODO se debe arreglar esto
-        # self.config = cfg if isinstance(cfg, DictConfig) else None
-
-        if self.config is not None:
-            # resolve data root via Hydra helper (makes paths absolute regardless of Hydra cwd)
-            try:
-                resolved_route = to_absolute_path(self.config.input_routes.general_route)
-                data_root = Path(resolved_route)
-            except Exception:
-                data_root = Path(self.config.input_routes.general_route) if self.config.input_routes.general_route else None
-        else:
-            print("Error")
-
-        #%% Inicializando atributos básicos y rutas
-
-        self.network_name = self.config.dataset
-        self.multiday = self.config.multiday_od
-        self.volume_year = self.config.volume_year
-
-        # metadata container (initialize early)
-        self.metadata = {
-            'network_name': self.network_name,
-            'multiday': self.multiday
-        }
-
-        input_route = Path(self.config.input_routes.general_route) if self.config.input_routes.general_route else None
-
-        self.flow_route =       Path(to_absolute_path(self.config.input_routes.flow_route))
-        self.network_route =    Path(to_absolute_path(self.config.input_routes.network_route))
-        self.node_route =       Path(to_absolute_path(self.config.input_routes.node_route))
-        self.routes_route =     Path(to_absolute_path(self.config.input_routes.routes_route))
-        self.trips_route =      Path(to_absolute_path(self.config.input_routes.trips_route))
-
-        print(self.flow_route)
-
-        self.all_routes = {
-            'flow_route': self.flow_route,
-            'network_route': self.network_route,
-            'node_route': self.node_route,
-            'routes_route': self.routes_route,
-            'trips_route': self.trips_route
-        }
-
-        #%% Métdo core de carga de datos
-        from src.data_ingestion.processing_modules._data_loader import DataLoader
-        # DataLoader will update this manager's attributes (network_df, flow_df, od_matrix, node_coords_df, metadata)
-        loader  = DataLoader(routes=self.all_routes,
-                             volume_year=self.volume_year,
-                             multiday=self.multiday,
-                             run_loads=True)
-
-        # Read results from loader attributes
-        network_df = loader.network_df
-        flow_df = loader.flow_df
-        known_od_matrix = loader.od_matrix
-        node_df = loader.node_df
-
-        #%% Expansión de Matriz OD para inclusión de pares OD desconocidos
-
-        from src.data_ingestion.processing_modules._od_matrix_expander import add_aux_od_matrix
-
-        complete_od_matrix = add_aux_od_matrix(known_od_matrix, node_df)
-
-        #%% Merging de network y flow dataframes (esto para tener toda la data de links en un solo dataframe)
-
-        from src.data_ingestion.processing_modules._unify_link_based_data import unify_link_data
-
-        link_df = unify_link_data(network_df, flow_df)
-
-        #%% Construcción de grafo (NetworkX) - como elemento base de todos los problemas de estimación.
-        # Además, se usa para el cálculo de rutas k-shortest paths.
-
-        from src.data_ingestion.processing_modules._graph_network_creator import build_graph
-        graph = build_graph(link_df, node_df)
-
-        #%% Computación de rutas k-shortest paths (a partir del grafo que hemos construido)
-
-        from src.data_ingestion.processing_modules._process_routes import RouteHandler
-
-        route_handler = RouteHandler(
-            graph=graph,
-            node_df=node_df,
-            output_route = self.config.output_routes.routing_cache_route,
-            config=self.config.route_calculation)
-
-        routes_data = route_handler.run()
-
-        #%% Save processed data
-
-        from src.data_ingestion.processing_modules._data_saver import DataSaver
-        saver = DataSaver(processed_dir=self.config.output_routes.processed_route)
-
-        # 1. Guardar grafo (pickle y opcionalmente imagen)
-        saver.save_graph_pickle(graph, file_path=Path(self.config.output_routes.processed_route) / f"{self.network_name}_graph.pkl")
-        # saver.save_graph_image(graph, file_path=Path(self.config.output_routes.processed_route) / f"{self.network_name}_graph.png", fmt='png')
-
-        # 2. Guardar matriz OD (formato sparse .npz)
-        # TODO meejorar este guardado para que sea más eficiente
-        from scipy.sparse import csr_matrix
-        complete_od_matrix = csr_matrix(complete_od_matrix)
-        od_matrix_path = Path(self.config.output_routes.processed_route) / f"{self.network_name}_od_matrix.npz"
-        sparse.save_npz(od_matrix_path, complete_od_matrix)
-
-        # 3. Guardar dataframe unificado de links (parquet)
-        link_data_path = Path(self.config.output_routes.processed_route) / f"{self.network_name}_link_data.parquet"
-        link_df.to_parquet(link_data_path, index=False)
-
-
-@hydra.main(config_path="../../configs", config_name="config")
-def main(cfg):
-
-    from omegaconf import OmegaConf
-    from src.data_ingestion._config_schema import DataProcessingConfig
-    # Cargando configuración específica para data processing
     dm_cfg = cfg.data_ingestion.data_processing
-    OmegaConf.resolve(dm_cfg) # Esto convierte todos los "${var}" en sus valores reales (strings/ints)
-    # Building a structured schema and merge to validate required fields/types
-    schema = OmegaConf.structured(DataProcessingConfig)
-    validated = OmegaConf.merge(schema, dm_cfg)
-    dp_instance = OmegaConf.to_object(validated) # This is optional, just to have a typed object
 
-    # Pasándole la configuración al DataManager
-    dm = DataManager(cfg=dp_instance)
+    artifact = build_training_artifact(
+        cfg=dm_cfg,
+        device=str(dm_cfg.device),
+        save=bool(dm_cfg.artifact.save_joblib),
+    )
 
-    try:
-        print("--- Cargando red de tráfico ---")
-        # dm.load_network()
-        # dm.load_flow()
-        # dm.load_od_matrix()
-        # dm.merge_network_flow()
-    except Exception as e:
-        print(f"Error during data processing: {e}")
-        raise
+    logger.info(
+        "Training artifact created successfully: %s",
+        artifact["paths"]["artifact_path"],
+    )
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()

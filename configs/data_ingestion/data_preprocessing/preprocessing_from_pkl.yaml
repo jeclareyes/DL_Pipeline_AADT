@@ -5,6 +5,6 @@
 
 # Usamos las variables globales:
 # ${paths.data_raw} -> viene de config.yaml
-# ${data.dataset}   -> viene de configs/dataset/Linköping.yaml (o el que elijas)
+# ${dataset.name}   -> viene de configs/dataset/Linköping.yaml (o el que elijas)
 
-pickle_data_path: ${paths.data_raw}/${data.dataset}/pickle/${data.dataset}_Pickle_Data.pkl
+pickle_data_path: ${paths.data_raw}/${dataset.name}/pickle/${dataset.name}_Pickle_Data.pkl
