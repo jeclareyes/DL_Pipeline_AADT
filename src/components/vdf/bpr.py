@@ -1,7 +1,10 @@
 import torch
 import torch.nn as nn
+import numpy as np
+import pandas as pd
+from src.components.vdf.base import BaseCostFunction
 
-class BPRCostFunction(nn.Module):
+class BPRCostFunction(BaseCostFunction):
     """
     Differentiable BPR Function.
     Pragmatic modifications:
@@ -18,6 +21,8 @@ class BPRCostFunction(nn.Module):
         
         self.register_buffer('t0', t0)
         self.register_buffer('capacity', capacity)
+        self.register_buffer('lanes', lanes)
+        self.effetive_capacity_multiplier = effetive_capacity_multiplier
         
         # Pragmatic initialization: using global parameters. 
         # (Could be expanded to group-specific parameters using num_link_groups)
@@ -80,3 +85,64 @@ class BPRCostFunction(nn.Module):
         link_costs = self.t0 * (1.0 + delay)
         
         return link_costs
+
+    @classmethod
+    def get_required_columns(cls) -> list[str]:
+        """
+        Retorna las columnas requeridas (nombres genéricos) para BPR.
+        """
+        return ["free_flow_time_col", "capacity_col", "alpha_col", "beta_col"]
+
+    @classmethod
+    def evaluate_costs_numpy(cls, link_flows: np.ndarray, link_table: pd.DataFrame, **kwargs) -> np.ndarray:
+        """
+        Calcula BPR costs estáticos en NumPy.
+        Mapeo de columnas a través de kwargs o nombres por defecto.
+        """
+        # Extraer nombres de columna (con defaults por si acaso)
+        free_flow_time_col = kwargs.get("free_flow_time_col", "free_flow_time")
+        capacity_col = kwargs.get("capacity_col", "capacity")
+        alpha_col = kwargs.get("alpha_col", "alpha")
+        beta_col = kwargs.get("beta_col", "beta")
+        toll_col = kwargs.get("toll_col", None)
+
+        free_flow_time = link_table[free_flow_time_col].to_numpy(dtype=float)
+        capacity = link_table[capacity_col].to_numpy(dtype=float)
+        alpha = link_table[alpha_col].to_numpy(dtype=float)
+        beta = link_table[beta_col].to_numpy(dtype=float)
+
+        toll = np.zeros_like(free_flow_time)
+        if toll_col is not None and toll_col in link_table.columns:
+            toll = link_table[toll_col].to_numpy(dtype=float)
+
+        costs = free_flow_time * (1.0 + alpha * (link_flows / capacity) ** beta) + toll
+        return costs
+
+    @classmethod
+    def evaluate_beckmann_integral_numpy(cls, link_flows: np.ndarray, link_table: pd.DataFrame, **kwargs) -> float:
+        """
+        Calcula la integral de Beckmann para BPR en NumPy.
+        Integral de BPR: t0 * w + t0 * alpha * (C / (beta + 1)) * (w / C)^(beta + 1)
+        """
+        free_flow_time_col = kwargs.get("free_flow_time_col", "free_flow_time")
+        capacity_col = kwargs.get("capacity_col", "capacity")
+        alpha_col = kwargs.get("alpha_col", "alpha")
+        beta_col = kwargs.get("beta_col", "beta")
+        toll_col = kwargs.get("toll_col", None)
+
+        free_flow_time = link_table[free_flow_time_col].to_numpy(dtype=float)
+        capacity = link_table[capacity_col].to_numpy(dtype=float)
+        alpha = link_table[alpha_col].to_numpy(dtype=float)
+        beta = link_table[beta_col].to_numpy(dtype=float)
+
+        toll = np.zeros_like(free_flow_time)
+        if toll_col is not None and toll_col in link_table.columns:
+            toll = link_table[toll_col].to_numpy(dtype=float)
+
+        v_c = link_flows / capacity
+        
+        # Integral = sum_a ( toll_a * x_a + t0_a * x_a + t0_a * alpha_a * (capacity_a / (beta_a + 1)) * (x_a / capacity_a)^(beta_a + 1) )
+        integral_link = toll * link_flows + free_flow_time * link_flows + \
+                        free_flow_time * alpha * (capacity / (beta + 1.0)) * (v_c ** (beta + 1.0))
+
+        return float(np.sum(integral_link))

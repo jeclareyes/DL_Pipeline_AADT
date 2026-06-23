@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
+import pandas as pd
 from .base import BaseCostFunction
 
 
@@ -48,3 +50,40 @@ class AkcelikCostFunction(BaseCostFunction):
 
         # Akcelik es t0 + demora. Aseguramos que no sea menor que t0.
         return self.t0 + torch.clamp(d_overflow, min=0.0)
+
+    @classmethod
+    def get_required_columns(cls) -> list[str]:
+        return ["free_flow_time_col", "capacity_col", "J_col"]
+
+    @classmethod
+    def evaluate_costs_numpy(cls, link_flows: np.ndarray, link_table: pd.DataFrame, **kwargs) -> np.ndarray:
+        fft_col = kwargs.get("free_flow_time_col", "free_flow_time")
+        cap_col = kwargs.get("capacity_col", "capacity")
+        J_col = kwargs.get("J_col", "J")
+        toll_col = kwargs.get("toll_col", None)
+        T = float(kwargs.get("T", 1.0))
+
+        free_flow_time = link_table[fft_col].to_numpy(dtype=float)
+        capacity = link_table[cap_col].to_numpy(dtype=float)
+        
+        if J_col in link_table.columns:
+            J = link_table[J_col].to_numpy(dtype=float)
+        else:
+            # Fallback a un valor por defecto si no existe la columna
+            J = np.full(len(link_table), 0.4, dtype=float)
+            
+        if toll_col and toll_col in link_table.columns:
+            toll = link_table[toll_col].to_numpy(dtype=float)
+        else:
+            toll = np.zeros(len(link_table), dtype=float)
+
+        x = link_flows / capacity
+        term_sqrt = (x - 1) ** 2 + (8 * J * x) / (capacity * T + 1e-9)
+        d_overflow = 0.25 * T * ((x - 1) + np.sqrt(np.maximum(term_sqrt, 1e-9)))
+
+        costs = free_flow_time + np.maximum(d_overflow, 0.0) + toll
+        return costs
+
+    @classmethod
+    def evaluate_beckmann_integral_numpy(cls, link_flows: np.ndarray, link_table: pd.DataFrame, **kwargs) -> np.ndarray:
+        raise NotImplementedError("La integral de Beckmann para la función de Akcelik no ha sido implementada.")

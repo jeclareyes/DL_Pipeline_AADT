@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
+import pandas as pd
 from .base import BaseCostFunction
 
 
@@ -47,3 +49,37 @@ class ConicalCostFunction(BaseCostFunction):
 
         # Aseguramos que el factor sea al menos 1.0 (no viajar más rápido que t0)
         return self.t0 * torch.clamp(factor, min=1.0)
+
+    @classmethod
+    def get_required_columns(cls) -> list[str]:
+        return ["free_flow_time_col", "capacity_col", "alpha_col"]
+
+    @classmethod
+    def evaluate_costs_numpy(cls, link_flows: np.ndarray, link_table: pd.DataFrame, **kwargs) -> np.ndarray:
+        fft_col = kwargs.get("free_flow_time_col", "free_flow_time")
+        cap_col = kwargs.get("capacity_col", "capacity")
+        alpha_col = kwargs.get("alpha_col", "alpha")
+        toll_col = kwargs.get("toll_col", None)
+
+        free_flow_time = link_table[fft_col].to_numpy(dtype=float)
+        capacity = link_table[cap_col].to_numpy(dtype=float)
+        alpha = link_table[alpha_col].to_numpy(dtype=float)
+        
+        if toll_col and toll_col in link_table.columns:
+            toll = link_table[toll_col].to_numpy(dtype=float)
+        else:
+            toll = np.zeros(len(link_table), dtype=float)
+
+        beta_val = 0.01
+        x = link_flows / capacity
+
+        term1 = (alpha ** 2) * ((1 - x) ** 2) + beta_val ** 2
+        sqrt_term = np.sqrt(np.maximum(term1, 1e-9))
+        factor = 2 + sqrt_term - alpha * (1 - x) - beta_val
+
+        costs = free_flow_time * np.maximum(factor, 1.0) + toll
+        return costs
+
+    @classmethod
+    def evaluate_beckmann_integral_numpy(cls, link_flows: np.ndarray, link_table: pd.DataFrame, **kwargs) -> np.ndarray:
+        raise NotImplementedError("La integral de Beckmann para la función Cónica no ha sido implementada.")
