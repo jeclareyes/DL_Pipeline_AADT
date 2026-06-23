@@ -4,6 +4,8 @@
 # Usage:
 #   python src/train/training_pipeline.py --config-name config_train
 
+# TODO: to implement further and properly with optuna
+
 defaults:
   - config
   - _self_
