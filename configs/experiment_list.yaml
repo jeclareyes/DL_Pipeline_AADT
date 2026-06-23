@@ -2,6 +2,8 @@
 # Esta lista se define bajo la clave 'override' para ser procesada por el sweeper.
 # Los valores se separan por comas.
 
+# TODO: this logic must be fully implemented
+
 defaults:
   - override /hydra/sweeper: list
 
