@@ -5,7 +5,7 @@ from __future__ import annotations
 Training Artifact Builder
 =========================
 
-This module builds a unified training artifact from TNTP-like input files.
+This module builds a unified base artifact from TNTP-like input files.
 
 Project context
 ---------------
@@ -25,20 +25,17 @@ Its main responsibilities are:
    - NetworkX directed graph;
    - route dictionary and route table;
    - OD demand table and matrix.
-3. Build model-ready objects:
-   - network tensors through RouteModelAdapter;
-   - flow targets and masks;
-   - OD targets and masks;
-   - visualization payloads.
-4. Save everything into a single training_artifact.joblib file.
-5. Save a lightweight JSON manifest for inspection and reproducibility.
+3. Preserve the processed transport objects needed by downstream asset
+   materialization.
+4. Save everything into a single base_artifact.joblib file.
+5. Save a lightweight bundle manifest for inspection and reproducibility.
 
 Design principles
 -----------------
 - Readers only read raw files.
 - This builder orchestrates the transformation into a training artifact.
 - Training code should load one artifact and train.
-- The artifact should preserve raw, processed and model-ready layers.
+- The artifact should preserve raw and processed layers.
 - Tensors are saved on CPU by default for portability.
 """
 
@@ -53,7 +50,6 @@ import platform
 import sys
 from typing import Any, Dict, Iterable, List, Sequence, Tuple, Union
 
-import joblib
 import networkx as nx
 import numpy as np
 import pandas as pd
@@ -69,6 +65,13 @@ from src.data_ingestion.readers.tntp_trips_reader import read_tntp_trips
 from src.data_ingestion.readers.tntp_routes_reader import read_tntp_routes
 
 from src.data_ingestion.adapters.route_model_adapter import RouteModelAdapter
+from src.components.artifacts.fingerprints import (
+    compute_link_order_fingerprint,
+    compute_network_fingerprint,
+    compute_od_space_fingerprint,
+    compute_zone_order_fingerprint,
+)
+from src.utils.serialization import dump
 
 from src.data_ingestion.builders.link_table_builder import build_link_table
 from src.data_ingestion.builders.graph_builder import build_graph
@@ -129,13 +132,13 @@ class TrainingArtifactBuilder:
         self.artifact_name = artifact_name
         self.manifest_name = manifest_name
 
-        self.dataset_name = str(self._cfg_get("dataset"))
-        self.volume_year = self._cfg_get("volume_year")
-        self.multiday_od = bool(self._cfg_get("multiday_od"))
+        self.dataset_name = str(self._cfg_get("dataset_name"))
+        self.volume_year = self._cfg_get("readers.flows.volume_year")
+        self.multiday_od = self._cfg_get("readers.trips.multiday_od")
 
-        self.k_paths = int(
-            self._cfg_get("model.k_paths")
-        )
+        self.max_routes_per_od = self._cfg_get("readers.routes.max_routes_per_od")
+        if self.max_routes_per_od is not None:
+            self.max_routes_per_od = int(self.max_routes_per_od)
 
         self.trips_aggregation = str(
             self._cfg_get("readers.trips.aggregation")
@@ -391,191 +394,10 @@ class TrainingArtifactBuilder:
     # Public API
     # ------------------------------------------------------------------
 
-    def _recompute_flows_from_current_routes(self) -> Dict[str, Any]:
-        """
-        Recompute the flow TNTP file from the current trips, network and routes.
-
-        This is intentionally executed after optional route recomputation. Flow
-        targets produced from a different route set are not compatible with the
-        delta matrix used by route-based training models.
-        """
-
-        flow_cfg = self._cfg_get("flow_recompute", default={}) or {}
-
-        if not bool(flow_cfg.get("enabled", False)):
-            return {"enabled": False, "skipped": True}
-
-        if self.paths.flow_path.exists() and not bool(flow_cfg.get("overwrite_existing", True)):
-            return {
-                "enabled": True,
-                "skipped": True,
-                "reason": "exists",
-                "flow_path": str(self.paths.flow_path),
-            }
-
-        logger.info("Recomputing flow targets from the active route set.")
-
-        network_result = read_tntp_network(self.paths.network_path)
-        trips_result = read_tntp_trips(
-            path=self.paths.trips_path,
-            aggregation=self.trips_aggregation,
-        )
-
-        zone_ids = trips_result.metadata.get("zone_ids")
-        if not zone_ids:
-            raise ValueError(
-                "Flow recompute failed: trips metadata does not contain zone_ids."
-            )
-
-        routes_result = read_tntp_routes(
-            path=self.paths.routes_path,
-            zone_ids=zone_ids,
-            max_routes_per_od=self.k_paths,
-        )
-
-        od_matrix = trips_result.od_matrix
-        if sparse.issparse(od_matrix):
-            assignment_matrix = od_matrix.toarray()
-        else:
-            assignment_matrix = np.asarray(od_matrix, dtype=float)
-
-        from src.components.assignment_motors import (
-            BehaviorModelName,
-            SolverName,
-            build_assignment_composition,
-            build_assignment_config_from_mapping,
-        )
-
-        assignment_yaml_path = (
-            Path(__file__).resolve().parents[3]
-            / "configs"
-            / "assignment"
-            / "assignment.yaml"
-        )
-        assign_cfg = OmegaConf.to_container(
-            OmegaConf.load(assignment_yaml_path),
-            resolve=True,
-        )
-
-        behavior_name = str(
-            flow_cfg.get("behavior_model", BehaviorModelName.STOCHASTIC_USER_EQUILIBRIUM.value)
-        )
-        solver_name = str(flow_cfg.get("solver", SolverName.MSA.value))
-
-        if behavior_name not in {
-            BehaviorModelName.STOCHASTIC_USER_EQUILIBRIUM.value,
-            BehaviorModelName.ROUTE_BASED_USER_EQUILIBRIUM.value,
-        }:
-            raise ValueError(
-                "flow_recompute.behavior_model must be "
-                "'stochastic_user_equilibrium' or 'route_based_user_equilibrium'. "
-                f"Received {behavior_name!r}."
-            )
-
-        if solver_name not in {
-            SolverName.MSA.value,
-            SolverName.FRANK_WOLFE.value,
-            SolverName.GRADIENT_PROJECTION.value,
-        }:
-            raise ValueError(
-                "flow_recompute.solver must be one of 'msa', 'frank_wolfe', "
-                f"or 'gradient_projection'. Received {solver_name!r}."
-            )
-
-        if (
-            behavior_name == BehaviorModelName.STOCHASTIC_USER_EQUILIBRIUM.value
-            and solver_name != SolverName.MSA.value
-        ):
-            raise ValueError("flow_recompute supports SUE only with solver='msa'.")
-
-        assign_cfg["behavior_model"]["source"] = "explicit"
-        assign_cfg["behavior_model"]["name"] = behavior_name
-        assign_cfg["common"]["max_iterations"] = int(flow_cfg.get("max_iterations", 10000))
-        assign_cfg["common"]["capacity_scaling"]["source"] = "explicit"
-        assign_cfg["common"]["capacity_scaling"]["value"] = 1.0
-        assign_cfg["common"]["capacity_scaling"]["training_config_path"] = None
-        assign_cfg["solvers"]["active_solver"] = solver_name
-
-        if solver_name == SolverName.MSA.value:
-            assign_cfg["solvers"]["msa"]["step_rule"] = str(
-                flow_cfg.get("msa_step_rule")
-            )
-
-        assign_cfg["route_based_user_equilibrium"]["policy"]["expected_solver"] = solver_name
-        assign_cfg["stochastic_user_equilibrium"]["policy"]["expected_solver"] = solver_name
-        assign_cfg["stochastic_user_equilibrium"]["logit"]["theta_source"] = "explicit"
-        assign_cfg["stochastic_user_equilibrium"]["logit"]["theta_value"] = float(
-            flow_cfg.get("theta", 1.0)
-        )
-        assign_cfg["stochastic_user_equilibrium"]["logit"]["theta_artifact_key"] = None
-
-        convergence_cfg = flow_cfg.get("convergence", {}) or {}
-        if behavior_name == BehaviorModelName.STOCHASTIC_USER_EQUILIBRIUM.value:
-            sue_conv = assign_cfg["stochastic_user_equilibrium"]["convergence"]
-            for key in (
-                "equilibrium_l1_threshold",
-                "max_absolute_gap_threshold",
-                "max_relative_gap_threshold",
-                "min_flow_for_relative_gap",
-            ):
-                if key in convergence_cfg:
-                    sue_conv[key] = float(convergence_cfg[key])
-        elif "max_relative_gap_threshold" in convergence_cfg:
-            assign_cfg["route_based_user_equilibrium"]["convergence"]["relative_gap_threshold"] = float(
-                convergence_cfg["max_relative_gap_threshold"]
-            )
-
-        assignment_config = build_assignment_config_from_mapping(assign_cfg)
-        zone_id_to_idx = {
-            int(zone_id): int(idx)
-            for zone_id, idx in trips_result.metadata["zone_id_to_idx"].items()
-        }
-
-        composition = build_assignment_composition(
-            links_df=network_result.network_df,
-            routes_by_od=routes_result.routes_by_od,
-            zone_id_to_idx=zone_id_to_idx,
-            assignment_config=assignment_config,
-            training_config={},
-            artifacts={},
-        )
-
-        result = composition.behavior_model.solve(
-            od_matrix=assignment_matrix,
-            config=composition.runtime_config,
-        )
-
-        flows_df = network_result.network_df[["init_node", "term_node"]].copy()
-        flows_df["Volume"] = np.asarray(result.final_link_flows, dtype=float)
-        flows_df = flows_df.rename(columns={"init_node": "From", "term_node": "To"})
-
-        self.paths.flow_path.parent.mkdir(parents=True, exist_ok=True)
-        flows_df.to_csv(self.paths.flow_path, sep="\t", index=False)
-
-        metadata = {
-            "enabled": True,
-            "skipped": False,
-            "flow_path": str(self.paths.flow_path),
-            "behavior_model": behavior_name,
-            "solver": solver_name,
-            "capacity_scaling_factor": 1.0,
-            "iterations_run": result.metadata.get("iterations_run"),
-            "converged": result.metadata.get("converged"),
-            "total_assigned_flow": float(np.sum(result.final_link_flows)),
-        }
-        logger.info(
-            "Flow targets recomputed | behavior=%s | solver=%s | iterations=%s | converged=%s | path=%s",
-            metadata["behavior_model"],
-            metadata["solver"],
-            metadata["iterations_run"],
-            metadata["converged"],
-            metadata["flow_path"],
-        )
-        return metadata
 
     def run(self, save: bool = True) -> Dict[str, Any]:
         """
-        Build the full training artifact.
+        Build the full base artifact.
 
         Parameters
         ----------
@@ -585,26 +407,26 @@ class TrainingArtifactBuilder:
         Returns
         -------
         Dict[str, Any]
-            Full training artifact.
+            Full base artifact.
         """
 
-        logger.info("Building training artifact for dataset: %s", self.dataset_name)
-        
-        # Ensure updated routes if requested
-        from src.data_ingestion.builders.routes_builder import recompute_routes_from_tntp
-        route_recompute_metadata = recompute_routes_from_tntp(self.cfg)
-        flow_recompute_metadata = self._recompute_flows_from_current_routes()
+        logger.info("Building base artifact for dataset: %s", self.dataset_name)
 
         raw = self.load_raw()
         processed = self.build_processed(raw)
-        model_ready = self.build_model_ready(raw=raw, processed=processed)
+        
+        include_model_ready = bool(self._cfg_get("artifact.include_model_ready_layer"))
+        if include_model_ready:
+            raise ValueError(
+                "Base artifact construction no longer supports a model_ready layer. "
+                "Set artifact.include_model_ready_layer to false."
+            )
+        model_ready = {}
 
         artifact = self.pack_artifact(
             raw=raw,
             processed=processed,
             model_ready=model_ready,
-            route_recompute_metadata=route_recompute_metadata,
-            flow_recompute_metadata=flow_recompute_metadata,
         )
 
 
@@ -660,7 +482,7 @@ class TrainingArtifactBuilder:
         routes_result = read_tntp_routes(
             path=self.paths.routes_path,
             zone_ids=zone_ids,
-            max_routes_per_od=self.k_paths,
+            max_routes_per_od=self.max_routes_per_od,
         )
 
         return {
@@ -773,6 +595,7 @@ class TrainingArtifactBuilder:
         self,
         raw: Dict[str, Any],
         processed: Dict[str, Any],
+        k_paths: int,
     ) -> Dict[str, Any]:
         """
         Build model-ready objects from processed transportation objects.
@@ -795,9 +618,12 @@ class TrainingArtifactBuilder:
 
         logger.info("Building model-ready payload.")
 
+        if int(k_paths) <= 0:
+            raise ValueError("k_paths must be a positive integer.")
+
         adapter = RouteModelAdapter(
             device=self.device,
-            k_paths=self.k_paths,
+            k_paths=int(k_paths),
         )
 
         canonical_edge_order = processed["edge_indexing"].get("link_pair_indices")
@@ -813,6 +639,10 @@ class TrainingArtifactBuilder:
             routes_by_od=processed["routes_by_od"],
             edge_order=canonical_edge_order,
         )
+
+        # TODO: corregir esta ambiguedad ante el modelo.
+        if "capacity" not in network_params and "effective_capacity" in network_params:
+            network_params["capacity"] = network_params["effective_capacity"]
 
         # ------------------------------------------------------------------
         # Resolve model link order
@@ -878,8 +708,6 @@ class TrainingArtifactBuilder:
         raw: Dict[str, Any],
         processed: Dict[str, Any],
         model_ready: Dict[str, Any],
-        route_recompute_metadata: Dict[str, Any] | None = None,
-        flow_recompute_metadata: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
         """
         Pack all layers into the final training artifact.
@@ -893,7 +721,7 @@ class TrainingArtifactBuilder:
             Processed layer.
 
         model_ready : Dict[str, Any]
-            Model-ready layer.
+            Deprecated placeholder retained for compatibility. The base artifact does not include a model-ready layer.
 
         Returns
         -------
@@ -902,7 +730,7 @@ class TrainingArtifactBuilder:
         """
 
         artifact = {
-            "artifact_type": "training_artifact",
+            "artifact_type": "base_artifact",
             "artifact_version": "1.0",
             "dataset_name": self.dataset_name,
             "created_at": datetime.now().isoformat(),
@@ -924,19 +752,17 @@ class TrainingArtifactBuilder:
                 "dataset_name": self.dataset_name,
                 "volume_year": self.volume_year,
                 "multiday_od": self.multiday_od,
-                "k_paths": self.k_paths,
+                "max_routes_per_od": self.max_routes_per_od,
                 "trips_aggregation": self.trips_aggregation,
                 "reader_metadata": raw["metadata"],
-                "route_recompute": route_recompute_metadata or {},
-                "flow_recompute": flow_recompute_metadata or {},
                 "processed_summary": self._build_processed_summary(processed),
-                "model_ready_summary": self._build_model_ready_summary(model_ready),
+                "model_ready_summary": self._build_model_ready_summary(model_ready) if model_ready else {},
             },
         }
 
         return artifact
 
-    def save_artifact(self, artifact: Dict[str, Any]) -> Dict[str, str]:
+    def save_artifact(self, artifact: Dict[str, Any]) -> Dict[str, Any]:
         """
         Save the artifact as joblib and write a lightweight manifest JSON.
 
@@ -947,27 +773,86 @@ class TrainingArtifactBuilder:
 
         Returns
         -------
-        Dict[str, str]
-            Paths to the saved artifact and manifest.
+        Dict[str, Any]
+            Saved-file summary and paths.
         """
-
-        logger.info("Saving training artifact to: %s", self.paths.artifact_path)
 
         self.paths.output_dir.mkdir(parents=True, exist_ok=True)
 
-        joblib.dump(artifact, self.paths.artifact_path)
+        save_joblib = bool(self._cfg_get("artifact.save_joblib"))
+        save_manifest = bool(self._cfg_get("artifact.save_manifest"))
 
-        manifest = self._to_serializable(artifact)
-        manifest["artifact_path"] = str(self.paths.artifact_path)
+        saved_files: list[str] = []
 
-        self.paths.manifest_path.write_text(
-            json.dumps(manifest, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        if save_joblib:
+            dump(artifact, self.paths.artifact_path)
+            saved_files.append(self.paths.artifact_path.name)
+
+        if save_manifest:
+            manifest = self._build_bundle_manifest(artifact)
+
+            self.paths.manifest_path.write_text(
+                json.dumps(manifest, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            saved_files.append(self.paths.manifest_path.name)
+
+        if saved_files:
+            logger.info(
+                "Saved %s in %s",
+                " and ".join(f"`{name}`" for name in saved_files),
+                self.paths.output_dir,
+            )
+        else:
+            logger.info(
+                "No training artifact files were saved in %s because saving is disabled in the configuration.",
+                self.paths.output_dir,
+            )
 
         return {
-            "artifact_path": str(self.paths.artifact_path),
-            "manifest_path": str(self.paths.manifest_path),
+            "output_dir": str(self.paths.output_dir),
+            "saved_files": saved_files,
+            "artifact_path": str(self.paths.artifact_path) if save_joblib else None,
+            "manifest_path": str(self.paths.manifest_path) if save_manifest else None,
+        }
+
+    def _build_bundle_manifest(self, artifact: Dict[str, Any]) -> Dict[str, Any]:
+        """Build the lightweight artifact-bundle manifest."""
+
+        processed = artifact["processed"]
+        raw = artifact["raw"]
+        network_fingerprint = compute_network_fingerprint(processed["link_df"], raw["nodes_df"])
+        od_fingerprint = compute_od_space_fingerprint(processed["od_indexing"].get("od_pairs", []))
+        link_order_fingerprint = compute_link_order_fingerprint(processed["edge_indexing"]["link_pair_indices"])
+        zone_order_fingerprint = compute_zone_order_fingerprint(processed["od_indexing"].get("zone_ids", []))
+
+        base_artifact_entry = {
+            "path": str(self.paths.artifact_path),
+            "artifact_type": artifact["artifact_type"],
+            "artifact_version": artifact["artifact_version"],
+            "fingerprints": {
+                "network": network_fingerprint,
+                "od_space": od_fingerprint,
+                "link_order": link_order_fingerprint,
+                "zone_order": zone_order_fingerprint,
+            },
+            "metadata": {
+                "dataset_name": artifact["dataset_name"],
+                "processed_summary": self._to_serializable(artifact["metadata"].get("processed_summary", {})),
+                "reader_metadata": self._to_serializable(artifact["metadata"].get("reader_metadata", {})),
+            },
+        }
+
+        return {
+            "schema_version": "artifact_bundle.v1",
+            "dataset_name": artifact["dataset_name"],
+            "artifact_type": artifact["artifact_type"],
+            "created_at": artifact["created_at"],
+            "base_artifact": base_artifact_entry,
+            "route_sets": {},
+            "assignment_sets": {},
+            "config": self._to_serializable(artifact["config"]),
+            "environment": self._to_serializable(artifact["environment"]),
         }
 
     # ------------------------------------------------------------------
@@ -1351,22 +1236,24 @@ class TrainingArtifactBuilder:
 
         return dict(cfg)
 
-    def _cfg_get(self, dotted_key: str, default: Any = None) -> Any:
+    def _cfg_get(self, dotted_key: str) -> Any:
         """
-        Get a possibly nested configuration value.
+        Get a possibly nested configuration value strictly.
 
         Parameters
         ----------
         dotted_key : str
             Key path such as "input_routes.node_route".
 
-        default : Any, default=None
-            Fallback value.
-
         Returns
         -------
         Any
-            Configuration value or default.
+            Configuration value.
+            
+        Raises
+        ------
+        KeyError
+            If the configuration key is missing.
         """
 
         parts = dotted_key.split(".")
@@ -1375,16 +1262,14 @@ class TrainingArtifactBuilder:
         for part in parts:
             if isinstance(current, DictConfig):
                 if part not in current:
-                    return default
+                    raise KeyError(f"Configuration key '{dotted_key}' is missing. Bypassing with defaults is prohibited by AGENTS.md.")
                 current = current[part]
             elif isinstance(current, dict):
                 if part not in current:
-                    return default
+                    raise KeyError(f"Configuration key '{dotted_key}' is missing. Bypassing with defaults is prohibited by AGENTS.md.")
                 current = current[part]
             else:
-                if not hasattr(current, part):
-                    return default
-                current = getattr(current, part)
+                raise KeyError(f"Cannot resolve '{dotted_key}' because '{part}' is not a dict.")
 
         return current
 
@@ -1446,6 +1331,8 @@ def build_training_artifact(
     cfg: Union[DictConfig, Dict[str, Any]],
     device: str = "cpu",
     save: bool = True,
+    artifact_name: str = "training_artifact.joblib",
+    manifest_name: str = "training_manifest.json",
 ) -> Dict[str, Any]:
     """
     Convenience function to build a training artifact.
@@ -1470,6 +1357,8 @@ def build_training_artifact(
     builder = TrainingArtifactBuilder(
         cfg=cfg,
         device=device,
+        artifact_name=artifact_name,
+        manifest_name=manifest_name,
     )
 
     return builder.run(save=save)

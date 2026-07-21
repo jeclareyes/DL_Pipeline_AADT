@@ -4,7 +4,7 @@ defaults:
   - _self_ # Permit overrides in this file
 
   # 1. Dataset (Ahora buscará en configs/dataset/Linköping.yaml)
-  - dataset: Synthetic03 # 'Linköping' | 'SiouxFalls' | 'Synthetic01' | 'Synthetic03'
+  - dataset: Synthetic05 # 'Linköping' | 'SiouxFalls' | 'Synthetic01' | 'Synthetic03'
 
 
   # 2. Data Processing (Rutas anidadas según tu estructura)

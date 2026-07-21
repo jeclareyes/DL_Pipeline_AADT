@@ -289,9 +289,11 @@ def recompute_routes_from_tntp(cfg: DictConfig) -> Dict[str, object]:
         "weight": weight,
         "engine": engine_name,
         "constraints": constraints,
-        "parallel": parallel,
-        "parallel_workers": parallel_workers,
-        "od_batch_size": od_batch_size,
+        # Not so relevant. Perhaps remove later
+        # "parallel": parallel,
+        # "parallel_workers": parallel_workers,
+        # "od_batch_size": od_batch_size,
+        # Until here.
     }
 
     logger.info(

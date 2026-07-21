@@ -40,12 +40,13 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
-import joblib
 import torch
 
 from src.data_ingestion.validators.training_artifact_validator import (
     validate_training_artifact_or_raise,
 )
+from src.utils.serialization import load
+from src.utils.paths import resolve_path
 
 
 logger = logging.getLogger(__name__)
@@ -134,7 +135,7 @@ class TrainingArtifactLoader:
         logger.info("Loading training artifact from: %s", self.artifact_path)
 
         try:
-            artifact = joblib.load(self.artifact_path)
+            artifact = load(self.artifact_path)
         except Exception as exc:
             raise RuntimeError(
                 f"Failed to load training artifact from {self.artifact_path}"
@@ -187,7 +188,13 @@ class TrainingArtifactLoader:
         """
 
         artifact = self.load_artifact()
-        return artifact["model_ready"]
+        model_ready = artifact.get("model_ready")
+        if not model_ready:
+            raise ValueError(
+                "Loaded artifact does not contain a model_ready section. "
+                "The current base_artifact contract delegates model-ready materialization to the asset pipeline."
+            )
+        return model_ready
 
     def load_training_inputs(self) -> Dict[str, Any]:
         """
@@ -206,7 +213,12 @@ class TrainingArtifactLoader:
         """
 
         artifact = self.load_artifact()
-        model_ready = artifact["model_ready"]
+        model_ready = artifact.get("model_ready")
+        if not model_ready:
+            raise ValueError(
+                "Loaded artifact does not contain a model_ready section. "
+                "Use the asset pipeline to materialize the active assets before preparing training inputs."
+            )
 
         return {
             "network_params": model_ready["network_params"],
@@ -385,7 +397,7 @@ class TrainingArtifactLoader:
             If the final artifact file does not exist.
         """
 
-        path = Path(artifact_path).expanduser().resolve(strict=False)
+        path = resolve_path(artifact_path)
 
         if path.is_dir():
             path = path / artifact_filename

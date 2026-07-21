@@ -142,7 +142,6 @@ class TrainingArtifactValidator:
         "paths",
         "raw",
         "processed",
-        "model_ready",
         "metadata",
     }
 
@@ -433,20 +432,29 @@ class TrainingArtifactValidator:
 
         self._validate_raw_structure(artifact)
         self._validate_processed_structure(artifact)
-        self._validate_model_ready_structure(artifact)
+
+        has_model_ready = bool(artifact.get("model_ready"))
+        if has_model_ready:
+            self._validate_model_ready_structure(artifact)
 
         if self._errors:
             return self._build_result(artifact)
 
-        self._validate_link_consistency(artifact)
-        self._validate_od_consistency(artifact)
+        if has_model_ready:
+            self._validate_link_consistency(artifact)
+            self._validate_od_consistency(artifact)
+            
         self._validate_od_indexing_payload(artifact)
         self._validate_od_matrix_zone_mapping_consistency(artifact)
         self._validate_raw_trips_zone_indexing_consistency(artifact)
-        self._validate_route_tensor_consistency(artifact)
-        self._validate_target_consistency(artifact)
-        self._validate_physical_tensors(artifact)
-        self._validate_indexing_consistency(artifact)
+        
+        if has_model_ready:
+            self._validate_route_tensor_consistency(artifact)
+            self._validate_target_consistency(artifact)
+            self._validate_physical_tensors(artifact)
+            self._validate_indexing_consistency(artifact)
+            self._validate_flow_target_edge_alignment(artifact)
+
         self._validate_link_df_order_against_processed_edge_indexing(artifact)
 
         if self.check_route_graph_compatibility:
@@ -554,10 +562,10 @@ class TrainingArtifactValidator:
             object_name="artifact",
         )
 
-        if artifact.get("artifact_type") != "training_artifact":
+        if artifact.get("artifact_type") not in ("training_artifact", "base_artifact"):
             self._add_error(
                 code="INVALID_ARTIFACT_TYPE",
-                message="artifact_type must be 'training_artifact'.",
+                message="artifact_type must be 'training_artifact' or 'base_artifact'.",
                 context={"artifact_type": artifact.get("artifact_type")},
             )
 
@@ -775,9 +783,9 @@ class TrainingArtifactValidator:
         from the OD-matrix shape.
         """
         processed = artifact["processed"]
-        model_ready = artifact["model_ready"]
-        network_params = model_ready["network_params"]
-        targets = model_ready["targets"]
+        model_ready = artifact.get("model_ready", {})
+        network_params = model_ready.get("network_params", {})
+        targets = model_ready.get("targets", {})
 
         od_indexing = processed.get("od_indexing")
         if not isinstance(od_indexing, dict):

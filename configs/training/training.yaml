@@ -1,14 +1,13 @@
 # configs/training/training.yaml
 # =============================================================================
 
-# Input Routes para el entrenamiento
-# El código de entrenamiento espera encontrar esto en cfg.training.input_routes
-input_routes:
-  # Usamos ${data.base_path} que viene de Linköping.yaml
-  graph: ${data.base_path}/${data.graph_file}
-  route_cache: ${data.base_path}/${data.routing_cache_file}
-  od_matrix: ${data.base_path}/${data.od_matrix_file}
-  link_df: ${data.base_path}/${data.link_data_file}
+# Training artifact source
+#
+# Training should consume a resolved manifest or base artifact, not hardcoded
+# physical input files. The manifest is the auditable source of truth for
+# graph, route cache, OD matrix, link table and related metadata.
+artifact_manifest: ${dataset.manifests.processed_default}
+base_artifact_filename: base_artifact.joblib
 
 # Hiperparámetros del Entrenamiento (Optimizador, Loops, etc.)
 epochs: 300

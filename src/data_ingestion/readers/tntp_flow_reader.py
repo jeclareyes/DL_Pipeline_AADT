@@ -500,10 +500,15 @@ class TNTPFlowReader:
             df["volume"] = pd.NA
             return df
 
-        df["volume"] = pd.to_numeric(
-            df[selected_volume_column],
-            errors="coerce",
-        )
+        if isinstance(selected_volume_column, list):
+            # volume_year="all": average all volume-like columns row-wise
+            numeric_cols = df[selected_volume_column].apply(pd.to_numeric, errors="coerce")
+            df["volume"] = numeric_cols.mean(axis=1)
+        else:
+            df["volume"] = pd.to_numeric(
+                df[selected_volume_column],
+                errors="coerce",
+            )
 
         return df
 

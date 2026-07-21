@@ -7,6 +7,7 @@ functions in _testing_functions.py using capability-based task dispatch.
 import logging
 import os
 from glob import glob
+import torch
 
 import hydra
 from omegaconf import DictConfig
@@ -26,14 +27,14 @@ def main(cfg: DictConfig):
     logging.basicConfig(level=logging.INFO)
 
     # 1. Configuración de Rutas
-    # outputs/runs/NombreModelo
-    model_dir = os.path.join(cfg.testing.root, cfg.testing.model_to_test)
+    # outputs/models/[run_id]
+    model_dir = cfg.testing.testing_route
 
     # Carpeta donde guardaremos los reportes (dentro de la carpeta del modelo)
     results_dir = os.path.join(model_dir, "test_results")
     os.makedirs(results_dir, exist_ok=True)
 
-    logging.info(f"Iniciando Testing Pipeline en: {model_dir}")
+    logging.info(f"Buscando artefactos en: {model_dir}")
 
     # Dispatch preflight: resolve callable tasks once before processing files.
     from src.test import evaluation_tasks
@@ -73,52 +74,81 @@ def main(cfg: DictConfig):
 
     # 2. Lógica de Selección de Archivos
     if cfg.testing.eval_mode.single_model:
-        # Modo Single: Buscamos un archivo específico
-        instance_name = cfg.testing.eval_mode.instance_to_test
-
-        # Asegurarnos de que buscamos el archivo 'eval_', no el checkpoint puro
-        if not instance_name.startswith("eval_"):
-            eval_name = f"eval_{instance_name}"
+        instance = cfg.testing.eval_mode.instance_to_test
+        if instance == "auto":
+            pattern = os.path.join(model_dir, "*_best.pt")
+            found = sorted(glob(pattern))
+            if found:
+                target_files.append(found[0])
+                logging.info(f"[MATCH] Modo auto encontró: {os.path.basename(found[0])}")
+            else:
+                logging.error(f"[ERROR] No se encontraron archivos '*_best.pt' en {model_dir}")
         else:
-            eval_name = instance_name
-
-        file_path = os.path.join(model_dir, eval_name)
-
-        if os.path.exists(file_path):
-            target_files.append(file_path)
-        else:
-            logging.error(f" No se encontró el archivo específico: {file_path}")
-            # Intento de fallback: buscar si el usuario puso el nombre sin extensión
-            if not file_path.endswith(".pt"):
-                if os.path.exists(file_path + ".pt"):
-                    target_files.append(file_path + ".pt")
-
+            file_path = os.path.join(model_dir, instance if instance.endswith(".pt") else f"{instance}.pt")
+            if os.path.exists(file_path):
+                target_files.append(file_path)
+            else:
+                logging.error(f"[ERROR] No se encontró el archivo específico: {file_path}")
     else:
-        # Modo Batch: Todos los eval_*.pt en la carpeta
-        pattern = os.path.join(model_dir, "eval_*.pt")
-        target_files = glob(pattern)
-        logging.info(f"Modo Batch: Se encontraron {len(target_files)} modelos para evaluar.")
+        pattern = os.path.join(model_dir, "*_best.pt")
+        target_files = sorted(glob(pattern))
+        logging.info(f"[BATCH] Se encontraron {len(target_files)} archivos para procesar.")
 
     if not target_files:
-        logging.warning("No hay archivos para procesar. Verifica paths y prefijos 'eval_'.")
+        logging.warning("No hay archivos en target_files. Abortando ejecución.")
         return
 
-    # 3. Ejecución del Test
+    # 3. Ejecución del Test con Logging de Proceso
+    # --- MODIFIED SECTION START ---
+    from src.data_ingestion.artifact_loaders.training_artifact_loader import TrainingArtifactLoader
+
+    if not target_files:
+        logging.warning("No files found in target_files. Aborting execution.")
+        return
+
+    # 1. Extract the data path from the first available checkpoint's configuration
+    logging.info("Extracting data path from the first checkpoint to initialize ArtifactLoader...")
+    first_bundle = torch.load(target_files[0], map_location='cpu', weights_only=False)
+    
+    # Handle config format (dict vs OmegaConf)
+    original_cfg = first_bundle.get("config", {})
+    
+    if hasattr(original_cfg, "artifact") and getattr(original_cfg.artifact, "path", None):
+        data_base_path = original_cfg.artifact.path
+    elif isinstance(original_cfg, dict) and "artifact" in original_cfg and "path" in original_cfg["artifact"]:
+        data_base_path = original_cfg["artifact"]["path"]
+    elif hasattr(original_cfg, "data"):
+        data_base_path = original_cfg.data.base_path
+    elif isinstance(original_cfg, dict) and "data" in original_cfg:
+        data_base_path = original_cfg["data"].get("base_path")
+    else:
+        logging.error("Could not locate 'data.base_path' or 'artifact.path' in the saved checkpoint config.")
+        raise ValueError("Missing data_base_path in model checkpoint.")
+
+    # 2. Instantiate Loader and load raw_data once for all testing tasks
+    loader = TrainingArtifactLoader(data_base_path)
+    raw_data = loader.load_artifact()
+    logging.info("Successfully loaded raw_data into the testing environment.")
+
+    # 3. Execution Loop
+    logging.info(f"--- Starting processing of {len(target_files)} files ---")
     for pt_file in target_files:
+        logging.info(f"[START] Evaluating file: {os.path.basename(pt_file)}")
         try:
             process_evaluation(
-                pt_file,
-                results_dir,
-                cfg.testing,
+                file_path=pt_file,
+                output_dir=results_dir,
+                testing_cfg=cfg.testing,
+                raw_data=raw_data, # Injecting raw_data here
                 resolved_task_names=resolved_task_names,
             )
-        except ContractError as e:
-            logging.error(f"Contract violation evaluating {os.path.basename(pt_file)}: {str(e)}")
+            logging.info(f"[SUCCESS] Evaluation finished for {os.path.basename(pt_file)}")
+            logging.info("Access testing results in: " + results_dir)
         except Exception as e:
-            logging.error(f"Error evaluando {os.path.basename(pt_file)}: {str(e)}")
+            logging.error(f"[CRITICAL] Evaluation failed for {os.path.basename(pt_file)}: {str(e)}")
             import traceback
             traceback.print_exc()
-
+    # --- MODIFIED SECTION END ---
 
 if __name__ == "__main__":
     main()

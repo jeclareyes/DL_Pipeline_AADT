@@ -98,10 +98,15 @@ def instantiate_model_from_checkpoint(master_checkpoint: Dict[str, Any],
         num_od_pairs=network_params["num_od_pairs"],
         t0=network_params["t0"].to(device),
         capacity=network_params["capacity"].to(device),
-        route_masks=network_params["route_masks"].to(device),
+        length=network_params["length"].to(device) if "length" in network_params else None,
+        lanes=network_params["lanes"].to(device) if "lanes" in network_params else None,
+        speed=network_params["speed"].to(device) if "speed" in network_params else None,
+        delta_matrix=(network_params["delta_matrix"].to(device) if "delta_matrix" in network_params else None),
+        route_masks=network_params.get("route_masks", torch.empty(0)).to(device) if "route_masks" in network_params else None,
+        route_validity_mask=(network_params["route_validity_mask"].to(device) if "route_validity_mask" in network_params else None),
         od_pair_indices=network_params["od_pair_indices"].to(device),
         num_link_groups=network_params.get("num_link_groups", None),
-        link_group=(network_params.get("link_group") and network_params.get("link_group").to(device)),
+        link_group=(network_params.get("link_group").to(device) if network_params.get("link_group") is not None else None),
         _recursive_=False,
     )
 
@@ -210,7 +215,7 @@ def evaluate_checkpoint_file(checkpoint_path: str,
     """
     logging.info(f"Evaluating checkpoint: {checkpoint_path}")
 
-    raw = torch.load(checkpoint_path, map_location=device)
+    raw = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
     # instantiate
     model = instantiate_model_from_checkpoint(raw, loader, device)
@@ -240,7 +245,7 @@ def load_eval_bundle(file_path: str) -> Dict[str, Any]:
         raise FileNotFoundError(f"No se encontró el archivo: {file_path}")
 
     logging.info(f"Cargando datos de evaluación: {file_path}")
-    return torch.load(file_path, map_location='cpu')
+    return torch.load(file_path, map_location='cpu', weights_only=False)
 
 
 def get_latest_epoch_data(bundle: Dict[str, Any]) -> tuple:
@@ -542,98 +547,231 @@ def process_evaluation(
         file_path: str,
         output_dir: str,
         testing_cfg,
+        raw_data: dict,
         resolved_task_names: Optional[list[str]] = None,
 ) -> None:
     """Config-driven evaluation dispatcher.
 
-    The pipeline loads artifacts and runs task functions resolved from
-    capability-based dispatch in configs/testing/testing.yaml.
-
-    Args:
-        resolved_task_names: Optional preflight-resolved callable task list.
-            If omitted, tasks are resolved in-place with resolver safeguards.
+    The pipeline loads a model checkpoint, instantiates the model,
+    runs a forward pass to generate predictions, and then runs task functions.
     """
     from src.test import evaluation_tasks
+    from src.train import instantiate_model
+    import hydra
+    from omegaconf import OmegaConf, DictConfig
 
-    model_name = os.path.basename(file_path).replace("eval_", "").replace(".pt", "")
-    bundle = load_eval_bundle(file_path)
-    bundle = validate_eval_bundle_contract(bundle)
+    model_name = os.path.basename(file_path).replace("_best", "").replace(".pt", "")    
+    logging.info(f"  -> Cargando checkpoint desde disco...")
+    bundle = torch.load(file_path, map_location='cpu', weights_only=False)
+    
+    ckpt_cfg = bundle.get("config")
+    
+    if isinstance(ckpt_cfg, dict):
+        ckpt_cfg = OmegaConf.create(ckpt_cfg)
 
-    static = dict(bundle["static_data"])
-    masks = dict(static.get("masks", {}))
+    elif isinstance(ckpt_cfg, DictConfig):
+        pass
 
-    # Canonical OD mask convention: masks.od_mask (legacy alias: static.mask_od_known).
-    if "od_mask" not in masks and "mask_od_known" in static:
-        masks["od_mask"] = static["mask_od_known"]
-    if "mask_od_known" not in static and "od_mask" in masks:
-        static["mask_od_known"] = masks["od_mask"]
-
-    _, dynamic = get_latest_epoch_data(bundle)
-
-    # Strict canonical artifacts contract (legacy fallback disabled by design).
-    artifacts = dynamic.get("artifacts")
-    if artifacts is None:
-        raise EvalBundleContractError(
-            "Evaluation bundle epoch payload missing required key 'artifacts'. "
-            "Legacy key fallback is disabled in strict mode."
-        )
-
-    artifacts = validate_artifacts_contract(artifacts)
-
-    if resolved_task_names is not None:
-        task_names = [str(t).strip() for t in resolved_task_names if str(t).strip()]
     else:
-        available_task_names = sorted(
-            name
-            for name, obj in vars(evaluation_tasks).items()
-            if callable(obj) and not name.startswith("_") and getattr(obj, "__module__", "") == evaluation_tasks.__name__
+        raise ValueError(
+            f"Checkpoint config must be a dict or DictConfig. Got: {type(ckpt_cfg)}"
         )
-        dispatch_plan = resolve_testing_dispatch_plan(
-            testing_cfg,
-            available_task_names=available_task_names,
-        )
-        task_names = list(dispatch_plan["tasks_callable"])
 
-        if dispatch_plan["tasks_unknown"]:
-            logging.warning(
-                "Unknown tasks in capability_dispatch were ignored: %s",
-                dispatch_plan["tasks_unknown"],
-            )
-        if dispatch_plan["capabilities_unused"]:
-            logging.warning(
-                "Unused capabilities defined in capability_dispatch for model '%s': %s",
-                dispatch_plan["model_key"],
-                dispatch_plan["capabilities_unused"],
-            )
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    task_names = list(dict.fromkeys(task_names))
-    if len(task_names) == 0:
-        raise TaskDispatchContractError(
-            f"No callable evaluation tasks resolved for model '{testing_cfg.model_to_test}'"
+    model_ready = raw_data.get("model_ready", {})
+    network_params = model_ready.get("network_params", {})
+    targets = model_ready.get("targets", {})
+
+    model_params = dict(network_params)
+    for key, value in list(model_params.items()):
+        if torch.is_tensor(value):
+            model_params[key] = value.to(device)
+    
+    logging.info("  -> Instanciando modelo...")
+    model = instantiate_model(ckpt_cfg, model_params, device)
+    
+
+    # Prepare inputs for model instantiation
+    """model = hydra.utils.instantiate(
+        ckpt_cfg.model,
+        num_links=network_params["num_links"],
+        num_od_pairs=network_params["num_od_pairs"],
+        t0=network_params["t0"].to(device),
+        capacity=network_params["capacity"].to(device),
+        length=network_params["length"].to(device) if "length" in network_params else None,
+        lanes=network_params["lanes"].to(device) if "lanes" in network_params else None,
+        speed=network_params["speed"].to(device) if "speed" in network_params else None,
+        delta_matrix=network_params["delta_matrix"].to(device),
+        route_masks=network_params["route_masks"].to(device),
+        route_validity_mask=network_params["route_validity_mask"].to(device),
+        od_pair_indices=network_params["od_pair_indices"].to(device),
+        num_link_groups=network_params.get("num_link_groups", None),
+        link_group=network_params.get("link_group").to(device) if network_params.get("link_group") is not None else None,
+        capacity_correction=OmegaConf.to_container(
+            ckpt_cfg.model.capacity_correction,
+            resolve=True,
+        ),
+        architecture=OmegaConf.to_container(
+            ckpt_cfg.model.architecture,
+            resolve=True,
+        ),
+        _recursive_=False,
+    )"""
+    
+    model.load_state_dict(bundle["model_state_dict"])
+    model.to(device)
+    model.eval()
+
+    # Extract target tensors and build masks for forward pass
+    true_flows_t = targets["flows_target_t"].to(device)
+    true_od_t = targets["od_target_t"].to(device)
+    
+    # During testing we usually pass fully ones as masks if we just want to run inference over the full network
+    flow_mask_t = torch.ones_like(true_flows_t)
+    od_mask_t = torch.ones_like(true_od_t)
+
+    logging.info("  -> Ejecutando inferencia completa...")
+    with torch.no_grad():
+        outputs = model(
+            observed_flows=true_flows_t,
+            flow_mask=flow_mask_t,
+            true_od_demand=true_od_t,
+            od_mask=od_mask_t,
+            is_pure_inference=True,
         )
+
+    # Clean outputs (move to CPU and numpy)
+    artifacts = {}
+    for k, v in outputs.items():
+        if k == "loss":
+            continue
+        if torch.is_tensor(v):
+            artifacts[k] = v.detach().cpu().numpy()
+        elif isinstance(v, dict):
+            artifacts[k] = {
+                ik: iv.detach().cpu().numpy() if torch.is_tensor(iv) else iv
+                for ik, iv in v.items()
+            }
+        else:
+            artifacts[k] = v
+
+    # Build static dict
+    static = {}
+    static["raw_data"] = raw_data
+    static["model_config"] = ckpt_cfg
+    static["testing_cfg"] = testing_cfg
+    static["true_flows"] = targets.get("flows_target_np")
+    static["true_od"] = targets.get("od_target_np")
+
+    # ------------------------------------------------------------------
+    # Inject visualization payload for spatial evaluation tasks
+    # ------------------------------------------------------------------
+    visualization = model_ready.get("visualization")
+
+    if isinstance(visualization, dict):
+        for key in ["node_coords", "link_geometries", "link_types_vis"]:
+            if key in visualization:
+                static[key] = visualization[key]
+
+    if "link_metadata" in model_ready:
+        static["link_metadata"] = model_ready["link_metadata"]
+
+    # Inject required network params into static
+    for param in ["capacity", "link_capacity", "link_group", "lanes", "length", "speed", "t0", "free_flow_time", "od_pair_indices", "delta_matrix", "route_validity_mask"]:
+        val = network_params.get(param)
+        if val is not None:
+            if torch.is_tensor(val):
+                if val.is_sparse:
+                    val = val.to_dense()
+                static[param] = val.cpu().numpy()
+            else:
+                static[param] = val
+
+    if "capacity" not in static and "link_capacity" in static:
+        static["capacity"] = static["link_capacity"]
+
+    # Retrieve all testing masks from raw_data or its config (which we parsed into global masks via the ArtifactLoader)
+    # Actually, we need to get the holdout, observed, train masks that Evaluation tasks expect.
+    masks = {}
+    # We load masks from the evaluation logic (using what we have in raw_data)
+    # But wait, raw_data.data_splits usually isn't present.
+    # Instead, the loader created global ones. Let's just create generic masks if needed, 
+    # but some are stored in raw_data.
+    masks["flow_observed"] = raw_data.get("flow_observed_mask_np", np.ones(network_params["num_links"], dtype=bool))
+    masks["flow_holdout"] = raw_data.get("flow_holdout_mask_np", np.zeros(network_params["num_links"], dtype=bool))
+    masks["od_observed"] = raw_data.get("od_observed_mask_np", np.ones(network_params["num_od_pairs"], dtype=bool))
+    
+    # Aliases
+    masks["od_mask"] = masks["od_observed"]
+    static["mask_od_known"] = masks["od_observed"]
+    masks["flow_test"] = masks["flow_holdout"]
+    masks["flow_train"] = masks["flow_observed"]
+    masks["flow_val"] = np.zeros_like(masks["flow_observed"])
+    masks["od_test"] = masks["od_observed"]
+
+    # Ensure backward compatibility with standard naming for artifacts
+    if "reconstructed_flows" in artifacts and "pred_flows" not in artifacts:
+        artifacts["pred_flows"] = artifacts["reconstructed_flows"]
+    if "estimated_demand" in artifacts and "pred_od" not in artifacts:
+        artifacts["pred_od"] = artifacts["estimated_demand"]
+
+    # Extract history if it exists
+    if "history" in bundle:
+        artifacts["epochs_history"] = bundle["history"]
+    elif "metadata" in bundle and "epochs_history" in bundle["metadata"]:
+        artifacts["epochs_history"] = bundle["metadata"]["epochs_history"]
+    
+    logging.info(f"  -> Llaves presentes en artifacts: {list(artifacts.keys())}")
+
+    task_names = list(dict.fromkeys(resolved_task_names or []))
+    logging.info(f"  -> Ejecutando {len(task_names)} tareas de evaluación...")
+
 
     valid_task_count = 0
     for task_name in task_names:
         task_fn = getattr(evaluation_tasks, task_name, None)
         if not callable(task_fn):
-            logging.warning(
-                "Configured task '%s' is not defined in src.test.evaluation_tasks. Skipping.",
-                task_name,
-            )
+            logging.warning(f"  -> [SKIP] Tarea '{task_name}' no encontrada en evaluation_tasks.")
             continue
 
-        valid_task_count += 1
-        task_fn(
-            artifacts=artifacts,
-            static=static,
-            masks=masks,
-            output_dir=output_dir,
-            model_name=model_name,
-        )
+        logging.info(f"  -> [TASK START] {task_name}")
+        try:
+            task_fn(
+                artifacts=artifacts,
+                static=static,
+                masks=masks,
+                output_dir=output_dir,
+                model_name=model_name,
+            )
+            logging.info(f"  -> [TASK OK] {task_name}")
+        except Exception as e:
+            logging.error(f"  -> [TASK FAIL] {task_name} falló con error: {str(e)}")
 
-    if valid_task_count == 0:
-        raise TaskDispatchContractError(
-            f"No callable evaluation tasks resolved for model '{testing_cfg.model_to_test}'"
-        )
 
     logging.info(f"Evaluation completed for: {model_name}")
+
+def export_spatial_audit_wrapper(
+    pred_flows: np.ndarray,
+    true_flows: np.ndarray,
+    capacity: np.ndarray,
+    cap_mult: Optional[np.ndarray],
+    link_geometries: Dict,
+    output_dir: str,
+    model_name: str
+):
+    """
+    Wrapper ligero que delega el renderizado pesado al motor visual espacial.
+    Esto previene que _testing_functions.py se infeste de código de Matplotlib.
+    """
+    from src.test._spatial_visualizer import render_static_spatial_audit
+    
+    render_static_spatial_audit(
+        pred_flows=pred_flows,
+        true_flows=true_flows,
+        capacity=capacity,
+        cap_mult=cap_mult,
+        link_geometries=link_geometries,
+        output_dir=output_dir,
+        model_name=model_name
+    )

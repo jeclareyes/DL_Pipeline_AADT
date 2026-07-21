@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 @hydra.main(config_path="../../configs", config_name="config", version_base=None)
 def main(cfg: DictConfig) -> None:
     """
-    Build the training artifact from the configured TNTP inputs.
+    Build the base artifact from the configured TNTP inputs.
     """
 
     # Resolve the entire configuration first to prevent InterpolationResolutionError
@@ -43,13 +43,12 @@ def main(cfg: DictConfig) -> None:
     artifact = build_training_artifact(
         cfg=dm_cfg,
         device=str(dm_cfg.device),
-        save=bool(dm_cfg.artifact.save_joblib),
+        save=bool(dm_cfg.artifact.save_joblib or dm_cfg.artifact.save_manifest),
+        artifact_name=str(dm_cfg.output_routes.artifact_filename),
+        manifest_name=str(dm_cfg.output_routes.manifest_filename),
     )
 
-    logger.info(
-        "Training artifact created successfully: %s",
-        artifact["paths"]["artifact_path"],
-    )
+    logger.info("Base artifact creation completed successfully.")
 
 
 if __name__ == "__main__":

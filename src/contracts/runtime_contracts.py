@@ -1,3 +1,5 @@
+# src/contracts/runtime_contracts.py
+
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
@@ -5,6 +7,7 @@ from typing import Any
 
 import torch
 
+#%%%
 
 class ContractError(RuntimeError):
     """Base exception for runtime contract violations."""
@@ -75,6 +78,10 @@ def validate_model_input_contract(train_tensors: Any, val_tensors: Any) -> None:
 
 
 def validate_model_output_contract(outputs: Any) -> Mapping[str, Any]:
+    """
+    Validate the model output contract for training.
+    """
+
     outputs_map = require_keys(
         outputs,
         ["reconstructed_flows", "estimated_demand", "loss"],
@@ -93,6 +100,55 @@ def validate_model_output_contract(outputs: Any) -> Mapping[str, Any]:
         raise ModelOutputContractError(
             f"model outputs.loss.total_loss must be a torch.Tensor, got {type(total_loss)}"
         )
+    return outputs_map
+
+
+def validate_model_inference_output_contract(outputs: Any) -> Mapping[str, Any]:
+    """
+    Validate the minimal output contract required for model inference (testing).
+
+    This contract is intentionally lighter than the training output contract.
+    Evaluation utilities only need reconstructed link flows, and should not
+    require a loss dictionary because loss computation depends on supervision
+    targets that may not be available during hold-out or reconstruction
+    evaluation.
+
+    Required keys
+    -------------
+    - reconstructed_flows
+
+    Parameters
+    ----------
+    outputs : Any
+        Model output object returned by model.forward().
+
+    Returns
+    -------
+    Mapping[str, Any]
+        Validated model output mapping.
+
+    Raises
+    ------
+    ModelOutputContractError
+        If outputs is not mapping-like, if required keys are missing, or if
+        reconstructed_flows is not a torch.Tensor.
+    """
+
+    outputs_map = require_keys(
+        outputs,
+        ["reconstructed_flows"],
+        context="model inference outputs",
+        exc_type=ModelOutputContractError,
+    )
+
+    reconstructed_flows = outputs_map["reconstructed_flows"]
+
+    if not torch.is_tensor(reconstructed_flows):
+        raise ModelOutputContractError(
+            "model inference outputs.reconstructed_flows must be a "
+            f"torch.Tensor, got {type(reconstructed_flows)}"
+        )
+
     return outputs_map
 
 
@@ -177,12 +233,15 @@ def resolve_testing_dispatch_plan(
     capability_names = capabilities_map[model_key]
     if isinstance(capability_names, str):
         capability_names = [capability_names]
+    elif isinstance(capability_names, Mapping):
+        # Support boolean flags to turn capabilities on/off
+        capability_names = [k for k, v in capability_names.items() if v is True]
     elif not isinstance(capability_names, Sequence):
         if hasattr(capability_names, "__iter__"):
             capability_names = list(capability_names)
         else:
             raise TaskDispatchContractError(
-                f"capabilities['{model_key}'] must be a list of capability names"
+                f"capabilities['{model_key}'] must be a list of capability names or a boolean mapping"
             )
 
     capability_list = [str(c).strip() for c in capability_names if str(c).strip()]
