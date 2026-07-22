@@ -1584,10 +1584,13 @@ class VariationalInequalityModel(nn.Module):
         )
 
         # 6. LOSS FUNCTION
+        loss_cfg = dict(loss or {})
+        loss_cfg.pop("link_scale", None)
+        loss_cfg.pop("od_scale", None)
         self.loss_fn = Loss(
             link_scale=self.link_scale,
             od_scale=self.od_scale,
-            **dict(loss or {})
+            **loss_cfg
         )
 
         # 7. INSTANTIATE DELEGATOR
@@ -2834,4 +2837,3 @@ class Loss(nn.Module):
             "l_od": loss_prior_od,
             "l_demand_reg": loss_unknown_regularization,
         }
-

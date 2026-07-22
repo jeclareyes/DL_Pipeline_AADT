@@ -69,7 +69,7 @@ def _build_base_artifact() -> dict[str, object]:
 
 
 def test_asset_manager_materializes_and_reuses_route_set(tmp_path):
-    manifest_path = tmp_path / "training_manifest.json"
+    manifest_path = tmp_path / "base_manifest.json"
     artifact_path = tmp_path / "base_artifact.joblib"
     joblib.dump(_build_base_artifact(), artifact_path)
 

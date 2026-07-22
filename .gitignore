@@ -5,4 +5,13 @@ __pycache__/
 /outputs/
 /multirun/
 /src/data_ingestion/outputs/
+/src/components/dataset_creation/outputs/
 /src/train/outputs/
+/configs/experiments/
+src/components/dataset_creation/.temporal/
+src/components/dataset_creation/TEMPORAL/
+data/processed/
+data/external/
+data/raw/Synthetic*/
+
+

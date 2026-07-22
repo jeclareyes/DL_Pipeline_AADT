@@ -44,7 +44,7 @@ stages:
 
 # Base route (relative to project root) so modules know where to storage/read data
 paths:
-  root_dir: ${hydra:runtime.cwd}
+  root_dir: ${oc.env:PROJECT_ROOT,${hydra:runtime.cwd}}
   logs: ${paths.root_dir}/logs
   data_raw: ${paths.root_dir}/data/raw
   data_interim: ${paths.root_dir}/data/interim

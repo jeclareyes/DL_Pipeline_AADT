@@ -371,7 +371,7 @@ class TrainingRunContextBuilder:
             "dataset.name",
             default=_safe_get(
                 self.cfg,
-                "data_ingestion.data_processing.dataset",
+                "data_ingestion.data_processing.dataset_name",
                 default="dataset",
             ),
         )

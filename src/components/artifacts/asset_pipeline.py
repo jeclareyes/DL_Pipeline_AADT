@@ -51,7 +51,8 @@ class AssetPipeline:
         self.root_config = self._load_config(experiment_config, context="experiment_config")
         self.experiment_config = self._extract_experiment_section(self.root_config)
         self.dataset_profile = load_dataset_profile(self._load_config(dataset_config, context="dataset_config"))
-        self.assets = load_assets_config(self._require_section(self.experiment_config, "assets"))
+        assets_source = self.root_config if "assets" in self.root_config else self.experiment_config
+        self.assets = load_assets_config(self._require_section(assets_source, "assets"))
         self.manifest_path = Path(manifest_path)
         self.base_artifact_path = Path(base_artifact_path) if base_artifact_path is not None else None
 
@@ -139,6 +140,7 @@ class AssetPipeline:
         artifact = builder.pack_artifact(
             raw=base_artifact["raw"],
             processed=base_artifact["processed"],
+            artifact_type="training_artifact",
             model_ready=model_ready,
         )
         validation_result = validate_training_artifact_or_raise(artifact, strict=True)

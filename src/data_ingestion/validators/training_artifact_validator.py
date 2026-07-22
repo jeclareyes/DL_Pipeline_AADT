@@ -5,17 +5,18 @@ from __future__ import annotations
 Training Artifact Validator
 ===========================
 
-This module validates the structural and dimensional consistency of a unified
-training artifact.
+This module validates the structural and dimensional consistency of the base
+artifact and the downstream training artifact.
 
 Project context
 ---------------
-In the AADT / traffic assignment pipeline, TrainingArtifactBuilder produces a
-single training_artifact.joblib file containing:
+In the AADT / traffic assignment pipeline, the data-processing stage produces a
+base artifact and the asset pipeline can materialize a downstream
+training_artifact.joblib file containing:
 
 - raw reader outputs;
 - processed transportation objects;
-- model-ready network tensors;
+- optionally a model-ready layer;
 - flow and OD targets;
 - metadata and reproducibility information.
 
@@ -32,6 +33,13 @@ validated. This validator checks that:
 
 This module does not read TNTP files, build graphs, compute routes, create
 targets, move tensors to devices, or save artifacts.
+
+It supports both artifact flavors:
+
+- `base_artifact`
+  - Must not contain `model_ready`.
+- `training_artifact`
+  - Must contain `model_ready`.
 
 Design principles
 -----------------
@@ -433,9 +441,23 @@ class TrainingArtifactValidator:
         self._validate_raw_structure(artifact)
         self._validate_processed_structure(artifact)
 
+        artifact_type = artifact.get("artifact_type")
         has_model_ready = bool(artifact.get("model_ready"))
-        if has_model_ready:
-            self._validate_model_ready_structure(artifact)
+
+        if artifact_type == "training_artifact":
+            if not has_model_ready:
+                self._add_error(
+                    code="TRAINING_ARTIFACT_MISSING_MODEL_READY",
+                    message="training_artifact must include a non-empty model_ready section.",
+                )
+            else:
+                self._validate_model_ready_structure(artifact)
+        elif artifact_type == "base_artifact":
+            if has_model_ready:
+                self._add_error(
+                    code="BASE_ARTIFACT_HAS_MODEL_READY",
+                    message="base_artifact must not include a model_ready section.",
+                )
 
         if self._errors:
             return self._build_result(artifact)

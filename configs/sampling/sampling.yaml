@@ -7,17 +7,13 @@
 # Uses Hydra interpolation (${...}) to reuse paths defined in data.
 # -----------------------------------------------------------------------------
 input_routes:
-  # General base path (usually 'data/Linköping' or similar)
-  general_route: ${data.base_path}
+  general_route: ${paths.data_processed}/${dataset.name}
 
-  # Graph pickle file (NetworkX). Contains topology and attributes (x, y, type).
-  graph_route: ${input_routes.general_route}/${data.dataset}_graph.pkl
+  graph_route: ${input_routes.general_route}/${dataset.name}_graph.pkl
 
-  # Origin–Destination matrix (ground-truth demand).
-  od_matrix_route: ${input_routes.general_route}/${data.dataset}_od_matrix.npz
+  od_matrix_route: ${input_routes.general_route}/${dataset.name}_od_matrix.npz
 
-  # Link data (table with flows, capacities, etc.).
-  link_data_route: ${input_routes.general_route}/${data.dataset}_link_data.parquet
+  link_data_route: ${input_routes.general_route}/${dataset.name}_link_data.parquet
 
 # -----------------------------------------------------------------------------
 # SAMPLING ENGINE PARAMETERS

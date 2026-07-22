@@ -24,16 +24,26 @@ solver:
   min_iterations: 3
   tol_rel_flow: 0.0005
   use_early_stop: false
-  imd:
-    enabled: false
-    backward_iters: 2
-    # IMD backward can become unstable (oscillation/NaN) on some runs.
-    # If use_damping=true, update is damped as: z <- (1-d)*z + d*(g + J^T z).
-    # Keep this switch in YAML to toggle stability vs. pure JFB without code edits.
-    use_damping: false
-    damping: 0.5
-    stationary_tail_steps: 0
-    warm_start: false
+
+imd:
+  enabled: false
+  backward_iters: 2
+  # IMD backward can become unstable (oscillation/NaN) on some runs.
+  # If use_damping=true, update is damped as: z <- (1-d)*z + d*(g + J^T z).
+  # Keep this switch in YAML to toggle stability vs. pure JFB without code edits.
+  use_damping: false
+  damping: 0.5
+  stationary_tail_steps: 0
+  warm_start: false
+
+od_estimation_policy:
+  anchor_known_od_in_solver: true
+  demand_completion:
+    hidden_dim: 128
+    num_layers: 2
+    dropout: 0.0
+    hard_anchor_known_od: true
+    known_anchor_weight: 0.95
 
 loss:
   _target_: src.components.models.VI_Model.Loss

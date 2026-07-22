@@ -8,7 +8,7 @@ source_format: "tntp"
 
 manifests:
   raw: "data/raw/${dataset.name}/info/dataset_manifest.json"
-  processed_default: "data/processed/${dataset.name}/training_manifest.json"
+  processed_default: "data/processed/${dataset.name}/base_manifest.json"
 
 conventions:
   file_stem: "${dataset.name}"

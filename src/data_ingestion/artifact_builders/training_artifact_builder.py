@@ -5,7 +5,7 @@ from __future__ import annotations
 Training Artifact Builder
 =========================
 
-This module builds a unified base artifact from TNTP-like input files.
+This module builds the base artifact from TNTP-like input files.
 
 Project context
 ---------------
@@ -14,8 +14,8 @@ files for nodes, network, trips, routes and flows. The neural network training
 pipeline should not be responsible for repeatedly parsing these files, merging
 tables, building graphs, preparing targets or adapting routes into tensors.
 
-This builder acts as the bridge between raw TNTP scenario files and the model
-training pipeline.
+This builder acts as the bridge between raw TNTP scenario files and the
+base-artifact layer of the pipeline.
 
 Its main responsibilities are:
 
@@ -33,8 +33,8 @@ Its main responsibilities are:
 Design principles
 -----------------
 - Readers only read raw files.
-- This builder orchestrates the transformation into a training artifact.
-- Training code should load one artifact and train.
+- This builder orchestrates the transformation into a base artifact.
+- Training-ready tensors are materialized later by the asset pipeline.
 - The artifact should preserve raw and processed layers.
 - Tensors are saved on CPU by default for portability.
 """
@@ -65,12 +65,6 @@ from src.data_ingestion.readers.tntp_trips_reader import read_tntp_trips
 from src.data_ingestion.readers.tntp_routes_reader import read_tntp_routes
 
 from src.data_ingestion.adapters.route_model_adapter import RouteModelAdapter
-from src.components.artifacts.fingerprints import (
-    compute_link_order_fingerprint,
-    compute_network_fingerprint,
-    compute_od_space_fingerprint,
-    compute_zone_order_fingerprint,
-)
 from src.utils.serialization import dump
 
 from src.data_ingestion.builders.link_table_builder import build_link_table
@@ -101,7 +95,7 @@ class TrainingArtifactPaths:
 
 class TrainingArtifactBuilder:
     """
-    Build a unified model-training artifact from TNTP files.
+    Build a unified base artifact from TNTP files.
 
     Parameters
     ----------
@@ -116,7 +110,7 @@ class TrainingArtifactBuilder:
     artifact_name : str, default="training_artifact.joblib"
         Name of the output joblib file.
 
-    manifest_name : str, default="training_manifest.json"
+    manifest_name : str, default="base_manifest.json"
         Name of the JSON manifest file.
     """
 
@@ -125,7 +119,7 @@ class TrainingArtifactBuilder:
         cfg: Union[DictConfig, Dict[str, Any]],
         device: str = "cpu",
         artifact_name: str = "training_artifact.joblib",
-        manifest_name: str = "training_manifest.json",
+        manifest_name: str = "base_manifest.json",
     ) -> None:
         self.cfg = cfg
         self.device = device
@@ -414,27 +408,25 @@ class TrainingArtifactBuilder:
 
         raw = self.load_raw()
         processed = self.build_processed(raw)
-        
+
         include_model_ready = bool(self._cfg_get("artifact.include_model_ready_layer"))
         if include_model_ready:
             raise ValueError(
                 "Base artifact construction no longer supports a model_ready layer. "
                 "Set artifact.include_model_ready_layer to false."
             )
-        model_ready = {}
 
         artifact = self.pack_artifact(
             raw=raw,
             processed=processed,
-            model_ready=model_ready,
+            artifact_type="base_artifact",
         )
-
 
         validation_result = validate_training_artifact_or_raise(
-            artifact, 
+            artifact,
             strict=True,
         )
-        
+
         artifact["metadata"]["validation"] = validation_result.summary
 
         if save:
@@ -707,7 +699,8 @@ class TrainingArtifactBuilder:
         self,
         raw: Dict[str, Any],
         processed: Dict[str, Any],
-        model_ready: Dict[str, Any],
+        artifact_type: str = "base_artifact",
+        model_ready: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
         """
         Pack all layers into the final training artifact.
@@ -720,8 +713,13 @@ class TrainingArtifactBuilder:
         processed : Dict[str, Any]
             Processed layer.
 
-        model_ready : Dict[str, Any]
-            Deprecated placeholder retained for compatibility. The base artifact does not include a model-ready layer.
+        artifact_type : str, default="base_artifact"
+            Artifact flavor to store. Use ``base_artifact`` for the output of
+            the data-processing pipeline and ``training_artifact`` for the
+            asset-materialized training bundle.
+
+        model_ready : Dict[str, Any] | None, default=None
+            Optional model-ready payload. The base artifact omits this layer.
 
         Returns
         -------
@@ -730,7 +728,7 @@ class TrainingArtifactBuilder:
         """
 
         artifact = {
-            "artifact_type": "base_artifact",
+            "artifact_type": artifact_type,
             "artifact_version": "1.0",
             "dataset_name": self.dataset_name,
             "created_at": datetime.now().isoformat(),
@@ -747,7 +745,6 @@ class TrainingArtifactBuilder:
             },
             "raw": raw,
             "processed": processed,
-            "model_ready": model_ready,
             "metadata": {
                 "dataset_name": self.dataset_name,
                 "volume_year": self.volume_year,
@@ -756,9 +753,12 @@ class TrainingArtifactBuilder:
                 "trips_aggregation": self.trips_aggregation,
                 "reader_metadata": raw["metadata"],
                 "processed_summary": self._build_processed_summary(processed),
-                "model_ready_summary": self._build_model_ready_summary(model_ready) if model_ready else {},
             },
         }
+
+        if model_ready:
+            artifact["model_ready"] = model_ready
+            artifact["metadata"]["model_ready_summary"] = self._build_model_ready_summary(model_ready)
 
         return artifact
 
@@ -818,6 +818,13 @@ class TrainingArtifactBuilder:
 
     def _build_bundle_manifest(self, artifact: Dict[str, Any]) -> Dict[str, Any]:
         """Build the lightweight artifact-bundle manifest."""
+
+        from src.components.artifacts.fingerprints import (
+            compute_link_order_fingerprint,
+            compute_network_fingerprint,
+            compute_od_space_fingerprint,
+            compute_zone_order_fingerprint,
+        )
 
         processed = artifact["processed"]
         raw = artifact["raw"]
@@ -1332,7 +1339,7 @@ def build_training_artifact(
     device: str = "cpu",
     save: bool = True,
     artifact_name: str = "training_artifact.joblib",
-    manifest_name: str = "training_manifest.json",
+    manifest_name: str = "base_manifest.json",
 ) -> Dict[str, Any]:
     """
     Convenience function to build a training artifact.
