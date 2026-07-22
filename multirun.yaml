@@ -1,0 +1,420 @@
+hydra:
+  run:
+    dir: .
+  sweep:
+    dir: .
+    subdir: .
+  launcher:
+    _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
+  sweeper:
+    _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
+    max_batch_size: null
+    params: null
+  help:
+    app_name: ${hydra.job.name}
+    header: '${hydra.help.app_name} is powered by Hydra.
+
+      '
+    footer: 'Powered by Hydra (https://hydra.cc)
+
+      Use --hydra-help to view Hydra specific help
+
+      '
+    template: '${hydra.help.header}
+
+      == Configuration groups ==
+
+      Compose your configuration from those groups (group=option)
+
+
+      $APP_CONFIG_GROUPS
+
+
+      == Config ==
+
+      Override anything in the config (foo.bar=value)
+
+
+      $CONFIG
+
+
+      ${hydra.help.footer}
+
+      '
+  hydra_help:
+    template: 'Hydra (${hydra.runtime.version})
+
+      See https://hydra.cc for more info.
+
+
+      == Flags ==
+
+      $FLAGS_HELP
+
+
+      == Configuration groups ==
+
+      Compose your configuration from those groups (For example, append hydra/job_logging=disabled
+      to command line)
+
+
+      $HYDRA_CONFIG_GROUPS
+
+
+      Use ''--cfg hydra'' to Show the Hydra config.
+
+      '
+    hydra_help: ???
+  hydra_logging:
+    version: 1
+    formatters:
+      simple:
+        format: '[%(asctime)s][HYDRA] %(message)s'
+    handlers:
+      console:
+        class: logging.StreamHandler
+        formatter: simple
+        stream: ext://sys.stdout
+    root:
+      level: INFO
+      handlers:
+      - console
+    loggers:
+      logging_example:
+        level: DEBUG
+    disable_existing_loggers: false
+  job_logging:
+    version: 1
+    formatters:
+      simple:
+        format: '[%(asctime)s][%(name)s][%(levelname)s] - %(message)s'
+    handlers:
+      console:
+        class: logging.StreamHandler
+        formatter: simple
+        stream: ext://sys.stdout
+      file:
+        class: logging.FileHandler
+        formatter: simple
+        filename: ${hydra.runtime.output_dir}/${hydra.job.name}.log
+    root:
+      level: INFO
+      handlers:
+      - console
+      - file
+    disable_existing_loggers: false
+  env: {}
+  mode: MULTIRUN
+  searchpath: []
+  callbacks: {}
+  output_subdir: .hydra
+  overrides:
+    hydra:
+    - hydra.mode=MULTIRUN
+    task:
+    - +tuning=datadriven
+  job:
+    name: training_pipeline
+    chdir: null
+    override_dirname: +tuning=datadriven
+    id: ???
+    num: ???
+    config_name: config
+    env_set: {}
+    env_copy: []
+    config:
+      override_dirname:
+        kv_sep: '='
+        item_sep: ','
+        exclude_keys: []
+  runtime:
+    version: 1.3.2
+    version_base: '1.3'
+    cwd: /home/jeclareyes/Documents/DL_Pipeline_AADT/DL_Pipeline_AADT
+    config_sources:
+    - path: hydra.conf
+      schema: pkg
+      provider: hydra
+    - path: /home/jeclareyes/Documents/DL_Pipeline_AADT/DL_Pipeline_AADT/configs
+      schema: file
+      provider: main
+    - path: ''
+      schema: structured
+      provider: schema
+    output_dir: ???
+    choices:
+      tuning: datadriven
+      vdf: bpr
+      testing: testing
+      sampling: sampling
+      training: training
+      model: CGAME_DataDriven
+      data_ingestion/data_preprocessing: preprocessing_from_pkl
+      data_ingestion/data_processing: data_processing
+      dataset: Synthetic03
+      hydra/env: default
+      hydra/callbacks: null
+      hydra/job_logging: default
+      hydra/hydra_logging: default
+      hydra/hydra_help: default
+      hydra/help: default
+      hydra/sweeper: basic
+      hydra/launcher: basic
+      hydra/output: default
+  verbose: false
+project_name: DL_Pipeline_AADT
+stages:
+- preprocessing
+- processing
+- training
+- testing
+paths:
+  root_dir: ${hydra:runtime.cwd}
+  logs: ${paths.root_dir}/logs
+  data_raw: ${paths.root_dir}/data/raw
+  data_interim: ${paths.root_dir}/data/interim
+  data_processed: ${paths.root_dir}/data/processed
+  trained_models: ${paths.root_dir}/models
+  outputs: ${paths.root_dir}/outputs
+runs:
+  dir: outputs/runs/${model.model_name}
+data:
+  dataset: Synthetic03
+  base_path: data/processed/${data.dataset}
+  graph_file: ${data.dataset}_graph.pkl
+  link_data_file: ${data.dataset}_link_data.parquet
+  od_matrix_file: ${data.dataset}_od_matrix.npz
+  routing_cache_file: routing_cache/${data.dataset}_kshortest_paths.pkl
+  volume_year: false
+  train_split: 0.8
+  random_seed: 42
+sampling:
+  flow_rate: 0.8
+  od_rate: 1.0
+  strategy: spatial_LHS
+  sampling_basis: traffic_counts_based
+  random_seed: 42
+  output_dir: outputs/masks
+  output_filename: sampled_flow_mask.npy
+network:
+  k_paths: 10
+  max_route_length: 10
+  cost_function: bpr
+  bpr_params:
+    learn_alpha: true
+    learn_beta: true
+    alpha_init: 0.15
+    beta_init: 4.0
+    alpha_bounds:
+    - 0.01
+    - 1.0
+    beta_bounds:
+    - 1.0
+    - 10.0
+data_ingestion:
+  data_processing:
+    dataset: ${data.dataset}
+    multiday_od: true
+    random_seed: 42
+    volume_year: ${data.volume_year}
+    input_routes:
+      general_route: ${paths.data_raw}/${data.dataset}
+      flow_route: ${.general_route}/${data.dataset}_flow.tntp
+      network_route: ${.general_route}/${data.dataset}_net.tntp
+      node_route: ${.general_route}/${data.dataset}_node.tntp
+      routes_route: ${.general_route}/${data.dataset}_routes.tntp
+      trips_route: ${.general_route}/${data.dataset}_trips.tntp
+    output_routes:
+      root: ${paths.root_dir}/data
+      processed_route: ${.root}/processed/${data.dataset}
+      routing_cache_route: ${.root}/processed/${data.dataset}/routing_cache/${data.dataset}_kshortest_paths.pkl
+    route_calculation:
+      k_paths: 10
+      algorithm: yen_astar
+      parallel_mode: true
+      weight: free_flow_time
+      force_recompute: false
+      n_workers: 8
+      chunk_size: 100
+      engine: networkx
+      export_as_dict: true
+  data_preprocessing:
+    pickle_data_path: ${paths.data_raw}/${data.dataset}/pickle/${data.dataset}_Pickle_Data.pkl
+model:
+  _target_: src.components.models.CGAME_DataDriven.CyclicODModel
+  model_name: CGAME_DataDriven
+  architecture:
+    num_structures: 8
+    feature_dim: 512
+    hidden_dim_from_link: 512
+    hidden_dim_to_link: 512
+    hidden_dim_from_od: 1024
+    hidden_dim_to_od: 1024
+    dropout_from_od: 0.0
+    dropout_to_od: 0.0
+    dropout_from_link: 0.0
+  feature_prescaling:
+    link_scale: 1.0
+    od_scale: 1.0
+  loss:
+    _target_: src.components.models.CGAME_DataDriven.Loss
+    w_flow: 1.0
+    w_od: 1.0
+    w_demand_reg: 0.1
+  diagnostics:
+    _target_: src.components.models.CGAME_DataDriven.TrainingDiagnostician
+    history_window: 100
+  vdf_config: ${vdf}
+  num_links: ???
+  num_od_pairs: ???
+  msa_convergence:
+    strategy: hybrid
+    flow_tol: 1.0e-05
+    gap_tol: 0.01
+    min_iters: 5
+    max_iters: 10
+    grad_steps: 3
+    eps: 1.0e-09
+  verbose: true
+training:
+  input_routes:
+    graph: ${data.base_path}/${data.graph_file}
+    route_cache: ${data.base_path}/${data.routing_cache_file}
+    od_matrix: ${data.base_path}/${data.od_matrix_file}
+    link_df: ${data.base_path}/${data.link_data_file}
+  epochs: 100
+  batch_size: 1
+  lr: 0.02
+  weight_decay: 4.5e-05
+  assignment_lr_multiplier: 0.62
+  warmup:
+    enabled: false
+    epochs: 50
+  optimizer: adam
+  scheduler: reduce_on_plateau
+  scheduler_monitor: auto
+  grad_clip_norm: 5.0
+  assignment_grad_clip_norm: 50.0
+  scheduler_params:
+    factor: 0.8
+    patience: 50
+    min_lr: 1.0e-10
+    threshold: 0.01
+    threshold_mode: rel
+    cooldown: 2
+  early_stopping:
+    enabled: false
+    patience: 15
+    min_delta: 0.0001
+    monitor: auto
+  device: cuda
+  metrics_on_training: true
+  strict_data: true
+  scaling_strategy: standard
+  compute_t0_od_cost_prior: false
+  od_initialization:
+    mode: known_mean
+    low_unknown_value: 0.57
+  val_frequency: 5
+  enable_post_training_diagnostics: true
+  checkpoint_retention:
+    max_epochs_history: 300
+  tuning: null
+  k_folds: 1
+input_routes:
+  general_route: ${data.base_path}
+  graph_route: ${input_routes.general_route}/${data.dataset}_graph.pkl
+  od_matrix_route: ${input_routes.general_route}/${data.dataset}_od_matrix.npz
+  link_data_route: ${input_routes.general_route}/${data.dataset}_link_data.parquet
+strategy_params:
+  random_fill: true
+sampling_strategies_routes:
+  random_sampling: src.components.sampling.strategies.random_sampler:RandomStrategy
+  spatial_LHS: src.components.sampling.strategies.spatial_LHS:SpatialLHSStrategy
+testing:
+  root: outputs/runs
+  model_to_test: VI_Model
+  eval_mode:
+    single_model: true
+    instance_to_test: eval_Epochs_300_VDF_bpr_Learning_Rate_0.0004_Flow_Rate_0.8_Strat_spatial_LHS_Basis_traffic_counts_based.pt
+  capabilities:
+    CGAME_DataDriven:
+    - flow_metrics
+    - link_distributions
+    - od_scatter
+    - export_csvs
+    CRAME_DataDriven:
+    - flow_metrics
+    - link_distributions
+    - od_scatter
+    - export_csvs
+    CRAME_DLayer:
+    - flow_metrics
+    - link_distributions
+    - od_scatter
+    - export_csvs
+    CGAME_MLP_SUE:
+    - flow_metrics
+    - link_distributions
+    - od_scatter
+    - export_csvs
+    CGME_MLP_SUE:
+    - flow_metrics
+    - link_distributions
+    - od_scatter
+    - export_csvs
+    VI_Model:
+    - flow_metrics
+    - link_distributions
+    - od_scatter
+    - export_csvs
+  capability_dispatch:
+    flow_metrics:
+    - plot_standard_metrics
+    link_distributions:
+    - plot_link_distributions
+    od_scatter:
+    - plot_od_scatter
+    export_csvs:
+    - export_standard_csvs
+    cgame_penalty:
+    - plot_cgame_penalty
+vdf:
+  _target_: src.components.vdf.bpr.BPRCostFunction
+  learnable_params: true
+  learn_alpha: true
+  learn_beta: true
+  alpha_min: 0.1
+  alpha_max: 0.5
+  beta_min: 1.0
+  beta_max: 6.0
+  alpha_grad_clip: 500.0
+  beta_grad_clip: 500.0
+tuning:
+  hydra:
+    sweeper:
+      sampler:
+        _target_: optuna.samplers.TPESampler
+        seed: 123
+      direction: minimize
+      study_name: traffic_assignment_optimization
+      storage: null
+      n_trials: 500
+      n_jobs: 1
+      params:
+        training.lr: tag(log, interval(0.00001, 0.01))
+        training.weight_decay: interval(1e-6, 1e-3)
+        training.batch_size: choice(1, 2)
+        model.architecture.num_structures: choice(1, 2, 4, 8)
+        model.architecture.hidden_dim_from_link: choice(16, 32, 128,256, 512, 1024)
+        model.architecture.hidden_dim_to_link: choice(16, 32, 128,256, 512, 1024)
+        model.architecture.feature_dim: choice(8, 16, 32, 128,256, 512)
+        model.architecture.dropout_from_od: interval(0.0, 1.0)
+        model.architecture.dropout_from_link: interval(0.0, 1.0)
+        model.architecture.dropout_to_od: interval(0.0, 1.0)
+        model.loss.w_flow: interval(0.1, 10.0, log=True)
+        model.loss.w_od: interval(0.1, 10.0, log=True)
+        model.loss.w_demand_reg: interval(0.01, 1.0, log=True)
+    callbacks:
+      optuna_report:
+        _target_: src.train.callbacks.OptunaReportCallback

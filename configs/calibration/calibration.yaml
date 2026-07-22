@@ -1,0 +1,39 @@
+# configs/calibration/calibration.yaml
+
+# Pipeline para Calibración de Parámetros de Asignación (Alpha/Beta)
+# ====================================================================
+# Este script toma los resultados finales de evaluación (CSVs) y el
+# bundle (.pt) para generar los parámetros calibrados por tipo de enlace.
+
+# Define la acción a tomar:
+# - calibrate_parameters: true -> Corre los métodos iterativos (Logit/Mirror)
+#   para encontrar los mejores Alpha y Beta. (Usar con CGAME_DataDriven)
+# - calibrate_parameters: false -> Extrae directamente los parámetros Alpha/Beta
+#   aprendidos por el modelo y los guarda. (Usar con VI_Model)
+calibrate_parameters: true
+
+id_model: "65905562" 
+
+# 65905562 (CGAME_DataDriven) | 77d9b042 (VI_Model)
+
+# Configuración de los archivos de entrada (resultados del modelo)
+inputs:
+  eval_bundle_path: "outputs/models/${id_model}/*eval.pt"  # Cambiar por la ruta real a eval_bundle.pt
+  flows_csv_path: "outputs/diagnostics/${id_model}/training/estimated_vs_real_flows.csv"  # Cambiar por ruta real 
+  demand_csv_path: "outputs/diagnostics/${id_model}/training/estimated_vs_real_demand.csv" # Cambiar por ruta real
+
+# Configuración de salida
+outputs:
+  output_csv_path: null  # Si es null, se guarda como calibrated_link_type_assignment.csv en el mismo folder que flows_csv_path
+
+# Parámetros del entorno de ejecución
+hardware:
+  device: "cpu" # "cpu" o "cuda"
+
+# Configuración específica en caso de calibrate_parameters: true
+tuner:
+  # Rango de parámetros de las curvas de costo BPR a explorar
+  alpha_min: 0.1
+  alpha_max: 0.8
+  beta_min: 1.0
+  beta_max: 6.0

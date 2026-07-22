@@ -1,0 +1,93 @@
+hydra:
+  job:
+    chdir: False
+
+defaults:
+  - base_config # It tells hydra: Use DatasetConfig from Python as the base schema
+                # for configuration
+  - datasets@_global_: Synthetic05
+  - _self_  # Represents this file
+
+  # The position of `_self_` determines the order in which configuration files
+  # are loaded. If `_self_` appears first in the `defaults` list, this file
+  # (`config/config.yaml`) is loaded first, and any configuration loaded
+  # afterward can override its values. If `_self_` appears last, this file is
+  # loaded last, so its values take precedence over those from previously loaded
+  # configuration files.
+
+  # Using `@` changes where the configuration is inserted in the final composed
+  # config. For example, `datasets@dataset: Synthetic05` places the contents of
+  # `Synthetic05.yaml` under the `dataset` key, so its fields must be accessed as
+  # `dataset.name`, `dataset.NodeParameters`, etc.
+  #
+  # Using `datasets@_global_: Synthetic05` instead places the contents directly at
+  # the root of the composed configuration, alongside the fields defined in
+  # `config.yaml`. In this case, fields are accessed directly (e.g. `name` instead
+  # of `dataset.name`).
+
+# ============================================
+# DATASET TO CREATE
+# ============================================
+
+# Nombre del dataset que se va a crear.
+# Debe coincidir con el nombre del fichero YAML que contiene
+# la configuración específica del escenario.
+
+dataset_to_create: "Synthetic05" # Escribir el nombre del escenario sin el '.yaml'
+
+# En esta composición el nombre activo coincide con el dataset seleccionado.
+name: ${dataset_to_create}
+# nature: "synthetic"
+
+# ============================================
+# RUTAS BASE DEL COMPONENTE
+# ============================================
+
+paths:
+  # Toma PROJECT_ROOT de las variables de entorno; si no está definida,
+  # usa el directorio de trabajo actual de Hydra como valor de respaldo.
+  root_dir: ${oc.env:PROJECT_ROOT,.}
+
+  folder_names:
+    raw: "raw"
+    info: "info"
+
+  file_names:
+    nodes: "${name}_nodes.tntp"
+    network: "${name}_network.tntp"
+    trips: "${name}_trips.tntp"
+    routes: "${name}_routes.tntp"
+    flows: "${name}_flows.tntp"
+    info: "scenario_manifest.json"
+
+  export_dirs:
+    generated_dataset: ${paths.root_dir}/data/${paths.folder_names.raw}/${name}
+    info_dataset: ${paths.export_dirs.generated_dataset}/info
+
+  export_filepaths:
+    nodes: "${paths.export_dirs.generated_dataset}/${paths.file_names.nodes}"
+    network: "${paths.export_dirs.generated_dataset}/${paths.file_names.network}"
+    trips: "${paths.export_dirs.generated_dataset}/${paths.file_names.trips}"
+    routes: "${paths.export_dirs.generated_dataset}/${paths.file_names.routes}"
+    flows: "${paths.export_dirs.generated_dataset}/${paths.file_names.flows}"
+    info: "${paths.export_dirs.info_dataset}/${paths.file_names.info}"
+
+
+# ============================================
+# FLAG DE PROTECCIÓN CONTRA SOBREESCRITURA
+# ============================================
+
+# Si es false, el pipeline no sobreescribirá archivos de escenarios ya existentes 
+# y lanzará advertencia para que el usuario elija otro nombre o realmente confirme 
+# que quiere sobreescribir el escenario
+overwrite_existing: true
+
+# ============================================
+# NÚMERO DE DECIMALES
+# ============================================
+
+# Número de decimales a utilizar en cada campo
+num_decimals:
+  coordinates: 0
+  demand: 0
+  flows: 1

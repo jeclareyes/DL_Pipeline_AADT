@@ -1,0 +1,18 @@
+id: fft_k10_sue_msa
+asset_type: assignment_set
+
+requires:
+  spec_id: fft_k20
+  k_active: 10
+
+behavior_model:
+  name: SUE
+  theta: 2.0
+
+solver:
+  name: MSA
+  max_iterations: 1000
+  convergence_gap: 1e-4
+
+vdf:
+  name: bpr

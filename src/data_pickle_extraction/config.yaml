@@ -1,0 +1,112 @@
+# src/data_pickle_extraction/config.yaml
+
+# ESTA CONFIGURACIÓN NO DEEBE USARSE EN NINGÚN OTRO SCRIPT.
+# ESTA ESTÁ DISEÑADA ÚNICAMENTE PARA EXTRAER DATOS DE ARCHIVOS PICKLES
+# PREVIAMENTE GENERADOS Y CONVERTIRLOS EN FORMATO TNTP PARA SU USO 
+# POSTERIOR EN EL PIPELINE DE ENTRENAMIENTO Y TESTING.
+
+scenario:
+  name: "Linköping"
+  start_date: "2022-01-01"
+  entries_per_line: 6
+
+paths:
+  input:
+    graph_path: "data/processed/Linköping/Linköping_graph.pkl"
+    link_data_path: "data/processed/Linköping/Linköping_link_data.parquet"
+    od_matrix_path: "data/processed/Linköping/Linköping_od_matrix.npz"
+
+  output:
+    root: "data/raw/Linköping"
+    info_dir: "data/raw/Linköping/info"
+
+    nodes_filepath: "data/raw/Linköping/Linköping_nodes.tntp"
+    network_filepath: "data/raw/Linköping/Linköping_network.tntp"
+    trips_filepath: "data/raw/Linköping/Linköping_trips.tntp"
+    routes_filepath: "data/raw/Linköping/Linköping_routes.tntp"
+    flows_filepath: "data/raw/Linköping/Linköping_flows.tntp"
+
+    manifest_filepath: "data/raw/Linköping/info/reconstruction_manifest.json"
+
+defaults:
+  bpr_b: -1
+  bpr_power: -1
+  toll: 0.0
+  missing_reverse_link_id: -1
+
+trips:
+  export_format: "single_static_matrix" # single_static_matrix | average_day_hourly
+  aggregation: "mean_over_days"
+  start_date: "2022-01-01"
+  hours_per_day: 24
+
+routes:
+  export: true
+  k_routes: 10
+  weight: "free_flow_time"
+
+  # Intrazonales
+  allow_intrazonal: true
+  intrazonal_policy: "cycle" # ["cycle" "zero length"] significa que, para un par A -> A, no se devuelve simplemente [A], sino que se buscan ciclos reales tipo A -> B -> C -> A.
+
+  # Rutas
+  allow_loops: false
+  require_exact_k_routes: false # hace que el script falle si algún par OD no alcanza las 10 rutas.
+  
+    # Ejecución
+  show_progress: true
+
+  # Paralelización de rutas
+  parallel: true # true | null
+  parallel_workers: null
+  od_batch_size: 10 # significa que cada proceso recibe bloques de X pares OD
+
+validation:
+  reverse_attribute_excluded_columns:
+  # Volume Related
+    - volume
+    - flow
+    - AADT
+
+  # Others
+    - vdf
+    - VDF
+    - length
+    - free_flow_time
+
+    - from_node
+    - to_node
+
+    - link_pos
+
+    - reverse
+    - reverse_link_id
+
+    - forward
+    - forward_row
+    - forward_value
+
+    - link_id
+  reverse_attribute_excluded_prefixes:
+    - Volume_
+    - volume_
+    - Flow_
+    - flow_
+    - AADT_
+    - aadt_
+
+  reverse_attribute_symmetry:
+    excluded_columns:
+      - from_node
+      - to_node
+      - link_pos
+      - link_id
+      - reverse_link_pos
+      - reverse_link_id
+      - volume
+      - flow
+      - flows
+      - aadt
+      - AADT
+      - adt
+      - ADT

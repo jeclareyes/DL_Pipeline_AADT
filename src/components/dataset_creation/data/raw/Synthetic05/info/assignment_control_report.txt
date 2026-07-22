@@ -1,0 +1,11 @@
+ASSIGNMENT CONTROL REPORT
+================================================================================
+Scenario: Synthetic05
+Number of alerts: 0
+
+Control thresholds:
+- Global demand balance: abs <= 1.0, rel <= 0.0001
+- Zone node balance: abs <= 1.0, rel <= 0.0001
+- Non-zone node balance: abs <= 1.0, rel <= 0.0001
+
+All assignment control checks passed.

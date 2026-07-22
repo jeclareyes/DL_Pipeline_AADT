@@ -1,0 +1,259 @@
+# Full route-based assignment configuration.
+#
+# This file is intended to live at:
+#   configs/assignment/assignment.yaml
+#
+# Design rules:
+# - No implicit defaults are assumed by Python code.
+# - No compatibility aliases are allowed.
+# - assignment_configs.py validates every section with exact-key checks.
+# - Assignment states are represented in route space.
+# - Link flows are always derived from route flows through RouteSet.
+#
+# Supported behavior-model / solver combinations:
+#   route_based_user_equilibrium + msa
+#   route_based_user_equilibrium + frank_wolfe
+#   route_based_user_equilibrium + gradient_projection
+#   stochastic_user_equilibrium + msa
+#
+# Not supported yet:
+#   stochastic_user_equilibrium + frank_wolfe
+#   stochastic_user_equilibrium + gradient_projection
+
+behavior_model:
+  # Allowed values:
+  #   explicit
+  #   training_config
+  #
+  # NOTE:
+  # Resolving the behavior model from training_config is intentionally not
+  # implemented yet in assignment_configs.py. Use source: explicit for now.
+  source: explicit
+
+  # Required when source: explicit.
+  # Must be null when source: training_config.
+  # Allowed explicit values:
+  #   route_based_user_equilibrium
+  #   stochastic_user_equilibrium
+  name: stochastic_user_equilibrium
+
+common:
+  # Maximum number of assignment iterations for the selected behavior model.
+  max_iterations: 5000
+
+  capacity_scaling:
+    # Allowed values:
+    #   explicit
+    #   training_config
+    source: explicit
+
+    # Required when source: explicit.
+    # Must be null when source: training_config.
+    value: 1.0
+
+    # Required when source: training_config.
+    # Must be null when source: explicit.
+    training_config_path: null
+
+cost_function:
+  # Currently supported VDF.
+  # Allowed values:
+  #   bpr
+  #   conical
+  #   akcelik
+  vdf_name: bpr
+
+  # Link free-flow travel time column.
+  free_flow_time_col: free_flow_time
+
+  # Physical capacity column used by the assignment model. In the modern
+  # pipeline this is the effective_capacity already computed upstream.
+  capacity_col: effective_capacity
+
+  # Use null only when toll_required is false and the intended policy is zero toll.
+  toll_col: null
+  toll_required: false
+
+  # VDF-specific parameter columns. Keys are logical parameter names and values
+  # are the concrete link-table columns used by the selected VDF.
+  parameters_cols:
+    alpha_col: b
+    beta_col: power
+
+route_set:
+  # Allowed values:
+  #   node_sequence
+  #   link_sequence
+  route_input_format: node_sequence
+
+  # Canonical link-table columns used to build and validate RouteSet.
+  link_id_col: link_id
+  init_node_col: init_node
+  term_node_col: term_node
+
+  # Static route-cost column used during RouteSet preparation.
+  route_cost_col: free_flow_time
+
+  # Strict route-set validation policies.
+  fail_on_duplicate_routes: true
+  fail_on_empty_route_set: true
+  fail_on_missing_od_routes: true
+
+  # Keep this false if explicit intrazonal loop routes can repeat the origin node.
+  # Set it true only when all routes are standard simple paths.
+  require_simple_node_routes: false
+
+  require_unique_link_ids: true
+  require_unique_directed_edges: true
+
+solvers:
+  # Active full route-based solver.
+  # Allowed values:
+  #   msa
+  #   frank_wolfe
+  #   gradient_projection
+  #
+  # This must match the expected_solver of the selected behavior model.
+  active_solver: msa
+
+  msa:
+    # Allowed values:
+    #   1_over_n
+    #   1_over_n_plus_1
+    #   hybrid_adaptive_gap
+    step_rule: hybrid_adaptive_gap
+
+    # if hybrid_adaptive_gap is True, the following parameters will inject
+    initial_step_size: 0.25
+    minimum_step_size: 0.001
+    maximum_step_size: 0.75
+    improvement_tolerance: 0.001
+    increase_factor: 1.05
+    decrease_factor: 0.50
+    hybrid_harmonic_weight: 1.0
+
+  frank_wolfe:
+    # Currently supported line-search method.
+    # Allowed values:
+    #   bisection
+    line_search_method: bisection
+    tolerance: 1.0e-5
+    max_bisection_iterations: 40
+
+  gradient_projection:
+    # Allowed values:
+    #   constant
+    #   1_over_n
+    #   sqrt
+    #   scaled_sqrt
+    step_rule: scaled_sqrt
+
+    # Positive base step size before optional cost scaling and clipping.
+    base_step_size: 5.0
+
+    # Allowed values:
+    #   simplex
+    projection_method: simplex
+
+    # Allowed values:
+    #   none
+    #   mean_abs_route_cost
+    cost_scaling: mean_abs_route_cost
+
+    # Explicit clipping bounds for the effective route-flow step size.
+    minimum_step_size: 1.0e-5
+    maximum_step_size: 0.50
+
+    # Feasibility tolerance for OD demand conservation after projection.
+    demand_tolerance: 1.0e-6
+
+route_based_user_equilibrium:
+  convergence:
+    # Deterministic UE relative-gap threshold.
+    relative_gap_threshold: 5.0e-4
+
+    # Minimum number of iterations before convergence can be accepted.
+    minimum_iterations: 2
+
+    # Tolerance for detecting degenerate zero-cost assignments.
+    zero_total_cost_tolerance: 1.0e-12
+
+  initialization:
+    # Allowed values:
+    #   free_flow_shortest
+    #   uniform
+    policy: free_flow_shortest
+
+  policy:
+    # If true, positive-demand OD pairs without candidate routes raise an error.
+    fail_on_missing_routes: false
+
+    # If true, any skipped positive-demand OD pair raises an error.
+    fail_on_skipped_od_pairs: false
+
+    # Allowed values:
+    #   raise
+    #   skip_and_report
+    #   assign_if_routes_exist
+    intrazonal_policy: skip_and_report
+
+    # Must match solvers.active_solver when behavior_model.name is
+    # route_based_user_equilibrium.
+    #
+    # Examples:
+    #   active_solver: msa                 -> expected_solver: msa
+    #   active_solver: frank_wolfe         -> expected_solver: frank_wolfe
+    #   active_solver: gradient_projection -> expected_solver: gradient_projection
+    expected_solver: gradient_projection
+
+stochastic_user_equilibrium:
+  convergence:
+    # Fixed-point convergence thresholds for SUE.
+    equilibrium_l1_threshold: 20.0
+    max_absolute_gap_threshold: 2.0
+    max_relative_gap_threshold: 1.0e-3
+    min_flow_for_relative_gap: 1.0
+    minimum_iterations: 5
+
+  logit:
+    # Allowed values:
+    #   explicit
+    #   artifact
+    theta_source: artifact
+
+    # Required when theta_source: explicit.
+    # Must be null when theta_source: artifact.
+    theta_value: null
+
+    # Required when theta_source: artifact.
+    # Must be null when theta_source: explicit.
+    theta_artifact_key: learned_theta
+
+    # Fail if Logit probabilities become non-finite, negative, or do not sum to one.
+    fail_on_invalid_probability: true
+
+  policy:
+    fail_on_missing_routes: false
+    fail_on_skipped_od_pairs: false
+
+    # Allowed values:
+    #   raise
+    #   skip_and_report
+    #   assign_if_routes_exist
+    intrazonal_policy: skip_and_report
+
+    # Must be msa for the current SUE fixed-point implementation.
+    expected_solver: msa
+
+# Legacy section kept because AssignmentConfig still expects exact top-level keys.
+# It is not part of the active full route-based refactor unless explicitly selected.
+graph_based_user_equilibrium:
+  convergence:
+    relative_gap_threshold: 0.001
+    minimum_iterations: 1
+    zero_total_cost_tolerance: 1.0e-9
+
+  policy:
+    fail_on_skipped_od_pairs: false
+    intrazonal_policy: skip_and_report
+    graph_weight_attribute: weight
