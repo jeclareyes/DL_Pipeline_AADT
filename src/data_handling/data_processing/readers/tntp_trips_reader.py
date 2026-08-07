@@ -1,4 +1,4 @@
-# src/data_ingestion/readers/tntp_trips_reader.py
+# src/data_handling/readers/tntp_trips_reader.py
 
 """
 TNTP Trips Reader

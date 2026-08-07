@@ -1,4 +1,4 @@
-# src/data_ingestion/builders/graph_builder.py
+# src/data_handling/builders/graph_builder.py
 from __future__ import annotations
 
 
@@ -52,7 +52,7 @@ Design principles
 
 from dataclasses import dataclass
 import logging
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 import networkx as nx
 import numpy as np
@@ -103,17 +103,12 @@ class GraphBuilder:
         If True, missing node attributes, duplicated directed links or links
         referencing unknown nodes raise errors.
 
-    add_missing_link_nodes : bool, default=False
-        If True, nodes referenced by links but missing in node_df are added to
-        the graph with empty attributes. If False and strict=True, this raises
-        an error.
-
     preserve_extra_attributes : bool, default=True
         If True, all columns in link_df and node_df are preserved as edge and
         node attributes.
 
-    weight_column : str, default="free_flow_time"
-        Edge attribute used as the default route-search weight downstream.
+    weight_column : str
+        Edge attribute used as the route-search weight downstream.
         This builder only stores the attribute; it does not compute routes.
     """
 
@@ -145,7 +140,6 @@ class GraphBuilder:
         "vdf",
         "toll",
         "link_type",
-        "volume",
         "cost",
         "has_flow_record",
     ]
@@ -159,15 +153,19 @@ class GraphBuilder:
 
     def __init__(
         self,
+        weight_column: str,
         strict: bool = True,
-        add_missing_link_nodes: bool = False,
         preserve_extra_attributes: bool = True,
-        weight_column: str = "free_flow_time",
+        zone_node_ids: Sequence[int] | None = None,
     ) -> None:
         self.strict = bool(strict)
-        self.add_missing_link_nodes = bool(add_missing_link_nodes)
         self.preserve_extra_attributes = bool(preserve_extra_attributes)
         self.weight_column = str(weight_column)
+        self.zone_node_ids = (
+            {int(node_id) for node_id in zone_node_ids}
+            if zone_node_ids is not None
+            else None
+        )
 
     def build(
         self,
@@ -417,7 +415,7 @@ class GraphBuilder:
 
         missing_nodes = sorted(link_nodes - known_nodes)
 
-        if missing_nodes and not self.add_missing_link_nodes:
+        if missing_nodes:
             message = (
                 "Some link endpoints are missing from node_df. "
                 f"missing_nodes_sample={missing_nodes[:20]} | "
@@ -428,12 +426,6 @@ class GraphBuilder:
                 raise ValueError(message)
 
             logger.warning(message)
-
-        elif missing_nodes and self.add_missing_link_nodes:
-            logger.warning(
-                "Adding %d nodes referenced by links but missing in node_df.",
-                len(missing_nodes),
-            )
 
     # ------------------------------------------------------------------
     # Graph construction
@@ -792,11 +784,25 @@ class GraphBuilder:
             for node_id, idx in node_id_to_idx.items()
         }
 
-        zone_ids = [
-            int(node)
-            for node, data in graph.nodes(data=True)
-            if self._is_zone_node(data)
-        ]
+        if self.zone_node_ids is None:
+            zone_ids = [
+                int(node)
+                for node, data in graph.nodes(data=True)
+                if self._is_zone_node(data)
+            ]
+        else:
+            graph_node_ids = {int(node) for node in graph.nodes()}
+            missing_zone_nodes = self.zone_node_ids.difference(graph_node_ids)
+            if missing_zone_nodes:
+                raise ValueError(
+                    "Configured OD zone nodes are absent from the graph: "
+                    f"{sorted(missing_zone_nodes)}"
+                )
+            zone_ids = [
+                int(node)
+                for node in graph.nodes()
+                if int(node) in self.zone_node_ids
+            ]
 
         non_zone_ids = [
             int(node)
@@ -900,8 +906,6 @@ class GraphBuilder:
             "largest_strong_component_size": int(max((len(c) for c in strongly_components), default=0)),
             "num_isolated_nodes": int(len(isolated_nodes)),
             "isolated_nodes_sample": isolated_nodes[:20],
-            "edge_order_source": "link_df_row_order",
-            "node_order_source": "node_df_row_order_plus_missing_link_nodes_if_any",
             "has_link_id_index": bool(len(edge_indexing["link_id_to_idx"]) > 0),
             "weight_column": self.weight_column,
         }
@@ -1073,10 +1077,10 @@ class GraphBuilder:
 def build_graph(
     link_df: pd.DataFrame,
     node_df: pd.DataFrame,
+    weight_column: str,
     strict: bool = True,
-    add_missing_link_nodes: bool = False,
     preserve_extra_attributes: bool = True,
-    weight_column: str = "free_flow_time",
+    zone_node_ids: Sequence[int] | None = None,
 ) -> GraphBuildResult:
     """
     Convenience function to build a directed NetworkX graph.
@@ -1092,14 +1096,11 @@ def build_graph(
     strict : bool, default=True
         Whether to use strict validation behavior.
 
-    add_missing_link_nodes : bool, default=False
-        Whether to add link endpoint nodes missing from node_df.
-
     preserve_extra_attributes : bool, default=True
         Whether to preserve extra DataFrame columns as graph attributes.
 
-    weight_column : str, default="free_flow_time"
-        Default edge weight attribute used downstream.
+    weight_column : str
+        Edge weight attribute used downstream.
 
     Returns
     -------
@@ -1109,9 +1110,9 @@ def build_graph(
 
     builder = GraphBuilder(
         strict=strict,
-        add_missing_link_nodes=add_missing_link_nodes,
         preserve_extra_attributes=preserve_extra_attributes,
         weight_column=weight_column,
+        zone_node_ids=zone_node_ids,
     )
 
     return builder.build(

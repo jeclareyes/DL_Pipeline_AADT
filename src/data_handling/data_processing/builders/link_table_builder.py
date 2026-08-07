@@ -1,4 +1,4 @@
-# src/data_ingestion/builders/link_table_builder.py
+# src/data_handling/builders/link_table_builder.py
 
 """
 Link Table Builder
@@ -48,6 +48,8 @@ from typing import Any, Dict, Iterable, Tuple
 
 import numpy as np
 import pandas as pd
+
+from src.utils.flow_columns import FlowColumnContract
 
 
 logger = logging.getLogger(__name__)
@@ -114,7 +116,6 @@ class LinkTableBuilder:
     REQUIRED_FLOW_COLUMNS = {
         "from_node",
         "to_node",
-        "volume",
     }
 
     CANONICAL_LINK_ORDER = [
@@ -132,7 +133,6 @@ class LinkTableBuilder:
         "vdf",
         "toll",
         "link_type",
-        "volume",
         "cost",
     ]
 
@@ -144,9 +144,11 @@ class LinkTableBuilder:
         preserve_extra_flow_columns: bool = True,
         aggregate_duplicate_flows: bool = True,
         duplicate_flow_aggregation: str = "mean",
+        flow_columns: FlowColumnContract | None = None,
     ) -> None:
         self.strict = bool(strict)
         self.preserve_extra_flow_columns = bool(preserve_extra_flow_columns)
+        self.flow_columns = flow_columns
         self.aggregate_duplicate_flows = bool(aggregate_duplicate_flows)
         self.duplicate_flow_aggregation = str(duplicate_flow_aggregation)
 
@@ -316,6 +318,13 @@ class LinkTableBuilder:
 
         flows = flow_df.copy()
 
+        declared = self.flow_columns.all_declared() if self.flow_columns else ()
+        if not any(column in flows.columns for column in declared):
+            raise ValueError(
+                "flow_df does not contain any declared flow column. "
+                f"Expected one of {list(declared)}."
+            )
+
         flows["from_node"] = pd.to_numeric(
             flows["from_node"],
             errors="coerce",
@@ -348,10 +357,9 @@ class LinkTableBuilder:
         flows["from_node"] = flows["from_node"].astype(int)
         flows["to_node"] = flows["to_node"].astype(int)
 
-        flows["volume"] = pd.to_numeric(
-            flows["volume"],
-            errors="coerce",
-        )
+        for column in declared:
+            if column in flows.columns:
+                flows[column] = pd.to_numeric(flows[column], errors="coerce")
 
         if "cost" in flows.columns:
             flows["cost"] = pd.to_numeric(
@@ -547,9 +555,6 @@ class LinkTableBuilder:
         link_df["has_flow_record"] = link_df["_merge"].eq("both")
         link_df = link_df.drop(columns=["_merge"])
 
-        if "volume" not in link_df.columns:
-            link_df["volume"] = np.nan
-
         return link_df
 
     def _select_flow_columns_for_merge(self, flow_df: pd.DataFrame) -> list[str]:
@@ -567,7 +572,13 @@ class LinkTableBuilder:
             Columns to merge.
         """
 
-        required = ["init_node", "term_node", "volume"]
+        required = ["init_node", "term_node"]
+        if self.flow_columns is not None:
+            required.extend(
+                column
+                for column in self.flow_columns.all_declared()
+                if column in flow_df.columns
+            )
 
         optional = []
 
@@ -620,7 +631,6 @@ class LinkTableBuilder:
             "power",
             "speed",
             "toll",
-            "volume",
             "cost",
         ]
 
@@ -713,7 +723,7 @@ class LinkTableBuilder:
 
         self._require_columns(
             df=link_df,
-            required_columns=self.REQUIRED_NETWORK_COLUMNS | {"volume"},
+            required_columns=self.REQUIRED_NETWORK_COLUMNS,
             df_name="link_df",
         )
 
@@ -752,8 +762,10 @@ class LinkTableBuilder:
         if (link_df["free_flow_time"] < 0).any():
             raise ValueError("link_df contains links with free_flow_time < 0.")
 
-        if (link_df["volume"].dropna() < 0).any():
-            raise ValueError("link_df contains negative observed volumes.")
+        if self.flow_columns is not None:
+            for column in self.flow_columns.all_declared():
+                if column in link_df.columns and (link_df[column].dropna() < 0).any():
+                    raise ValueError(f"link_df contains negative values in {column!r}.")
 
     def _build_metadata(
         self,
@@ -785,7 +797,19 @@ class LinkTableBuilder:
             Link-table metadata.
         """
 
-        observed_mask = link_df["volume"].notna()
+        observed_column = next(
+            (
+                column
+                for column in (self.flow_columns.traffic_counts if self.flow_columns else ())
+                if column in link_df.columns
+            ),
+            None,
+        )
+        observed_mask = (
+            link_df[observed_column].notna()
+            if observed_column is not None
+            else pd.Series(False, index=link_df.index)
+        )
 
         flow_key_set = set(
             zip(
@@ -822,7 +846,11 @@ class LinkTableBuilder:
             "columns": link_df.columns.tolist(),
         }
 
-        observed_volume = link_df.loc[observed_mask, "volume"]
+        observed_volume = (
+            link_df.loc[observed_mask, observed_column]
+            if observed_column is not None
+            else pd.Series(dtype=float)
+        )
 
         if len(observed_volume) > 0:
             metadata.update(
@@ -936,6 +964,7 @@ def build_link_table(
     preserve_extra_flow_columns: bool = True,
     aggregate_duplicate_flows: bool = True,
     duplicate_flow_aggregation: str = "mean",
+    flow_columns: FlowColumnContract | None = None,
 ) -> LinkTableBuildResult:
     """
     Convenience function to build the canonical link table.
@@ -971,6 +1000,7 @@ def build_link_table(
         preserve_extra_flow_columns=preserve_extra_flow_columns,
         aggregate_duplicate_flows=aggregate_duplicate_flows,
         duplicate_flow_aggregation=duplicate_flow_aggregation,
+        flow_columns=flow_columns,
     )
 
     return builder.build(

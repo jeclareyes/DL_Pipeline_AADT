@@ -6,23 +6,6 @@ from typing import Optional, List, Dict, Union, Any
 # -----------------------------------------------------------------------------
 
 @dataclass
-class InputRoutesConfig:
-    general_route: str
-    node_route: str
-    network_route: str
-    trips_route: str
-    routes_route: str
-    flow_route: str
-
-@dataclass
-class OutputRoutesConfig:
-    processed_route: str
-    artifact_filename: str
-    manifest_filename: str
-    overwrite_existing: bool = True
-    save_manifest: bool = True
-
-@dataclass
 class NodeReaderConfig:
     strict: bool = True
     preserve_extra_columns: bool = True
@@ -43,9 +26,6 @@ class NetworkReaderConfig:
 class FlowReaderConfig:
     strict: bool = True
     preserve_extra_columns: bool = True
-    volume_column: Optional[str] = None
-    volume_year: str = "all"
-    preserve_missing_volumes_as_nan: bool = True
 
 @dataclass
 class TripReaderConfig:
@@ -78,14 +58,12 @@ class LinkTableConfig:
     preserve_extra_flow_columns: bool = True
     aggregate_duplicate_flows: bool = True
     duplicate_flow_aggregation: str = "mean"
-    preserve_missing_volume_as_nan: bool = True
 
 @dataclass
 class GraphBuilderConfig:
+    dataset_weight_column: str
     strict: bool = True
-    add_missing_link_nodes: bool = False
     preserve_extra_attributes: bool = True
-    weight_column: str = "free_flow_time"
     store_edge_endpoints_as_attributes: bool = True
     edge_order_source: str = "link_df_row_order"
     node_order_source: str = "node_df_row_order"
@@ -139,8 +117,6 @@ class DebugConfig:
 @dataclass
 class DataProcessingConfig:
     description: str = ""
-    input_routes: InputRoutesConfig = field(default_factory=InputRoutesConfig)
-    output_routes: OutputRoutesConfig = field(default_factory=OutputRoutesConfig)
     readers: ReadersConfig = field(default_factory=ReadersConfig)
     link_table: LinkTableConfig = field(default_factory=LinkTableConfig)
     graph: GraphBuilderConfig = field(default_factory=GraphBuilderConfig)

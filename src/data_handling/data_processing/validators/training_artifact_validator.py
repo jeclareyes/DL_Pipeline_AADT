@@ -1,4 +1,4 @@
-# src/data_ingestion/validators/training_artifact_validator.py
+# src/data_handling/validators/training_artifact_validator.py
 from __future__ import annotations
 
 """
@@ -54,7 +54,7 @@ from networkx.generators import spectral_graph_forge
 
 from dataclasses import dataclass, field
 import logging
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 import networkx as nx
 import numpy as np
@@ -133,8 +133,16 @@ class TrainingArtifactValidator:
         If True, each route edge is checked against the graph.
 
     check_tensor_values : bool, default=True
-        If True, physical tensors and targets are checked for finite and
+        If True, model-ready tensor values are checked for finite and
         non-negative values where appropriate.
+
+    check_target_masks : bool, default=True
+        If True, target arrays and their observation masks are checked for
+        shape, finiteness, non-negativity and binary-mask consistency.
+
+    check_physical_tensors : bool, default=True
+        If True, network physical tensors such as travel times, capacities and
+        lanes are checked for valid dimensions and values.
 
     max_reported_items : int, default=20
         Maximum number of problematic examples included in issue contexts.
@@ -159,16 +167,16 @@ class TrainingArtifactValidator:
         "flow_df",
         "trips_df",
         "od_matrix",
-        "routes_by_od",
-        "routes_df",
+        "primary_source_route_set",
+        "primary_source_routes_df",
         "metadata",
     }
 
     REQUIRED_PROCESSED_KEYS = {
         "link_df",
         "graph",
-        "routes_by_od",
-        "routes_df",
+        "primary_source_route_set",
+        "primary_source_routes_df",
         "trips_df",
         "od_matrix",
         "edge_indexing",
@@ -210,11 +218,15 @@ class TrainingArtifactValidator:
         strict: bool = True,
         check_route_graph_compatibility: bool = True,
         check_tensor_values: bool = True,
+        check_target_masks: bool = True,
+        check_physical_tensors: bool = True,
         max_reported_items: int = 20,
     ) -> None:
         self.strict = bool(strict)
         self.check_route_graph_compatibility = bool(check_route_graph_compatibility)
         self.check_tensor_values = bool(check_tensor_values)
+        self.check_target_masks = bool(check_target_masks)
+        self.check_physical_tensors = bool(check_physical_tensors)
         self.max_reported_items = int(max_reported_items)
 
         self._errors: List[ValidationIssue] = []
@@ -308,14 +320,16 @@ class TrainingArtifactValidator:
             )
             return
 
-        if "volume" not in link_df.columns:
+        flow_column = processed.get("selected_flow_column")
+        if not isinstance(flow_column, str) or flow_column not in link_df.columns:
             return
 
-        edge_to_volume = {}
+        edge_to_flow = {}
 
         for row in link_df.itertuples(index=False):
             edge = (int(row.init_node), int(row.term_node))
-            edge_to_volume[edge] = float(row.volume) if pd.notna(row.volume) else np.nan
+            value = row._asdict()[flow_column]
+            edge_to_flow[edge] = float(value) if pd.notna(value) else np.nan
 
         expected_raw = []
 
@@ -334,7 +348,7 @@ class TrainingArtifactValidator:
                 expected_raw.append(np.nan)
                 continue
 
-            expected_raw.append(edge_to_volume[edge])
+            expected_raw.append(edge_to_flow[edge])
 
         if missing_edges:
             self._add_error(
@@ -466,15 +480,33 @@ class TrainingArtifactValidator:
             self._validate_link_consistency(artifact)
             self._validate_od_consistency(artifact)
             
+        base_indexing_error_count = len(self._errors)
         self._validate_od_indexing_payload(artifact)
         self._validate_od_matrix_zone_mapping_consistency(artifact)
         self._validate_raw_trips_zone_indexing_consistency(artifact)
+
+        if not has_model_ready:
+            if len(self._errors) == base_indexing_error_count:
+                logger.info("Base-artifact indexing consistency validation passed.")
+            else:
+                logger.error("Base-artifact indexing consistency validation failed.")
         
         if has_model_ready:
             self._validate_route_tensor_consistency(artifact)
-            self._validate_target_consistency(artifact)
-            self._validate_physical_tensors(artifact)
+            if self.check_target_masks:
+                self._validate_target_consistency(artifact)
+            if self.check_physical_tensors:
+                self._validate_physical_tensors(artifact)
+            if self.check_tensor_values:
+                self._validate_assignment_ground_truth(artifact)
+
+            indexing_error_count = len(self._errors)
             self._validate_indexing_consistency(artifact)
+            if len(self._errors) == indexing_error_count:
+                logger.info("Training-artifact indexing consistency validation passed.")
+            else:
+                logger.error("Training-artifact indexing consistency validation failed.")
+
             self._validate_flow_target_edge_alignment(artifact)
 
         self._validate_link_df_order_against_processed_edge_indexing(artifact)
@@ -485,10 +517,21 @@ class TrainingArtifactValidator:
         result = self._build_result(artifact)
 
         if result.is_valid:
-            logger.info("Training artifact validation passed.")
+            artifact_label = (
+                "Training artifact"
+                if artifact_type == "training_artifact"
+                else "Base artifact"
+            )
+            logger.info("%s validation passed.", artifact_label)
         else:
+            artifact_label = (
+                "Training artifact"
+                if artifact_type == "training_artifact"
+                else "Base artifact"
+            )
             logger.error(
-                "Training artifact validation failed with %d errors and %d warnings.",
+                "%s validation failed with %d errors and %d warnings.",
+                artifact_label,
                 len(result.errors),
                 len(result.warnings),
             )
@@ -751,14 +794,14 @@ class TrainingArtifactValidator:
         processed = artifact["processed"]
         model_ready = artifact["model_ready"]
 
-        routes_by_od = processed["routes_by_od"]
+        routes_by_od = processed["primary_source_route_set"]
         network_params = model_ready["network_params"]
         targets = model_ready["targets"]
 
         if not isinstance(routes_by_od, dict):
             self._add_error(
                 code="ROUTES_BY_OD_NOT_DICT",
-                message="processed['routes_by_od'] must be a dictionary.",
+                message="processed['primary_source_route_set'] must be a dictionary.",
             )
             return
 
@@ -768,7 +811,7 @@ class TrainingArtifactValidator:
         num_od_mask = len(targets["od_observed_mask_np"])
 
         values = {
-            "routes_by_od": num_od_routes,
+            "primary_source_route_set": num_od_routes,
             "network_params_num_od_pairs": num_od_params,
             "od_target": num_od_target,
             "od_mask": num_od_mask,
@@ -932,12 +975,12 @@ class TrainingArtifactValidator:
 
         routes_by_od_pairs = {
             (int(origin), int(destination))
-            for origin, destination in processed["routes_by_od"].keys()
+            for origin, destination in processed["primary_source_route_set"].keys()
         }
         if set(od_pairs) != routes_by_od_pairs:
             self._add_error(
                 code="OD_INDEXING_ROUTE_KEYS_MISMATCH",
-                message="processed['od_indexing']['od_pairs'] does not match processed['routes_by_od'].keys().",
+                message="processed['od_indexing']['od_pairs'] does not match processed['primary_source_route_set'].keys().",
                 context={
                     "missing_in_od_indexing": sorted(routes_by_od_pairs.difference(od_pairs))[:self.max_reported_items],
                     "extra_in_od_indexing": sorted(set(od_pairs).difference(routes_by_od_pairs))[:self.max_reported_items],
@@ -1643,6 +1686,57 @@ class TrainingArtifactValidator:
                     message=f"network_params['{key}'] contains negative values.",
                 )
 
+    def _validate_assignment_ground_truth(self, artifact: Dict[str, Any]) -> None:
+        """Validate generated assignment outputs without confusing them with dataset targets."""
+
+        targets = artifact["model_ready"]["targets"]
+        assignment = targets.get("assignment_ground_truth")
+        if assignment is None:
+            return
+        if not isinstance(assignment, Mapping):
+            self._add_error(
+                code="ASSIGNMENT_GROUND_TRUTH_NOT_MAPPING",
+                message="model_ready.targets['assignment_ground_truth'] must be a mapping.",
+            )
+            return
+
+        network_params = artifact["model_ready"]["network_params"]
+        expected_links = int(network_params["num_links"])
+        for key in (
+            "final_link_flows",
+            "final_link_costs",
+        ):
+            if key not in assignment:
+                self._add_error(
+                    code=f"MISSING_ASSIGNMENT_{key.upper()}",
+                    message=f"assignment_ground_truth is missing '{key}'.",
+                )
+                continue
+            values = np.asarray(assignment[key])
+            if values.ndim != 1 or len(values) != expected_links:
+                self._add_error(
+                    code=f"ASSIGNMENT_{key.upper()}_LENGTH_MISMATCH",
+                    message=f"assignment_ground_truth['{key}'] must have length num_links.",
+                    context={"found": int(values.size), "expected": expected_links},
+                )
+                continue
+            if not np.isfinite(values).all():
+                self._add_error(
+                    code=f"NONFINITE_ASSIGNMENT_{key.upper()}",
+                    message=f"assignment_ground_truth['{key}'] contains non-finite values.",
+                )
+            if key.endswith("flows") and np.any(values < 0.0):
+                self._add_error(
+                    code=f"NEGATIVE_ASSIGNMENT_{key.upper()}",
+                    message=f"assignment_ground_truth['{key}'] contains negative values.",
+                )
+            if key.endswith("costs") and np.any(values <= 0.0):
+                self._add_error(
+                    code=f"NONPOSITIVE_ASSIGNMENT_{key.upper()}",
+                    message=f"assignment_ground_truth['{key}'] must contain positive costs.",
+                )
+                continue
+
     def _validate_indexing_consistency(self, artifact: Dict[str, Any]) -> None:
         """
         Validate indexing payload consistency.
@@ -1810,7 +1904,7 @@ class TrainingArtifactValidator:
         """
 
         graph = artifact["processed"]["graph"]
-        routes_by_od = artifact["processed"]["routes_by_od"]
+        routes_by_od = artifact["processed"]["primary_source_route_set"]
 
         missing_edge_records = []
         invalid_endpoint_records = []
@@ -2155,6 +2249,9 @@ def validate_training_artifact(
     strict: bool = True,
     check_route_graph_compatibility: bool = True,
     check_tensor_values: bool = True,
+    check_target_masks: bool = True,
+    check_physical_tensors: bool = True,
+    max_reported_items: int = 20,
 ) -> TrainingArtifactValidationResult:
     """
     Convenience function to validate a training artifact.
@@ -2183,6 +2280,9 @@ def validate_training_artifact(
         strict=strict,
         check_route_graph_compatibility=check_route_graph_compatibility,
         check_tensor_values=check_tensor_values,
+        check_target_masks=check_target_masks,
+        check_physical_tensors=check_physical_tensors,
+        max_reported_items=max_reported_items,
     )
 
     return validator.validate(artifact)
@@ -2193,6 +2293,9 @@ def validate_training_artifact_or_raise(
     strict: bool = True,
     check_route_graph_compatibility: bool = True,
     check_tensor_values: bool = True,
+    check_target_masks: bool = True,
+    check_physical_tensors: bool = True,
+    max_reported_items: int = 20,
 ) -> TrainingArtifactValidationResult:
     """
     Convenience function to validate a training artifact and raise on errors.
@@ -2226,6 +2329,41 @@ def validate_training_artifact_or_raise(
         strict=strict,
         check_route_graph_compatibility=check_route_graph_compatibility,
         check_tensor_values=check_tensor_values,
+        check_target_masks=check_target_masks,
+        check_physical_tensors=check_physical_tensors,
+        max_reported_items=max_reported_items,
     )
 
+    return validator.validate_or_raise(artifact)
+
+
+def validate_base_artifact_or_raise(
+    artifact: Dict[str, Any],
+    strict: bool = True,
+    check_route_graph_compatibility: bool = True,
+    max_reported_items: int = 20,
+) -> TrainingArtifactValidationResult:
+    """Validate the data-processing output as a base artifact.
+
+    The validator is shared with the downstream training artifact because the
+    structural checks overlap, but this entry point makes the boundary
+    explicit and prevents the data-processing pipeline from being described as
+    a training-artifact producer.
+    """
+
+    if not isinstance(artifact, dict):
+        raise TypeError("base artifact must be a dictionary.")
+    if artifact.get("artifact_type") != "base_artifact":
+        raise ValueError(
+            "Base-artifact validation requires artifact_type='base_artifact'."
+        )
+
+    validator = TrainingArtifactValidator(
+        strict=strict,
+        check_route_graph_compatibility=check_route_graph_compatibility,
+        check_tensor_values=False,
+        check_target_masks=False,
+        check_physical_tensors=False,
+        max_reported_items=max_reported_items,
+    )
     return validator.validate_or_raise(artifact)

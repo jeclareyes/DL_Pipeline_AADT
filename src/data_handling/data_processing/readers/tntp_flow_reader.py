@@ -1,4 +1,4 @@
-# src/data_ingestion/readers/tntp_flow_reader.py
+# src/data_handling/readers/tntp_flow_reader.py
 
 """
 TNTP Flow Reader
@@ -71,9 +71,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union, Mapping
 
 import pandas as pd
+
+from src.utils.flow_columns import FlowColumnContract
 
 
 logger = logging.getLogger(__name__)
@@ -176,14 +178,16 @@ class TNTPFlowReader:
     def __init__(
         self,
         path: Union[str, Path],
-        volume_year: Optional[int] = None,
-        volume_column: Optional[str] = None,
+        flow_columns: Mapping[str, Any] | FlowColumnContract,
         strict: bool = True,
         preserve_extra_columns: bool = True,
     ) -> None:
         self.path = Path(path).resolve(strict=False)
-        self.volume_year = volume_year
-        self.volume_column = volume_column
+        self.flow_columns = (
+            flow_columns
+            if isinstance(flow_columns, FlowColumnContract)
+            else FlowColumnContract.from_mapping(flow_columns)
+        )
         self.strict = bool(strict)
         self.preserve_extra_columns = bool(preserve_extra_columns)
 
@@ -213,11 +217,7 @@ class TNTPFlowReader:
         raw_df = self._read_raw_dataframe()
         flow_df = self._normalize_column_names(raw_df)
 
-        selected_volume_column = self._select_volume_column(flow_df)
-        flow_df = self._create_canonical_volume_column(
-            flow_df=flow_df,
-            selected_volume_column=selected_volume_column,
-        )
+        flow_df = self.flow_columns.rename_legacy_columns(flow_df, logger=logger)
 
         flow_df = self._normalize_dtypes(flow_df)
         flow_df = self._order_columns(flow_df)
@@ -225,15 +225,13 @@ class TNTPFlowReader:
 
         metadata = self._build_metadata(
             flow_df=flow_df,
-            selected_volume_column=selected_volume_column,
             raw_columns=raw_df.columns.tolist(),
         )
 
         logger.info(
-            "Flow file loaded successfully | records=%d | observed_volumes=%d | selected_volume_column=%s",
+            "Flow file loaded successfully | records=%d | flow_columns=%s",
             len(flow_df),
-            metadata["num_observed_volumes"],
-            selected_volume_column,
+            list(self.flow_columns.all_declared()),
         )
 
         return FlowReadResult(
@@ -355,6 +353,8 @@ class TNTPFlowReader:
             Selected volume column name. Returns None only when strict=False and
             no suitable volume column is found.
         """
+
+        raise RuntimeError("Legacy volume-column selection is disabled; use flow_columns.")
 
         columns = list(flow_df.columns)
         lower_to_original = {str(col).lower(): col for col in columns}
@@ -545,8 +545,9 @@ class TNTPFlowReader:
         df["from_node"] = df["from_node"].astype(int)
         df["to_node"] = df["to_node"].astype(int)
 
-        if "volume" in df.columns:
-            df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
+        for column in self.flow_columns.all_declared():
+            if column in df.columns:
+                df[column] = pd.to_numeric(df[column], errors="coerce")
 
         if "cost" in df.columns:
             df["cost"] = pd.to_numeric(df["cost"], errors="coerce")
@@ -568,11 +569,14 @@ class TNTPFlowReader:
             Reordered flow table.
         """
 
-        canonical_present = [
+        canonical_present = ["from_node", "to_node"]
+        canonical_present.extend(
             column
-            for column in self.CANONICAL_ORDER
+            for column in self.flow_columns.all_declared()
             if column in flow_df.columns
-        ]
+        )
+        if "cost" in flow_df.columns:
+            canonical_present.append("cost")
 
         if not self.preserve_extra_columns:
             return flow_df[canonical_present].copy()
@@ -618,11 +622,17 @@ class TNTPFlowReader:
         if flow_df[["from_node", "to_node"]].isna().any().any():
             raise ValueError("Missing values found in flow endpoint columns.")
 
-        if "volume" not in flow_df.columns:
-            raise ValueError("Normalized flow table does not contain canonical 'volume' column.")
+        declared_columns = [
+            column for column in self.flow_columns.all_declared() if column in flow_df.columns
+        ]
+        if not declared_columns:
+            raise ValueError(
+                "Normalized flow table does not contain any declared flow_columns."
+            )
 
-        if (flow_df["volume"].dropna() < 0).any():
-            raise ValueError("Flow table contains negative volume values.")
+        for column in declared_columns:
+            if (flow_df[column].dropna() < 0).any():
+                raise ValueError(f"Flow table contains negative values in {column!r}.")
 
         duplicated_links = flow_df[["from_node", "to_node"]].duplicated(keep=False)
 
@@ -638,7 +648,6 @@ class TNTPFlowReader:
     def _build_metadata(
         self,
         flow_df: pd.DataFrame,
-        selected_volume_column: Optional[str],
         raw_columns: List[str],
     ) -> Dict[str, Any]:
         """
@@ -661,41 +670,18 @@ class TNTPFlowReader:
             Reader metadata.
         """
 
-        observed_mask = flow_df["volume"].notna()
-        observed_volume = flow_df.loc[observed_mask, "volume"]
-
         metadata: Dict[str, Any] = {
             "source_file": str(self.path),
             "raw_columns": raw_columns,
             "columns": flow_df.columns.tolist(),
-            "selected_volume_column": selected_volume_column,
-            "volume_year": self.volume_year,
+            "flow_columns": self.flow_columns.as_dict(),
             "num_records": int(len(flow_df)),
-            "num_observed_volumes": int(observed_mask.sum()),
-            "num_missing_volumes": int((~observed_mask).sum()),
-            "observed_volume_share": (
-                float(observed_mask.mean()) if len(flow_df) > 0 else 0.0
-            ),
+            "observed_counts": {
+                column: int(flow_df[column].notna().sum())
+                for column in self.flow_columns.traffic_counts
+                if column in flow_df.columns
+            },
         }
-
-        if len(observed_volume) > 0:
-            metadata.update(
-                {
-                    "total_observed_volume": float(observed_volume.sum()),
-                    "mean_observed_volume": float(observed_volume.mean()),
-                    "min_observed_volume": float(observed_volume.min()),
-                    "max_observed_volume": float(observed_volume.max()),
-                }
-            )
-        else:
-            metadata.update(
-                {
-                    "total_observed_volume": 0.0,
-                    "mean_observed_volume": None,
-                    "min_observed_volume": None,
-                    "max_observed_volume": None,
-                }
-            )
 
         if "cost" in flow_df.columns:
             observed_cost = flow_df["cost"].dropna()
@@ -712,8 +698,7 @@ class TNTPFlowReader:
 
 def read_tntp_flows(
     path: Union[str, Path],
-    volume_year: Optional[int] = None,
-    volume_column: Optional[str] = None,
+    flow_columns: Mapping[str, Any] | FlowColumnContract,
     strict: bool = True,
     preserve_extra_columns: bool = True,
 ) -> FlowReadResult:
@@ -745,8 +730,7 @@ def read_tntp_flows(
 
     reader = TNTPFlowReader(
         path=path,
-        volume_year=volume_year,
-        volume_column=volume_column,
+        flow_columns=flow_columns,
         strict=strict,
         preserve_extra_columns=preserve_extra_columns,
     )

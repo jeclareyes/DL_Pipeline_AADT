@@ -1,80 +1,27 @@
 from __future__ import annotations
 
-import heapq
 import logging
-import os
-import sys
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from itertools import count
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import networkx as nx
-import numpy as np
 from omegaconf import DictConfig
-from tqdm import tqdm
 
-from src.data_ingestion.builders.graph_builder import GraphBuilder
-from src.data_ingestion.readers.tntp_network_reader import read_tntp_network
-from src.data_ingestion.readers.tntp_node_reader import read_tntp_nodes
-from src.data_ingestion.readers.tntp_trips_reader import read_tntp_trips
-from src.components.route_engines import get_route_engine, RouteEngine
+from .graph_builder import GraphBuilder
+from ..readers.tntp_network_reader import read_tntp_network
+from ..readers.tntp_node_reader import read_tntp_nodes
+from ..readers.tntp_trips_reader import read_tntp_trips
+from src.components.route_engines.base_engine import generate_routes_by_od
 
 logger = logging.getLogger(__name__)
 
 ODPair = Tuple[int, int]
 Route = List[int]
 
-_ROUTE_WORKER_ENGINE: RouteEngine | None = None
-_ROUTE_WORKER_K: int = 10
-_ROUTE_WORKER_WEIGHT: str = "free_flow_time"
-_ROUTE_WORKER_CONSTRAINTS: dict[str, bool] | None = None
-_ROUTE_WORKER_CONNECTOR_LINK_TYPES: set[int] | None = None
-
-
-def _initialize_routes_worker(
-    engine_name: str,
-    graph: nx.DiGraph,
-    k: int,
-    weight: str,
-    constraints: dict[str, bool],
-    connector_link_types: set[int],
-) -> None:
-    global _ROUTE_WORKER_ENGINE, _ROUTE_WORKER_K, _ROUTE_WORKER_WEIGHT, _ROUTE_WORKER_CONSTRAINTS, _ROUTE_WORKER_CONNECTOR_LINK_TYPES
-    _ROUTE_WORKER_ENGINE = get_route_engine(engine_name, graph)
-    _ROUTE_WORKER_K = k
-    _ROUTE_WORKER_WEIGHT = weight
-    _ROUTE_WORKER_CONSTRAINTS = constraints
-    _ROUTE_WORKER_CONNECTOR_LINK_TYPES = connector_link_types
-
-
-def _solve_routes_batch_worker(
-    batch_tasks: List[Tuple[int, int]]
-) -> List[Tuple[Tuple[int, int], List[Route]]]:
-    if _ROUTE_WORKER_ENGINE is None:
-        raise RuntimeError("Worker engine not initialized.")
-
-    results = []
-    for origin_id, destination_id in batch_tasks:
-        routes = _ROUTE_WORKER_ENGINE.get_k_routes(
-            origin_id=origin_id,
-            destination_id=destination_id,
-            k=_ROUTE_WORKER_K,
-            weight=_ROUTE_WORKER_WEIGHT,
-            constraints=_ROUTE_WORKER_CONSTRAINTS,
-            connector_link_types=_ROUTE_WORKER_CONNECTOR_LINK_TYPES,
-        )
-        results.append(((origin_id, destination_id), routes))
-    return results
-
-
-def _chunk_tasks(tasks: List[Tuple[int, int]], batch_size: int) -> List[List[Tuple[int, int]]]:
-    if batch_size <= 0:
-        raise ValueError("batch_size must be greater than zero.")
-    return [tasks[start:start + batch_size] for start in range(0, len(tasks), batch_size)]
-
-
-def recompute_routes_from_tntp(cfg: DictConfig) -> Dict[str, object]:
+def recompute_routes_from_tntp(
+    cfg: DictConfig,
+    dataset_cfg: DictConfig,
+) -> Dict[str, object]:
     """
     Recompute the TNTP routes file from the current nodes/network/trips inputs.
 
@@ -83,14 +30,14 @@ def recompute_routes_from_tntp(cfg: DictConfig) -> Dict[str, object]:
         with the latest network and trips inputs.
 
     Storage:
-        Writes the routes file at cfg.input_routes.routes_route.
+        Writes the routes file at dataset_cfg.paths.tntp_files.routes.
     """
     routes_cfg = dict(cfg.get("routes_recompute", {}) or {})
     enabled = bool(routes_cfg.get("enabled", False))
     if not enabled:
         return {"enabled": False, "skipped": True}
 
-    routes_path = Path(cfg.input_routes.routes_route)
+    routes_path = Path(dataset_cfg.paths.tntp_files.routes)
     overwrite_existing = bool(routes_cfg.get("overwrite_existing", True))
 
     if routes_path.exists() and not overwrite_existing:
@@ -107,31 +54,30 @@ def recompute_routes_from_tntp(cfg: DictConfig) -> Dict[str, object]:
     trips_cfg = cfg.readers.get("trips", {})
 
     node_result = read_tntp_nodes(
-        path=cfg.input_routes.node_route,
+        path=dataset_cfg.paths.tntp_files.nodes,
         strict=bool(nodes_cfg.get("strict", True)),
         preserve_extra_columns=bool(nodes_cfg.get("preserve_extra_columns", True)),
     )
 
     network_result = read_tntp_network(
-        path=cfg.input_routes.network_route,
+        path=dataset_cfg.paths.tntp_files.network,
         strict=bool(network_cfg.get("strict", True)),
         preserve_extra_columns=bool(network_cfg.get("preserve_extra_columns", True)),
     )
 
     trips_result = read_tntp_trips(
-        path=cfg.input_routes.trips_route,
+        path=dataset_cfg.paths.tntp_files.trips,
         aggregation=str(trips_cfg.get("aggregation", "average_daily")),
         matrix_format=str(trips_cfg.get("matrix_format", "csr")),
         include_zero_flows=bool(trips_cfg.get("include_zero_flows", False)),
         strict=bool(trips_cfg.get("strict", True)),
     )
 
-    graph_cfg = cfg.get("graph", {})
+    graph_cfg = cfg.get("builders", {}).get("graph", {})
     graph_builder = GraphBuilder(
         strict=bool(graph_cfg.get("strict", True)),
-        add_missing_link_nodes=bool(graph_cfg.get("add_missing_link_nodes", False)),
         preserve_extra_attributes=bool(graph_cfg.get("preserve_extra_attributes", True)),
-        weight_column=str(graph_cfg.get("weight_column", "free_flow_time")),
+        weight_column=str(graph_cfg["dataset_weight_column"]),
     )
 
     graph = graph_builder.build(
@@ -144,7 +90,7 @@ def recompute_routes_from_tntp(cfg: DictConfig) -> Dict[str, object]:
         raise ValueError("Routes recompute failed: no zone_ids found in trips metadata.")
 
     k_paths = int(routes_cfg.get("k_paths", cfg.readers.routes.max_routes_per_od))
-    weight = str(routes_cfg.get("weight", graph_cfg.get("weight_column", "free_flow_time")))
+    weight = str(routes_cfg.get("weight", graph_cfg["dataset_weight_column"]))
     engine_name = str(routes_cfg.get("engine", "networkx"))
 
 
@@ -189,81 +135,26 @@ def recompute_routes_from_tntp(cfg: DictConfig) -> Dict[str, object]:
         f"Constrains: {[(k, v) for k, v in constraints.items()]}"
     )
 
-    if parallel:
-        if parallel_workers is None:
-            parallel_workers = max(1, (os.cpu_count() or 2) - 1)
-        if parallel_workers <= 1:
-            parallel = False
-
-    if parallel:
-        batches = _chunk_tasks(all_od_tasks, od_batch_size)
-        if show_progress:
-            pbar = tqdm(total=total_od_pairs, desc="Recomputing routes", unit="OD pair")
-        else:
-            pbar = None
-
-        try:
-            with ProcessPoolExecutor(
-                max_workers=parallel_workers,
-                initializer=_initialize_routes_worker,
-                initargs=(engine_name, graph, k_paths, weight, constraints, connector_link_types),
-            ) as executor:
-                futures = [executor.submit(_solve_routes_batch_worker, batch) for batch in batches]
-                for future in as_completed(futures):
-                    for od_pair, routes in future.result():
-                        routes_by_od[od_pair] = routes
-                        num_routes = len(routes)
-                        total_routes_found += num_routes
-                        if num_routes == 0:
-                            od_pairs_without_routes.append(od_pair)
-                        if num_routes < k_paths:
-                            od_pairs_with_less_than_k.append(od_pair)
-
-                        if pbar is not None:
-                            pbar.update(1)
-                            pbar.set_postfix({
-                                "routes": total_routes_found,
-                                "no_route": len(od_pairs_without_routes),
-                                "less_k": len(od_pairs_with_less_than_k),
-                            })
-        finally:
-            if pbar is not None:
-                pbar.close()
-    else:
-        if show_progress:
-            pbar = tqdm(total=total_od_pairs, desc="Recomputing routes", unit="OD pair")
-        else:
-            pbar = None
-
-        try:
-            engine = get_route_engine(engine_name, graph)
-            for origin_id, destination_id in all_od_tasks:
-                routes = engine.get_k_routes(
-                    origin_id=origin_id,
-                    destination_id=destination_id,
-                    k=k_paths,
-                    weight=weight,
-                    constraints=constraints,
-                    connector_link_types=connector_link_types,
-                )
-                routes_by_od[(origin_id, destination_id)] = routes
-                num_routes = len(routes)
-                total_routes_found += num_routes
-                if num_routes == 0:
-                    od_pairs_without_routes.append((origin_id, destination_id))
-                if num_routes < k_paths:
-                    od_pairs_with_less_than_k.append((origin_id, destination_id))
-
-                if pbar is not None:
-                    pbar.update(1)
-                    pbar.set_postfix({
-                        "routes": total_routes_found,
-                        "no_route": len(od_pairs_without_routes),
-                        "less_k": len(od_pairs_with_less_than_k),
-                    })
-        finally:
-            if pbar is not None:
-                pbar.close()
+    routes_by_od = generate_routes_by_od(
+        graph=graph,
+        od_pairs=all_od_tasks,
+        engine_name=engine_name,
+        k=k_paths,
+        weight=weight,
+        constraints=constraints,
+        connector_link_types=connector_link_types,
+        parallel=parallel,
+        workers=parallel_workers,
+        batch_size=od_batch_size,
+        show_progress=show_progress,
+    )
+    for od_pair, routes in routes_by_od.items():
+        num_routes = len(routes)
+        total_routes_found += num_routes
+        if num_routes == 0:
+            od_pairs_without_routes.append(od_pair)
+        if num_routes < k_paths:
+            od_pairs_with_less_than_k.append(od_pair)
 
     # Reorder routes_by_od to match deterministic original nested-loop order
     ordered_routes_by_od = {}

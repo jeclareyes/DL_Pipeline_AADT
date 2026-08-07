@@ -1,4 +1,4 @@
-# src/data_ingestion/artifact_loaders/training_artifact_loader.py
+# src/data_handling/artifact_loaders/training_artifact_loader.py
 
 """
 Training Artifact Loader
@@ -43,9 +43,7 @@ from typing import Any, Dict, Optional, Union
 
 import torch
 
-from src.data_ingestion.validators.training_artifact_validator import (
-    validate_training_artifact_or_raise,
-)
+from ..validators.training_artifact_validator import validate_training_artifact_or_raise
 from src.utils.serialization import load
 from src.utils.paths import resolve_path
 

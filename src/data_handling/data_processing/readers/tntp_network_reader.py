@@ -1,4 +1,4 @@
-# src/data_ingestion/readers/tntp_network_reader.py
+# src/data_handling/readers/tntp_network_reader.py
 
 """
 TNTP Network Reader
@@ -672,6 +672,17 @@ class TNTPNetworkReader:
                 pd.to_numeric(df["capacity_per_lane"], errors="coerce")
                 * pd.to_numeric(df["lanes"], errors="coerce")
             )
+
+        # Some TNTP exports use -1 for an unspecified scenario-adjusted
+        # capacity.  It is a sentinel, not a physical zero/negative capacity;
+        # use the already-normalized lane capacity in that case.  Keep other
+        # non-positive values intact so the strict validation below still
+        # rejects genuinely invalid network data.
+        if "effective_capacity" in df.columns and "total_capacity" in df.columns:
+            unspecified_capacity = df["effective_capacity"].eq(-1)
+            df.loc[unspecified_capacity, "effective_capacity"] = df.loc[
+                unspecified_capacity, "total_capacity"
+            ]
 
         return df
 

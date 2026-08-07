@@ -1,5 +1,5 @@
 from __future__ import annotations
-# src/data_ingestion/artifact_builders/training_artifact_builder.py
+# src/data_handling/artifact_builders/training_artifact_builder.py
 
 """
 Training Artifact Builder
@@ -39,8 +39,6 @@ Design principles
 - Tensors are saved on CPU by default for portability.
 """
 
-from networkx.generators import spectral_graph_forge
-
 from dataclasses import dataclass
 from datetime import datetime
 import json
@@ -58,20 +56,25 @@ from omegaconf import DictConfig, ListConfig, OmegaConf
 from scipy import sparse
 
 
-from src.data_ingestion.readers.tntp_node_reader import read_tntp_nodes
-from src.data_ingestion.readers.tntp_network_reader import read_tntp_network
-from src.data_ingestion.readers.tntp_flow_reader import read_tntp_flows
-from src.data_ingestion.readers.tntp_trips_reader import read_tntp_trips
-from src.data_ingestion.readers.tntp_routes_reader import read_tntp_routes
+from ..readers.tntp_node_reader import read_tntp_nodes
+from ..readers.tntp_network_reader import read_tntp_network
+from ..readers.tntp_flow_reader import read_tntp_flows
+from ..readers.tntp_trips_reader import read_tntp_trips
+from ..readers.tntp_routes_reader import read_tntp_routes
 
-from src.data_ingestion.adapters.route_model_adapter import RouteModelAdapter
+from ..adapters.route_model_adapter import RouteModelAdapter
 from src.utils.serialization import dump
+from src.utils.flow_columns import flow_columns_from_dataset_config
 
-from src.data_ingestion.builders.link_table_builder import build_link_table
-from src.data_ingestion.builders.graph_builder import build_graph
-from src.data_ingestion.builders.target_builder import build_targets
+from ..builders.link_table_builder import build_link_table
+from ..builders.graph_builder import build_graph
+from ..builders.target_builder import build_targets
 
-from src.data_ingestion.validators.training_artifact_validator import (validate_training_artifact_or_raise,)
+from ..validators.training_artifact_validator import (
+    validate_base_artifact_or_raise,
+    validate_training_artifact_or_raise,
+)
+from ..validators.node_classification import validate_and_classify_nodes
 
 
 logger = logging.getLogger(__name__)
@@ -117,17 +120,18 @@ class TrainingArtifactBuilder:
     def __init__(
         self,
         cfg: Union[DictConfig, Dict[str, Any]],
+        dataset_cfg: Union[DictConfig, Dict[str, Any]],
         device: str = "cpu",
         artifact_name: str = "training_artifact.joblib",
         manifest_name: str = "base_manifest.json",
     ) -> None:
         self.cfg = cfg
+        self.dataset_cfg = dataset_cfg
         self.device = device
         self.artifact_name = artifact_name
         self.manifest_name = manifest_name
 
-        self.dataset_name = str(self._cfg_get("dataset_name"))
-        self.volume_year = self._cfg_get("readers.flows.volume_year")
+        self.dataset_name = str(self._dataset_cfg_get("name"))
         self.multiday_od = self._cfg_get("readers.trips.multiday_od")
 
         self.max_routes_per_od = self._cfg_get("readers.routes.max_routes_per_od")
@@ -137,8 +141,16 @@ class TrainingArtifactBuilder:
         self.trips_aggregation = str(
             self._cfg_get("readers.trips.aggregation")
         )
+        self.include_intrazonal_pairs = bool(
+            self._cfg_get("builders.od_indexing.include_intrazonal_pairs")
+        )
+        self.node_classification = None
 
         self.paths = self._resolve_paths()
+        self.flow_columns = flow_columns_from_dataset_config(
+            self._to_plain_container(self.dataset_cfg),
+            creation_manifest_path=self._dataset_cfg_get("paths.manifests.creation"),
+        )
 
 
     def _resolve_model_link_pair_indices(
@@ -409,31 +421,34 @@ class TrainingArtifactBuilder:
         raw = self.load_raw()
         processed = self.build_processed(raw)
 
-        include_model_ready = bool(self._cfg_get("artifact.include_model_ready_layer"))
-        if include_model_ready:
-            raise ValueError(
-                "Base artifact construction no longer supports a model_ready layer. "
-                "Set artifact.include_model_ready_layer to false."
-            )
-
         artifact = self.pack_artifact(
             raw=raw,
             processed=processed,
             artifact_type="base_artifact",
         )
 
-        validation_result = validate_training_artifact_or_raise(
-            artifact,
-            strict=True,
-        )
-
-        artifact["metadata"]["validation"] = validation_result.summary
+        validation_cfg = self._cfg_get("validation")
+        validation_enabled = bool(validation_cfg.get("enabled"))
+        if validation_enabled:
+            validation_result = validate_base_artifact_or_raise(
+                artifact,
+                strict=bool(validation_cfg.get("strict")),
+                check_route_graph_compatibility=bool(
+                    validation_cfg.get("check_route_graph_compatibility")
+                ),
+                max_reported_items=int(validation_cfg.get("max_reported_items")),
+            )
+            artifact["metadata"]["validation"] = validation_result.summary
+        else:
+            logger.warning(
+                "Base-artifact validation is disabled by data_processing.validation.enabled=false."
+            )
 
         if save:
             save_info = self.save_artifact(artifact)
             artifact["metadata"]["save_info"] = save_info
 
-        logger.info("Training artifact successfully built.")
+        logger.info("Base artifact successfully built.")
 
         return artifact
 
@@ -450,12 +465,16 @@ class TrainingArtifactBuilder:
         logger.info("Reading raw TNTP files.")
 
         node_result = read_tntp_nodes(self.paths.node_path)
+        self.node_classification = validate_and_classify_nodes(
+            node_df=node_result.nodes_df,
+            classification_cfg=self._dataset_cfg_get("node_classification"),
+        )
 
         network_result = read_tntp_network(self.paths.network_path)
 
         flow_result = read_tntp_flows(
             path=self.paths.flow_path,
-            volume_year=self.volume_year,
+            flow_columns=self.flow_columns,
         )
 
         trips_result = read_tntp_trips(
@@ -471,6 +490,12 @@ class TrainingArtifactBuilder:
                 "Cannot read compact routes safely because OD order would be ambiguous."
             )
 
+        if [int(zone_id) for zone_id in zone_ids] != self.node_classification.zone_ids:
+            raise ValueError(
+                "Trips zone IDs do not match the dataset node classification order. "
+                f"trips={zone_ids}, classified={self.node_classification.zone_ids}"
+            )
+
         routes_result = read_tntp_routes(
             path=self.paths.routes_path,
             zone_ids=zone_ids,
@@ -483,8 +508,10 @@ class TrainingArtifactBuilder:
             "flow_df": flow_result.flow_df,
             "trips_df": trips_result.trips_df,
             "od_matrix": trips_result.od_matrix,
-            "routes_by_od": routes_result.routes_by_od,
-            "routes_df": routes_result.routes_df,
+            # The TNTP route file is retained as provenance only. It is the
+            # dataset's primary source route set, not the experiment route set.
+            "primary_source_route_set": routes_result.routes_by_od,
+            "primary_source_routes_df": routes_result.routes_df,
             "metadata": {
                 "nodes": node_result.metadata,
                 "network": network_result.metadata,
@@ -511,9 +538,35 @@ class TrainingArtifactBuilder:
 
         logger.info("Building processed transportation objects.")
 
+        trips_df = raw["trips_df"]
+        # Processed primary routes are the normalized TNTP source route set.
+        # They document what came from the dataset, but are not selected for
+        # an experiment. AssetPipeline supplies the experiment route_set later.
+        routes_by_od = raw["primary_source_route_set"]
+        routes_df = raw["primary_source_routes_df"]
+        od_matrix = raw["od_matrix"]
+        if not self.include_intrazonal_pairs:
+            trips_df = trips_df.loc[
+                trips_df["origin"] != trips_df["destination"]
+            ].reset_index(drop=True)
+            routes_by_od = {
+                od_pair: routes
+                for od_pair, routes in routes_by_od.items()
+                if od_pair[0] != od_pair[1]
+            }
+            if {"origin", "destination"}.issubset(routes_df.columns):
+                routes_df = routes_df.loc[
+                    routes_df["origin"] != routes_df["destination"]
+                ].reset_index(drop=True)
+            od_matrix = od_matrix.tolil(copy=True)
+            od_matrix.setdiag(0)
+            od_matrix = od_matrix.tocsr()
+            od_matrix.eliminate_zeros()
+
         link_result = build_link_table(
             network_df=raw["network_df"],
             flow_df=raw["flow_df"],
+            flow_columns=self.flow_columns,
         )
 
         link_df = link_result.link_df
@@ -539,7 +592,10 @@ class TrainingArtifactBuilder:
             link_df=link_df,
             node_df=raw["nodes_df"],
             strict=True,
-            weight_column="free_flow_time",
+            weight_column=str(
+                self._cfg_get("builders.graph.dataset_weight_column")
+            ),
+            zone_node_ids=self.node_classification.zone_ids,
         )
 
         graph = graph_result.graph
@@ -557,7 +613,7 @@ class TrainingArtifactBuilder:
             )
 
         od_indexing = self._build_od_indexing(
-            routes_by_od=raw["routes_by_od"],
+            routes_by_od=routes_by_od,
             zone_ids=zone_ids,
         )
 
@@ -576,10 +632,10 @@ class TrainingArtifactBuilder:
                     "effective_capacity_source": "effective_capacity",
                 },
             },
-            "routes_by_od": raw["routes_by_od"],
-            "routes_df": raw["routes_df"],
-            "trips_df": raw["trips_df"],
-            "od_matrix": raw["od_matrix"],
+            "primary_source_route_set": routes_by_od,
+            "primary_source_routes_df": routes_df,
+            "trips_df": trips_df,
+            "od_matrix": od_matrix,
         }
 
 
@@ -588,6 +644,8 @@ class TrainingArtifactBuilder:
         raw: Dict[str, Any],
         processed: Dict[str, Any],
         k_paths: int,
+        route_set: Any | None = None,
+        assignment_set: Any | None = None,
     ) -> Dict[str, Any]:
         """
         Build model-ready objects from processed transportation objects.
@@ -613,6 +671,11 @@ class TrainingArtifactBuilder:
         if int(k_paths) <= 0:
             raise ValueError("k_paths must be a positive integer.")
 
+        selected_routes_by_od = self._resolve_selected_routes_by_od(
+            processed=processed,
+            route_set=route_set,
+        )
+
         adapter = RouteModelAdapter(
             device=self.device,
             k_paths=int(k_paths),
@@ -628,7 +691,7 @@ class TrainingArtifactBuilder:
 
         network_params = adapter.transform(
             graph=processed["graph"],
-            routes_by_od=processed["routes_by_od"],
+            routes_by_od=selected_routes_by_od,
             edge_order=canonical_edge_order,
         )
 
@@ -670,15 +733,67 @@ class TrainingArtifactBuilder:
         target_result = build_targets(
             link_df=processed["link_df"],
             trips_df=processed["trips_df"],
-            routes_by_od=processed["routes_by_od"],
+            routes_by_od=selected_routes_by_od,
             edge_indexing=model_edge_indexing,
             od_indexing=model_od_indexing,
-            create_tensors=True,
-            tensor_device=self.device,
+            flow_column=str(processed["selected_flow_column"]),
         )
 
         targets = target_result.targets
         target_metadata = target_result.metadata
+
+        assignment_ground_truth = None
+        if assignment_set is not None:
+            assignment_ground_truth = getattr(assignment_set, "assignment_result", None)
+            if assignment_ground_truth is None:
+                raise ValueError(
+                    "The selected assignment_set does not contain materialized "
+                    "assignment ground truth."
+                )
+            assignment_ground_truth = {
+                key: value
+                for key, value in assignment_ground_truth.items()
+                if key in {
+                    "final_route_flows",
+                    "final_link_flows",
+                    "final_link_costs",
+                    "final_route_costs",
+                    "metadata",
+                }
+            }
+            for key in (
+                "final_route_flows",
+                "final_link_flows",
+                "final_link_costs",
+                "final_route_costs",
+            ):
+                assignment_ground_truth[f"{key}_t"] = torch.tensor(
+                    assignment_ground_truth[key],
+                    dtype=torch.float32,
+                    device="cpu",
+                )
+            targets["assignment_ground_truth"] = assignment_ground_truth
+
+        availability = self._dataset_cfg_get("data_availability")
+        target_provenance = {
+            "od": (
+                "dataset_full_od_ground_truth"
+                if bool(availability.get("has_full_od_ground_truth"))
+                else "dataset_od_data"
+            ),
+            "link_flows": (
+                "dataset_ground_truth_link_flows"
+                if bool(availability.get("has_ground_truth_link_flows"))
+                else "dataset_observed_link_flows"
+                if bool(availability.get("has_observed_link_flows"))
+                else "dataset_link_flow_data"
+            ),
+            "generated_assignment_flows": (
+                "assignment_set_ground_truth"
+                if assignment_set is not None
+                else None
+            ),
+        }
 
         visualization = self._build_visualization_payload(
             graph=processed["graph"],
@@ -689,11 +804,39 @@ class TrainingArtifactBuilder:
         "targets": targets,
         "visualization": visualization,
         "link_metadata": model_link_df,
-        "metadata": {
-            "targets": target_metadata,
+            "metadata": {
+                "targets": target_metadata,
+                "target_provenance": target_provenance,
+                "route_set_source": "experiment_route_set" if route_set is not None else "primary_source_route_set",
+            "assignment_set_source": "experiment_assignment_set" if assignment_set is not None else None,
             # "route_model": route_model_metadata, # TODO: esto?
         },
     }
+
+    @staticmethod
+    def _resolve_selected_routes_by_od(
+        *,
+        processed: Dict[str, Any],
+        route_set: Any | None,
+    ) -> Dict[Tuple[int, int], List[List[int]]]:
+        """Return the selected RouteSet in the adapter's route-by-OD format."""
+
+        if route_set is None:
+            return processed["primary_source_route_set"]
+
+        if not hasattr(route_set, "routes_df") or not hasattr(route_set, "od_to_route_indices"):
+            raise TypeError("route_set must be a materialized RouteSet instance.")
+
+        routes_df = route_set.routes_df
+        routes_by_od: Dict[Tuple[int, int], List[List[int]]] = {}
+        for od_pair, route_indices in route_set.od_to_route_indices.items():
+            routes_by_od[(int(od_pair[0]), int(od_pair[1]))] = [
+                list(routes_df.iloc[int(route_index)]["route_nodes"])
+                for route_index in route_indices
+            ]
+        if not routes_by_od:
+            raise ValueError("The selected route_set contains no OD routes.")
+        return routes_by_od
 
     def pack_artifact(
         self,
@@ -747,12 +890,21 @@ class TrainingArtifactBuilder:
             "processed": processed,
             "metadata": {
                 "dataset_name": self.dataset_name,
-                "volume_year": self.volume_year,
+                "flow_columns": self.flow_columns.as_dict(),
                 "multiday_od": self.multiday_od,
                 "max_routes_per_od": self.max_routes_per_od,
                 "trips_aggregation": self.trips_aggregation,
                 "reader_metadata": raw["metadata"],
                 "processed_summary": self._build_processed_summary(processed),
+                "route_provenance": {
+                    "primary_source_route_set": True,
+                    "primary_source_route_set_role": (
+                        "Normalized routes read from dataset.paths.tntp_files.routes. "
+                        "They are retained for provenance and validation only; an "
+                        "experiment training_artifact must use its selected route_set."
+                    ),
+                    "experiment_route_set_required_for_training_artifact": True,
+                },
             },
         }
 
@@ -789,7 +941,7 @@ class TrainingArtifactBuilder:
             saved_files.append(self.paths.artifact_path.name)
 
         if save_manifest:
-            manifest = self._build_bundle_manifest(artifact)
+            manifest = self.build_manifest(artifact)
 
             self.paths.manifest_path.write_text(
                 json.dumps(manifest, indent=2, ensure_ascii=False),
@@ -816,7 +968,33 @@ class TrainingArtifactBuilder:
             "manifest_path": str(self.paths.manifest_path) if save_manifest else None,
         }
 
-    def _build_bundle_manifest(self, artifact: Dict[str, Any]) -> Dict[str, Any]:
+    def build_manifest(
+        self,
+        artifact: Dict[str, Any],
+        *,
+        entry_name: str | None = None,
+        artifact_path: str | Path | None = None,
+    ) -> Dict[str, Any]:
+        """Build a lightweight manifest for a base or experiment artifact.
+
+        ``entry_name`` is explicit because an experiment artifact is currently
+        validated and stored using the historical ``training_artifact`` type,
+        while its manifest belongs to the experiment-artifact layer.
+        """
+
+        return self._build_bundle_manifest(
+            artifact,
+            entry_name=entry_name,
+            artifact_path=artifact_path,
+        )
+
+    def _build_bundle_manifest(
+        self,
+        artifact: Dict[str, Any],
+        *,
+        entry_name: str | None = None,
+        artifact_path: str | Path | None = None,
+    ) -> Dict[str, Any]:
         """Build the lightweight artifact-bundle manifest."""
 
         from src.components.artifacts.fingerprints import (
@@ -833,8 +1011,13 @@ class TrainingArtifactBuilder:
         link_order_fingerprint = compute_link_order_fingerprint(processed["edge_indexing"]["link_pair_indices"])
         zone_order_fingerprint = compute_zone_order_fingerprint(processed["od_indexing"].get("zone_ids", []))
 
-        base_artifact_entry = {
-            "path": str(self.paths.artifact_path),
+        manifest_entry_name = entry_name or (
+            "base_artifact"
+            if artifact["artifact_type"] == "base_artifact"
+            else artifact["artifact_type"]
+        )
+        artifact_entry = {
+            "path": str(artifact_path or self.paths.artifact_path),
             "artifact_type": artifact["artifact_type"],
             "artifact_version": artifact["artifact_version"],
             "fingerprints": {
@@ -846,7 +1029,24 @@ class TrainingArtifactBuilder:
             "metadata": {
                 "dataset_name": artifact["dataset_name"],
                 "processed_summary": self._to_serializable(artifact["metadata"].get("processed_summary", {})),
-                "reader_metadata": self._to_serializable(artifact["metadata"].get("reader_metadata", {})),
+                "reader_metadata": self._build_manifest_value(
+                    artifact["metadata"].get("reader_metadata", {}),
+                    artifact_key="raw.metadata",
+                ),
+                "full": self._build_manifest_value(
+                    artifact.get("metadata", {}), "metadata"
+                ),
+            },
+            "content": {
+                "raw": self._build_manifest_value(artifact.get("raw", {}), "raw"),
+                "processed": self._build_manifest_value(
+                    artifact.get("processed", {}), "processed"
+                ),
+                "model_ready": self._build_manifest_value(
+                    artifact.get("model_ready", {}), "model_ready"
+                )
+                if "model_ready" in artifact
+                else None,
             },
         }
 
@@ -855,12 +1055,45 @@ class TrainingArtifactBuilder:
             "dataset_name": artifact["dataset_name"],
             "artifact_type": artifact["artifact_type"],
             "created_at": artifact["created_at"],
-            "base_artifact": base_artifact_entry,
+            manifest_entry_name: artifact_entry,
             "route_sets": {},
             "assignment_sets": {},
-            "config": self._to_serializable(artifact["config"]),
-            "environment": self._to_serializable(artifact["environment"]),
+            "config": self._build_manifest_value(artifact["config"], "config"),
+            "environment": self._build_manifest_value(
+                artifact["environment"], "environment"
+            ),
         }
+
+    def _build_manifest_value(self, value: Any, artifact_key: str) -> Any:
+        """Serialize metadata while replacing large collections by references."""
+
+        if isinstance(value, dict):
+            result: Dict[str, Any] = {}
+            for key, child in value.items():
+                child_key = f"{artifact_key}.{key}"
+                if isinstance(child, (dict, list, tuple, set)) and len(child) > 20:
+                    result[str(key)] = {
+                        "kind": type(child).__name__,
+                        "length": int(len(child)),
+                        "artifact_key": child_key,
+                    }
+                else:
+                    result[str(key)] = self._build_manifest_value(child, child_key)
+            return result
+
+        if isinstance(value, (list, tuple, set)):
+            if len(value) > 20:
+                return {
+                    "kind": type(value).__name__,
+                    "length": int(len(value)),
+                    "artifact_key": artifact_key,
+                }
+            return [
+                self._build_manifest_value(item, f"{artifact_key}[{index}]")
+                for index, item in enumerate(value)
+            ]
+
+        return self._to_serializable(value)
 
     # ------------------------------------------------------------------
     # Processed object builders
@@ -984,18 +1217,15 @@ class TrainingArtifactBuilder:
             Resolved paths.
         """
 
-        node_path = self._as_path(self._cfg_get("input_routes.node_route"))
-        network_path = self._as_path(self._cfg_get("input_routes.network_route"))
-        flow_path = self._as_path(self._cfg_get("input_routes.flow_route"))
-        trips_path = self._as_path(self._cfg_get("input_routes.trips_route"))
-        routes_path = self._as_path(self._cfg_get("input_routes.routes_route"))
+        node_path = self._as_path(self._dataset_cfg_get("paths.tntp_files.nodes"))
+        network_path = self._as_path(self._dataset_cfg_get("paths.tntp_files.network"))
+        flow_path = self._as_path(self._dataset_cfg_get("paths.tntp_files.flows"))
+        trips_path = self._as_path(self._dataset_cfg_get("paths.tntp_files.trips"))
+        routes_path = self._as_path(self._dataset_cfg_get("paths.tntp_files.routes"))
 
-        output_dir = self._as_path(
-            self._cfg_get("output_routes.processed_route")
-        )
-
-        artifact_path = output_dir / self.artifact_name
-        manifest_path = output_dir / self.manifest_name
+        artifact_path = self._as_path(self._dataset_cfg_get("paths.artifacts.base"))
+        manifest_path = self._as_path(self._dataset_cfg_get("paths.manifests.base"))
+        output_dir = artifact_path.parent
 
         return TrainingArtifactPaths(
             node_path=node_path,
@@ -1090,8 +1320,18 @@ class TrainingArtifactBuilder:
 
         graph = processed["graph"]
         link_df = processed["link_df"]
-        routes_by_od = processed["routes_by_od"]
+        routes_by_od = processed["primary_source_route_set"]
         od_matrix = processed["od_matrix"]
+        od_indexing = processed.get("od_indexing", {})
+        route_metadata = processed.get("metadata", {}).get("routes", {})
+        route_counts = [len(routes) for routes in routes_by_od.values()]
+
+        def collection_summary(value: Any, artifact_key: str) -> Dict[str, Any]:
+            if isinstance(value, dict):
+                return {"kind": "dict", "length": int(len(value)), "artifact_key": artifact_key}
+            if isinstance(value, (list, tuple, set)):
+                return {"kind": type(value).__name__, "length": int(len(value)), "artifact_key": artifact_key}
+            return {"kind": type(value).__name__, "artifact_key": artifact_key}
 
         return {
             "num_nodes": int(graph.number_of_nodes()),
@@ -1106,6 +1346,28 @@ class TrainingArtifactBuilder:
             "num_routes": int(sum(len(routes) for routes in routes_by_od.values())),
             "od_matrix_shape": tuple(int(x) for x in od_matrix.shape),
             "od_matrix_nnz": int(od_matrix.nnz) if sparse.issparse(od_matrix) else None,
+            "route_metadata": {
+                "od_pairs_with_routes": int(len(routes_by_od)),
+                "od_pairs_without_routes": int(route_metadata.get("od_pairs_without_routes", 0)),
+                "od_pairs_with_less_than_k": int(route_metadata.get("od_pairs_with_less_than_k", 0)),
+                "route_counts": {
+                    "kind": "list",
+                    "length": int(len(route_counts)),
+                    "min": int(min(route_counts)) if route_counts else 0,
+                    "max": int(max(route_counts)) if route_counts else 0,
+                    "artifact_key": "processed.primary_source_route_set.values()",
+                },
+            },
+            "large_collections": {
+                name: collection_summary(value, key)
+                for name, value, key in (
+                    ("zone_ids", od_indexing.get("zone_ids", []), "processed.od_indexing.zone_ids"),
+                    ("zone_id_to_idx", od_indexing.get("zone_id_to_idx", {}), "processed.od_indexing.zone_id_to_idx"),
+                    ("idx_to_zone_id", od_indexing.get("idx_to_zone_id", {}), "processed.od_indexing.idx_to_zone_id"),
+                    ("od_pairs", od_indexing.get("od_pairs", []), "processed.od_indexing.od_pairs"),
+                    ("primary_source_route_set", routes_by_od, "processed.primary_source_route_set"),
+                )
+            },
         }
 
     def _build_model_ready_summary(self, model_ready: Dict[str, Any]) -> Dict[str, Any]:
@@ -1280,6 +1542,32 @@ class TrainingArtifactBuilder:
 
         return current
 
+    def _dataset_cfg_get(self, dotted_key: str) -> Any:
+        """Resolve a required value from the selected dataset configuration."""
+
+        parts = dotted_key.split(".")
+        current = self.dataset_cfg
+
+        for part in parts:
+            if isinstance(current, DictConfig):
+                if part not in current:
+                    raise KeyError(
+                        f"Dataset configuration key '{dotted_key}' is missing."
+                    )
+                current = current[part]
+            elif isinstance(current, dict):
+                if part not in current:
+                    raise KeyError(
+                        f"Dataset configuration key '{dotted_key}' is missing."
+                    )
+                current = current[part]
+            else:
+                raise KeyError(
+                    f"Cannot resolve dataset key '{dotted_key}' because '{part}' is not a mapping."
+                )
+
+        return current
+
     def _as_path(self, value: Any) -> Path:
         """
         Convert a path-like config value into a Path object.
@@ -1336,6 +1624,7 @@ class TrainingArtifactBuilder:
 
 def build_training_artifact(
     cfg: Union[DictConfig, Dict[str, Any]],
+    dataset_cfg: Union[DictConfig, Dict[str, Any]],
     device: str = "cpu",
     save: bool = True,
     artifact_name: str = "training_artifact.joblib",
@@ -1363,6 +1652,7 @@ def build_training_artifact(
 
     builder = TrainingArtifactBuilder(
         cfg=cfg,
+        dataset_cfg=dataset_cfg,
         device=device,
         artifact_name=artifact_name,
         manifest_name=manifest_name,

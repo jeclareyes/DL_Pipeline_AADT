@@ -1,5 +1,5 @@
 from __future__ import annotations
-# src/data_ingestion/adapters/route_model_adapter.py
+# src/data_handling/adapters/route_model_adapter.py
 
 """
 Route Model Adapter

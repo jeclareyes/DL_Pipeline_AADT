@@ -1,4 +1,4 @@
-# src/data_ingestion/builders/target_builder.py
+# src/data_handling/builders/target_builder.py
 from __future__ import annotations
 
 """
@@ -37,7 +37,7 @@ Design principles
 - Fill missing target values with zero only after creating masks.
 - Align flow targets with link_df row order.
 - Align OD targets with routes_by_od OD-pair order.
-- Return NumPy arrays and optional CPU tensors.
+- Return NumPy arrays and CPU tensors with float32 dtype.
 - Keep device transfer outside this builder.
 """
 
@@ -82,27 +82,10 @@ class TargetBuilder:
 
     Parameters
     ----------
-    create_tensors : bool, default=True
-        If True, PyTorch tensors are created in addition to NumPy arrays.
-
-    tensor_device : str, default="cpu"
-        Device used when creating tensors. For artifact generation, "cpu" is
-        recommended.
-
-    tensor_dtype : torch.dtype, default=torch.float32
-        Tensor dtype for target and mask tensors.
-
-    strict : bool, default=True
-        If True, missing required columns or dimensional inconsistencies raise
-        errors.
-
-    missing_target_fill_value : float, default=0.0
-        Value used to fill missing targets after masks have been created.
+    Target tensors are always created on CPU with ``torch.float32``. Missing
+    values remain NaN in the raw arrays and are replaced by zero only in the
+    model-ready arrays after observation masks have been created.
     """
-
-    REQUIRED_LINK_COLUMNS = {
-        "volume",
-    }
 
     REQUIRED_TRIPS_COLUMNS = {
         "origin",
@@ -110,25 +93,19 @@ class TargetBuilder:
         "flow",
     }
 
-    def __init__(
-        self,
-        create_tensors: bool = True,
-        tensor_device: str = "cpu",
-        tensor_dtype: torch.dtype = torch.float32,
-        strict: bool = True,
-        missing_target_fill_value: float = 0.0,
-    ) -> None:
-        self.create_tensors = bool(create_tensors)
-        self.tensor_device = str(tensor_device)
-        self.tensor_dtype = tensor_dtype
-        self.strict = bool(strict)
-        self.missing_target_fill_value = float(missing_target_fill_value)
+    def __init__(self) -> None:
+        self.create_tensors = True
+        self.tensor_device = "cpu"
+        self.tensor_dtype = torch.float32
+        self.strict = True
+        self.missing_target_fill_value = 0.0
 
     def build(
         self,
         link_df: pd.DataFrame,
         trips_df: pd.DataFrame,
         routes_by_od: Dict[ODPair, List[List[int]]],
+        flow_column: str,
         edge_indexing: Optional[Dict[str, Any]] = None,
         od_indexing: Optional[Dict[str, Any]] = None,
     ) -> TargetBuildResult:
@@ -162,11 +139,7 @@ class TargetBuilder:
 
         logger.info("Building flow and OD targets.")
 
-        self._require_columns(
-            df=link_df,
-            required_columns=self.REQUIRED_LINK_COLUMNS,
-            df_name="link_df",
-        )
+        self._require_columns(df=link_df, required_columns={flow_column}, df_name="link_df")
 
         self._require_columns(
             df=trips_df,
@@ -177,6 +150,7 @@ class TargetBuilder:
         flow_payload = self._build_flow_targets(
             link_df=link_df,
             edge_indexing=edge_indexing,
+            flow_column=flow_column,
         )
 
         od_payload = self._build_od_targets(
@@ -190,8 +164,7 @@ class TargetBuilder:
             **od_payload,
         }
 
-        if self.create_tensors:
-            targets.update(self._build_tensor_payload(targets))
+        targets.update(self._build_tensor_payload(targets))
 
         metadata = self._build_metadata(
             targets=targets,
@@ -226,6 +199,7 @@ class TargetBuilder:
         self,
         link_df: pd.DataFrame,
         edge_indexing: Optional[Dict[str, Any]] = None,
+        flow_column: str = "",
     ) -> Dict[str, Any]:
         """
         Build link-flow target vector and observation mask.
@@ -267,10 +241,11 @@ class TargetBuilder:
             link_rows = self._build_edge_aligned_link_rows(
                 link_df=link_df,
                 link_pair_indices=edge_indexing["link_pair_indices"],
+                flow_column=flow_column,
             )
 
         raw_flow = pd.to_numeric(
-            link_rows["volume"],
+            link_rows[flow_column],
             errors="coerce",
         ).to_numpy(dtype=np.float32)
 
@@ -308,6 +283,7 @@ class TargetBuilder:
         self,
         link_df: pd.DataFrame,
         link_pair_indices: Any,
+        flow_column: str,
     ) -> pd.DataFrame:
         """
         Reindex link_df to the model edge order.
@@ -326,7 +302,7 @@ class TargetBuilder:
             link_df rows reordered to match link_pair_indices.
         """
 
-        required_columns = {"init_node", "term_node", "volume"}
+        required_columns = {"init_node", "term_node", flow_column}
         missing_columns = required_columns - set(link_df.columns)
 
         if missing_columns:
@@ -839,13 +815,9 @@ def build_targets(
     link_df: pd.DataFrame,
     trips_df: pd.DataFrame,
     routes_by_od: Dict[ODPair, List[List[int]]],
+    flow_column: str,
     edge_indexing: Optional[Dict[str, Any]] = None,
     od_indexing: Optional[Dict[str, Any]] = None,
-    create_tensors: bool = True,
-    tensor_device: str = "cpu",
-    tensor_dtype: torch.dtype = torch.float32,
-    strict: bool = True,
-    missing_target_fill_value: float = 0.0,
 ) -> TargetBuildResult:
     """
     Convenience function to build model targets and masks.
@@ -867,39 +839,19 @@ def build_targets(
     od_indexing : Optional[Dict[str, Any]], default=None
         OD indexing payload.
 
-    create_tensors : bool, default=True
-        Whether to create PyTorch tensors.
-
-    tensor_device : str, default="cpu"
-        Device for tensor creation.
-
-    tensor_dtype : torch.dtype, default=torch.float32
-        Floating-point tensor dtype.
-
-    strict : bool, default=True
-        Whether to use strict validation behavior.
-
-    missing_target_fill_value : float, default=0.0
-        Fill value used after observation masks are created.
-
     Returns
     -------
     TargetBuildResult
         Target dictionary and metadata.
     """
 
-    builder = TargetBuilder(
-        create_tensors=create_tensors,
-        tensor_device=tensor_device,
-        tensor_dtype=tensor_dtype,
-        strict=strict,
-        missing_target_fill_value=missing_target_fill_value,
-    )
+    builder = TargetBuilder()
 
     return builder.build(
         link_df=link_df,
         trips_df=trips_df,
         routes_by_od=routes_by_od,
+        flow_column=flow_column,
         edge_indexing=edge_indexing,
         od_indexing=od_indexing,
     )

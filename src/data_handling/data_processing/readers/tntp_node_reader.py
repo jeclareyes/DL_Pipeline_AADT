@@ -1,4 +1,4 @@
-# src/data_ingestion/readers/tntp_node_reader.py
+# src/data_handling/readers/tntp_node_reader.py
 """
 TNTP Node Reader
 ================
