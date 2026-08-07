@@ -10,20 +10,20 @@ if __package__ is None or __package__ == "":
     if str(PROJECT_ROOT_BOOTSTRAP) not in sys.path:
         sys.path.insert(0, str(PROJECT_ROOT_BOOTSTRAP))
 
-from src.data_pickle_extraction.config_utils import find_project_root, load_config, resolve_project_path
-from src.data_pickle_extraction.graph_validation_utils import (
+from data_handling.data_from_pickle.config_utils import find_project_root, load_config, resolve_project_path
+from data_handling.data_from_pickle.graph_validation_utils import (
     validate_graph_topology_and_bidirectionality,
     validate_network_tntp_topology,
 )
-from src.data_pickle_extraction.io_utils import (
+from data_handling.data_from_pickle.io_utils import (
     ensure_output_directories,
     load_reconstruction_inputs,
     save_dataframe_as_tntp,
     save_json_report,
     save_text_as_tntp,
 )
-from src.data_pickle_extraction.route_generation_utils import build_routes_tntp_text
-from src.data_pickle_extraction.tntp_builders import (
+from data_handling.data_from_pickle.route_generation_utils import build_routes_tntp_text
+from data_handling.data_from_pickle.tntp_builders import (
     MISSING_REVERSE_LINK_ID,
     REQUIRED_FLOW_COLUMNS_PREFIX,
     build_flows_tntp,

@@ -15,8 +15,8 @@ try:
     from .tntp_builders import build_export_graph_from_network_tntp
 except (ImportError, ValueError):
     try:
-        from src.data_pickle_extraction.od_utils import get_zone_ids_from_nodes_tntp
-        from src.data_pickle_extraction.tntp_builders import build_export_graph_from_network_tntp
+        from data_handling.data_from_pickle.od_utils import get_zone_ids_from_nodes_tntp
+        from data_handling.data_from_pickle.tntp_builders import build_export_graph_from_network_tntp
     except ImportError:
         from od_utils import get_zone_ids_from_nodes_tntp  # type: ignore
         from tntp_builders import build_export_graph_from_network_tntp  # type: ignore

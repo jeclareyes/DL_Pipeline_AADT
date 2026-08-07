@@ -1,4 +1,4 @@
-# src/data_pickle_extraction/config.yaml
+# src/data_from_pickle/config.yaml
 
 # ESTA CONFIGURACIÓN NO DEEBE USARSE EN NINGÚN OTRO SCRIPT.
 # ESTA ESTÁ DISEÑADA ÚNICAMENTE PARA EXTRAER DATOS DE ARCHIVOS PICKLES

@@ -227,7 +227,7 @@ def validate_network_tntp_topology(
         from .tntp_builders import build_export_graph_from_network_tntp
     except (ImportError, ValueError):
         try:
-            from src.data_pickle_extraction.tntp_builders import build_export_graph_from_network_tntp
+            from data_handling.data_from_pickle.tntp_builders import build_export_graph_from_network_tntp
         except ImportError:
             from tntp_builders import build_export_graph_from_network_tntp  # type: ignore
 
