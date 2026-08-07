@@ -10,7 +10,7 @@ import networkx as nx
 import pandas as pd
 
 from src.components.assignment_motors.route_set import RouteInputFormat, RouteSet, RouteSetBuildConfig
-from src.components.route_engines import get_route_engine
+from src.components.route_engines.base_engine import generate_routes_by_od
 from src.utils.serialization import dump, load
 
 from .config_schemas import RouteSetSpecConfig, RouteSetRequirementConfig
@@ -82,6 +82,7 @@ class RouteSetBuilder:
             graph=graph,
             od_pairs=od_pairs,
             spec=spec,
+            weight=self._effective_weight(spec=spec, requirement=requirement),
         )
         routes_by_od = self._apply_ordering(routes_by_od=routes_by_od, link_df=link_df, spec=spec)
 
@@ -97,6 +98,12 @@ class RouteSetBuilder:
             "route_count": int(route_set.number_of_routes),
             "od_pair_count": int(len(route_set.od_to_route_indices)),
             "k_generate": int(spec.builder.k_generate),
+            "k_generate_intrazonal": (
+                int(spec.constraints.intrazonal.k_generate or spec.builder.k_generate)
+                if spec.constraints.intrazonal.enabled
+                and spec.constraints.intrazonal.policy == "cycle"
+                else None
+            ),
             "k_active": None if requirement is None else int(requirement.k_active),
             "canonical_link_id_order": list(route_set.canonical_link_id_order),
             "route_ordering": spec.ordering.route_rank_policy,
@@ -105,6 +112,12 @@ class RouteSetBuilder:
         diagnostics = self._build_diagnostics(
             routes_by_od=routes_by_od,
             k_generate=int(spec.builder.k_generate),
+            intrazonal_k_generate=(
+                int(spec.constraints.intrazonal.k_generate or spec.builder.k_generate)
+                if spec.constraints.intrazonal.enabled
+                and spec.constraints.intrazonal.policy == "cycle"
+                else None
+            ),
         )
         asset = RouteSetAsset(
             asset_type="route_set_asset",
@@ -161,7 +174,12 @@ class RouteSetBuilder:
 
         processed = self.base_artifact["processed"]
         zone_ids = self._extract_zone_ids(processed)
-        signature_payload = self._build_signature_payload(spec=spec, requirement=requirement, zone_ids=zone_ids)
+        signature_payload = self._build_signature_payload(
+            spec=spec,
+            requirement=requirement,
+            zone_ids=zone_ids,
+            weight=self._effective_weight(spec=spec, requirement=requirement),
+        )
         signature = compute_route_set_signature(signature_payload)
         network_fp = self._network_fingerprint()
         od_fp = self._od_space_fingerprint()
@@ -185,30 +203,90 @@ class RouteSetBuilder:
         graph: nx.DiGraph,
         od_pairs: list[tuple[int, int]],
         spec: RouteSetSpecConfig,
+        weight: str,
     ) -> dict[tuple[int, int], list[list[int]]]:
-        engine = get_route_engine(spec.builder.engine, graph)
-        constraints = {
-            "allow_duplicates": bool(spec.constraints.allow_duplicates),
-            "allow_loops": bool(spec.constraints.allow_loops),
-            "allow_auto_routes": bool(spec.constraints.allow_auto_routes),
-        }
         connector_link_types = {int(value) for value in spec.connectors.connector_link_types}
 
+        interzonal_pairs = [pair for pair in od_pairs if int(pair[0]) != int(pair[1])]
+        intrazonal_pairs = [pair for pair in od_pairs if int(pair[0]) == int(pair[1])]
         routes_by_od: dict[tuple[int, int], list[list[int]]] = {}
-        missing_pairs: list[tuple[int, int]] = []
-        for origin_id, destination_id in od_pairs:
-            routes = engine.get_k_routes(
-                origin_id=origin_id,
-                destination_id=destination_id,
-                k=int(spec.builder.k_generate),
-                weight=str(spec.builder.weight),
-                constraints=constraints,
-                connector_link_types=connector_link_types,
+
+        if interzonal_pairs:
+            routes_by_od.update(
+                generate_routes_by_od(
+                    graph=graph,
+                    od_pairs=interzonal_pairs,
+                    engine_name=spec.builder.engine,
+                    k=int(spec.builder.k_generate),
+                    weight=weight,
+                    constraints={
+                        "allow_duplicates": bool(spec.constraints.interzonal.allow_duplicates),
+                        "allow_loops": bool(spec.constraints.interzonal.allow_loops),
+                        "allow_auto_routes": False,
+                    },
+                    connector_link_types=connector_link_types,
+                    parallel=bool(spec.builder.parallel),
+                    workers=spec.builder.parallel_workers,
+                    batch_size=int(spec.builder.od_batch_size),
+                    show_progress=bool(spec.builder.show_progress),
+                )
             )
-            route_lists = [list(route) for route in routes]
-            if not route_lists:
-                missing_pairs.append((int(origin_id), int(destination_id)))
-            routes_by_od[(int(origin_id), int(destination_id))] = route_lists
+
+        intrazonal = spec.constraints.intrazonal
+        if intrazonal.enabled and intrazonal.policy == "cycle" and intrazonal_pairs:
+            routes_by_od.update(
+                generate_routes_by_od(
+                    graph=graph,
+                    od_pairs=intrazonal_pairs,
+                    engine_name=spec.builder.engine,
+                    k=int(intrazonal.k_generate or spec.builder.k_generate),
+                    weight=weight,
+                    constraints={
+                        "allow_duplicates": bool(intrazonal.allow_duplicates),
+                        "allow_loops": True,
+                        "allow_auto_routes": True,
+                    },
+                    connector_link_types=connector_link_types,
+                    parallel=bool(spec.builder.parallel),
+                    workers=spec.builder.parallel_workers,
+                    batch_size=int(spec.builder.od_batch_size),
+                    show_progress=bool(spec.builder.show_progress),
+                )
+            )
+
+        # Route generation is intentionally split into interzonal and
+        # intrazonal batches because they have different engine constraints.
+        # The resulting mapping must nevertheless follow the canonical OD
+        # order from the processed artifact.  Dict insertion order propagates
+        # into RouteSet.od_to_route_indices, network_params and targets.
+        expected_od_order = (
+            od_pairs
+            if intrazonal.enabled and intrazonal.policy == "cycle"
+            else interzonal_pairs
+        )
+        normalized_routes = {
+            (int(origin), int(destination)): routes
+            for (origin, destination), routes in routes_by_od.items()
+        }
+        missing_expected_pairs = [
+            (int(origin), int(destination))
+            for origin, destination in expected_od_order
+            if (int(origin), int(destination)) not in normalized_routes
+        ]
+        if missing_expected_pairs:
+            raise ValueError(
+                "Route-set materialization did not produce all expected OD pairs. "
+                f"First missing pairs: {missing_expected_pairs[:10]}"
+            )
+
+        routes_by_od = {
+            (int(origin), int(destination)): normalized_routes[
+                (int(origin), int(destination))
+            ]
+            for origin, destination in expected_od_order
+        }
+
+        missing_pairs = [od_pair for od_pair, routes in routes_by_od.items() if not routes]
 
         if missing_pairs:
             raise ValueError(
@@ -259,7 +337,10 @@ class RouteSetBuilder:
             fail_on_duplicate_routes=not bool(spec.constraints.allow_duplicates),
             fail_on_empty_route_set=True,
             fail_on_missing_od_routes=False,
-            require_simple_node_routes=not bool(spec.constraints.allow_loops),
+            require_simple_node_routes=not (
+                spec.constraints.intrazonal.enabled
+                and spec.constraints.intrazonal.policy == "cycle"
+            ),
             require_unique_link_ids=True,
             require_unique_directed_edges=True,
         )
@@ -270,19 +351,30 @@ class RouteSetBuilder:
         spec: RouteSetSpecConfig,
         requirement: RouteSetRequirementConfig | None,
         zone_ids: list[int],
+        weight: str,
     ) -> dict[str, Any]:
         return {
+            "route_set_schema_version": 2,
+            "od_order_policy": "processed_od_indexing_order",
             "spec": {
                 "id": spec.id,
                 "builder": {
                     "engine": spec.builder.engine,
-                    "weight": spec.builder.weight,
+                    "weight": weight,
                     "k_generate": int(spec.builder.k_generate),
                 },
                 "constraints": {
-                    "allow_duplicates": spec.constraints.allow_duplicates,
-                    "allow_loops": spec.constraints.allow_loops,
-                    "allow_auto_routes": spec.constraints.allow_auto_routes,
+                    "interzonal": {
+                        "allow_duplicates": spec.constraints.interzonal.allow_duplicates,
+                        "allow_loops": spec.constraints.interzonal.allow_loops,
+                    },
+                    "intrazonal": {
+                        "enabled": spec.constraints.intrazonal.enabled,
+                        "policy": spec.constraints.intrazonal.policy,
+                        "allow_duplicates": spec.constraints.intrazonal.allow_duplicates,
+                        "allow_loops": spec.constraints.intrazonal.allow_loops,
+                        "k_generate": spec.constraints.intrazonal.k_generate,
+                    },
                 },
                 "connectors": list(spec.connectors.connector_link_types),
                 "ordering": {
@@ -295,21 +387,38 @@ class RouteSetBuilder:
             else {
                 "spec_id": requirement.spec_id,
                 "k_active": int(requirement.k_active),
+                "weight_column": requirement.weight_column,
             },
             "zone_ids": [int(zone_id) for zone_id in zone_ids],
         }
+
+    @staticmethod
+    def _effective_weight(
+        *,
+        spec: RouteSetSpecConfig,
+        requirement: RouteSetRequirementConfig | None,
+    ) -> str:
+        if requirement is not None and requirement.weight_column is not None:
+            return requirement.weight_column
+        return spec.builder.weight
 
     def _build_diagnostics(
         self,
         *,
         routes_by_od: Mapping[tuple[int, int], list[list[int]]],
         k_generate: int,
+        intrazonal_k_generate: int | None = None,
     ) -> dict[str, Any]:
         route_counts = [len(routes) for routes in routes_by_od.values()]
         partial_pairs = [
             od_pair
             for od_pair, routes in routes_by_od.items()
-            if len(routes) < k_generate
+            if len(routes)
+            < (
+                intrazonal_k_generate
+                if od_pair[0] == od_pair[1] and intrazonal_k_generate is not None
+                else k_generate
+            )
         ]
         return {
             "num_od_pairs": int(len(routes_by_od)),

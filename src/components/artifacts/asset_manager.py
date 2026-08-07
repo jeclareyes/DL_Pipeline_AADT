@@ -35,11 +35,15 @@ class AssetManager:
         self,
         manifest_path: str | Path,
         base_artifact_path: str | Path | None = None,
+        creation_artifact_path: str | Path | None = None,
         policy: Mapping[str, Any] | AssetPolicyConfig | None = None,
     ) -> None:
         self.manifest_store = ManifestStore(manifest_path)
         self.registry = AssetRegistry(self.manifest_store)
         self.base_artifact_path = Path(base_artifact_path) if base_artifact_path is not None else None
+        self.creation_artifact_path = (
+            Path(creation_artifact_path) if creation_artifact_path is not None else None
+        )
         self.policy = self._normalize_policy(policy)
         self._materializer: AssetMaterializer | None = None
 
@@ -100,11 +104,28 @@ class AssetManager:
     def resolve_assignment_set(
         self,
         spec: Mapping[str, Any] | AssignmentSetSpecConfig,
+        route_set_requirement: Mapping[str, Any] | RouteSetRequirementConfig | None = None,
     ) -> dict[str, Any]:
         """Resolve or materialize an assignment-set recipe asset."""
 
         spec_cfg = self._coerce_assignment_set_spec(spec)
         route_requirement = spec_cfg.requires
+        if route_set_requirement is not None:
+            requested_route_requirement = self._coerce_route_requirement(route_set_requirement)
+            if requested_route_requirement.spec_id != route_requirement.spec_id:
+                raise ValueError(
+                    "Experiment route_set spec does not match the route_set required by "
+                    f"assignment_set {spec_cfg.id!r}: "
+                    f"experiment={requested_route_requirement.spec_id!r}, "
+                    f"assignment={route_requirement.spec_id!r}."
+                )
+            if requested_route_requirement.k_active != route_requirement.k_active:
+                raise ValueError(
+                    "Experiment route_set k_active does not match the assignment_set requirement: "
+                    f"experiment={requested_route_requirement.k_active}, "
+                    f"assignment={route_requirement.k_active}."
+                )
+            route_requirement = requested_route_requirement
         route_set_spec = self._load_route_set_spec(route_requirement.spec_id)
         route_set_entry = self.resolve_route_set(route_requirement, route_set_spec)
 
@@ -153,7 +174,11 @@ class AssetManager:
             return self._materializer
         base_artifact = self._load_base_artifact()
         output_root = self.manifest_store.manifest_path.parent
-        self._materializer = AssetMaterializer(base_artifact=base_artifact, output_root=output_root)
+        self._materializer = AssetMaterializer(
+            base_artifact=base_artifact,
+            output_root=output_root,
+            creation_artifact=self.creation_artifact_path,
+        )
         return self._materializer
 
     def _load_base_artifact(self) -> dict[str, Any]:
@@ -211,8 +236,43 @@ class AssetManager:
             "od_space_fingerprint": od_fp,
             "link_order_fingerprint": link_order_fp,
             "zone_order_fingerprint": zone_order_fp,
-            "metadata": base_artifact.get("metadata", {}),
+            "metadata": {
+                "dataset_name": base_artifact.get("dataset_name"),
+                "processed_summary": base_artifact.get("metadata", {}).get(
+                    "processed_summary", {}
+                ),
+                "reader_metadata": self._summarize_manifest_value(
+                    base_artifact.get("metadata", {}).get("reader_metadata", {}),
+                    artifact_key="raw.metadata",
+                ),
+            },
         }
+
+    @staticmethod
+    def _summarize_manifest_value(value: Any, artifact_key: str) -> Any:
+        """Keep registry metadata inspectable without duplicating the artifact."""
+
+        if isinstance(value, Mapping):
+            return {
+                str(key): AssetManager._summarize_manifest_value(
+                    child, f"{artifact_key}.{key}"
+                )
+                for key, child in value.items()
+            }
+        if isinstance(value, (list, tuple, set)):
+            if len(value) > 20:
+                return {
+                    "kind": type(value).__name__,
+                    "length": int(len(value)),
+                    "artifact_key": artifact_key,
+                }
+            return [
+                AssetManager._summarize_manifest_value(
+                    child, f"{artifact_key}[{index}]"
+                )
+                for index, child in enumerate(value)
+            ]
+        return value
 
     def _load_route_set_spec(self, spec_id: str) -> RouteSetSpecConfig:
         from .config_schemas import load_route_set_spec
@@ -233,6 +293,11 @@ class AssetManager:
         return RouteSetRequirementConfig(
             spec_id=str(value["spec_id"]),
             k_active=int(value["k_active"]),
+            weight_column=(
+                None
+                if value.get("weight_column") is None
+                else str(value["weight_column"])
+            ),
         )
 
     def _coerce_route_set_spec(self, value: Mapping[str, Any] | RouteSetSpecConfig) -> RouteSetSpecConfig:

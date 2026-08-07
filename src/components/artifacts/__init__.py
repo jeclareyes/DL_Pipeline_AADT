@@ -2,6 +2,7 @@ from .asset_manager import AssetManager
 from .asset_pipeline import AssetPipeline, AssetPipelineResult
 from .asset_registry import AssetRegistry
 from .asset_materializer import AssetMaterializer
+from .asset_materialization_pipeline import AssetMaterializationPipeline, AssetMaterializationResult
 from .artifact_bundle import ArtifactBundle
 from .manifest_store import ManifestStore
 from .config_schemas import (
@@ -33,6 +34,10 @@ from .fingerprints import (
 )
 from .route_set_builder import RouteSetAsset, RouteSetBuildResult, RouteSetBuilder
 from .assignment_set_builder import AssignmentSetAsset, AssignmentSetBuildResult, AssignmentSetBuilder
+from .base_artifact import BaseArtifactBuilder, BaseArtifactLoadResult, BaseArtifactLoader, build_base_artifact
+from .common import ArtifactManifestContract, ArtifactReference, ArtifactStage
+from .experiment_artifact import ExperimentArtifactBuilder, ExperimentArtifactLoadResult, ExperimentArtifactLoader
+from .post_training_artifact import materialize_post_trained_artifact, materialize_post_training_artifact
 
 __all__ = [
     "AssignmentSetAsset",
@@ -41,9 +46,14 @@ __all__ = [
     "AssignmentSetRequirementConfig",
     "AssignmentSetSpecConfig",
     "AssetMaterializer",
+    "AssetMaterializationPipeline",
+    "AssetMaterializationResult",
     "AssetManager",
     "AssetPipeline",
     "AssetPipelineResult",
+    "ArtifactManifestContract",
+    "ArtifactReference",
+    "ArtifactStage",
     "AssetPolicyConfig",
     "AssetRegistry",
     "AssetRequirementsConfig",
@@ -53,6 +63,15 @@ __all__ = [
     "DatasetNature",
     "DatasetProfileConfig",
     "ManifestStore",
+    "BaseArtifactBuilder",
+    "BaseArtifactLoadResult",
+    "BaseArtifactLoader",
+    "build_base_artifact",
+    "ExperimentArtifactBuilder",
+    "ExperimentArtifactLoadResult",
+    "ExperimentArtifactLoader",
+    "materialize_post_trained_artifact",
+    "materialize_post_training_artifact",
     "RouteSetAsset",
     "RouteSetBuildResult",
     "RouteSetBuilder",

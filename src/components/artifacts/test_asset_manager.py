@@ -44,8 +44,8 @@ def _build_base_artifact() -> dict[str, object]:
             "flow_df": pd.DataFrame(),
             "trips_df": pd.DataFrame(),
             "od_matrix": np.zeros((2, 2), dtype=float),
-            "routes_by_od": {(1, 3): [[1, 3], [1, 2, 3]]},
-            "routes_df": pd.DataFrame(),
+            "primary_source_route_set": {(1, 3): [[1, 3], [1, 2, 3]]},
+            "primary_source_routes_df": pd.DataFrame(),
             "metadata": {"trips": {"zone_ids": [1, 3]}},
         },
         "processed": {
@@ -55,8 +55,8 @@ def _build_base_artifact() -> dict[str, object]:
             "node_indexing": {},
             "od_indexing": {"od_pairs": [(1, 3)], "zone_ids": [1, 3]},
             "metadata": {},
-            "routes_by_od": {(1, 3): [[1, 3], [1, 2, 3]]},
-            "routes_df": pd.DataFrame(),
+            "primary_source_route_set": {(1, 3): [[1, 3], [1, 2, 3]]},
+            "primary_source_routes_df": pd.DataFrame(),
             "trips_df": pd.DataFrame(),
             "od_matrix": np.zeros((2, 2), dtype=float),
         },
@@ -77,10 +77,14 @@ def test_asset_manager_materializes_and_reuses_route_set(tmp_path):
         {
             "id": "fft_k20",
             "asset_type": "route_set",
-            "builder": {"engine": "networkx", "weight": "free_flow_time", "k_generate": 2},
-            "constraints": {"allow_duplicates": False, "allow_loops": False, "allow_auto_routes": False},
-            "connectors": {"connector_link_types": [99]},
-            "ordering": {"route_rank_policy": "engine_order", "cost_field": "free_flow_time"},
+            "routes_recompute": {
+                "engine": "networkx",
+                "weight": "free_flow_time",
+                "k_generate": 2,
+                "constraints": {"allow_duplicates": False, "allow_loops": False, "allow_auto_routes": False},
+                "connectors": {"connector_link_types": [99]},
+                "ordering": {"route_rank_policy": "engine_order", "cost_field": "free_flow_time"},
+            },
             "compatibility": {"requires_network_fingerprint": True, "requires_od_space_fingerprint": True},
             "storage": {"format": "joblib", "directory": "asset_cache/route_banks"},
         }
@@ -104,4 +108,3 @@ def test_asset_manager_materializes_and_reuses_route_set(tmp_path):
     assert first["fingerprint"] == second["fingerprint"]
     assert first["path"] == second["path"]
     assert manifest_path.exists()
-

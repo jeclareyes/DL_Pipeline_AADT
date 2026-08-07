@@ -35,15 +35,15 @@ class DatasetAvailabilityConfig:
     than about the dataset being synthetic or real.
     """
 
-    has_complete_od_ground_truth: bool
+    has_full_od_ground_truth: bool
+    has_ground_truth_link_flows: bool
     has_observed_link_flows: bool
-    has_ground_truth_assignment: bool
 
     def __post_init__(self) -> None:
         for field_name in (
-            "has_complete_od_ground_truth",
+            "has_full_od_ground_truth",
+            "has_ground_truth_link_flows",
             "has_observed_link_flows",
-            "has_ground_truth_assignment",
         ):
             if not isinstance(getattr(self, field_name), bool):
                 raise TypeError(f"{field_name} must be a bool.")
@@ -85,10 +85,13 @@ class RouteSetRequirementConfig:
 
     spec_id: str
     k_active: int
+    weight_column: str | None = None
 
     def __post_init__(self) -> None:
         _validate_non_empty_string("spec_id", self.spec_id)
         _validate_positive_int("k_active", self.k_active)
+        if self.weight_column is not None:
+            _validate_non_empty_string("weight_column", self.weight_column)
 
 
 @dataclass(frozen=True)
@@ -124,25 +127,79 @@ class RouteSetBuilderConfig:
     engine: str
     weight: str
     k_generate: int
+    parallel: bool = True
+    parallel_workers: int | None = None
+    od_batch_size: int = 32
+    show_progress: bool = True
 
     def __post_init__(self) -> None:
         _validate_non_empty_string("engine", self.engine)
         _validate_non_empty_string("weight", self.weight)
         _validate_positive_int("k_generate", self.k_generate)
+        _validate_bool("parallel", self.parallel)
+        if self.parallel_workers is not None:
+            _validate_positive_int("parallel_workers", self.parallel_workers)
+        _validate_positive_int("od_batch_size", self.od_batch_size)
+        _validate_bool("show_progress", self.show_progress)
+
+
+@dataclass(frozen=True)
+class RouteSetInterzonalConstraintsConfig:
+    """Constraints for OD pairs whose origin and destination differ."""
+
+    allow_duplicates: bool
+    allow_loops: bool
+
+    def __post_init__(self) -> None:
+        _validate_bool("interzonal.allow_duplicates", self.allow_duplicates)
+        _validate_bool("interzonal.allow_loops", self.allow_loops)
+
+
+@dataclass(frozen=True)
+class RouteSetIntrazonalConstraintsConfig:
+    """Explicit policy for OD pairs of the form ``(zone, zone)``."""
+
+    enabled: bool
+    policy: str
+    allow_duplicates: bool
+    allow_loops: bool
+    k_generate: int | None = None
+
+    def __post_init__(self) -> None:
+        _validate_bool("intrazonal.enabled", self.enabled)
+        _validate_choice("intrazonal.policy", self.policy, {"cycle", "skip"})
+        _validate_bool("intrazonal.allow_duplicates", self.allow_duplicates)
+        _validate_bool("intrazonal.allow_loops", self.allow_loops)
+        if self.k_generate is not None:
+            _validate_positive_int("intrazonal.k_generate", self.k_generate)
+        if self.enabled and self.policy == "cycle" and not self.allow_loops:
+            raise ValueError("intrazonal.allow_loops must be true when policy='cycle'.")
 
 
 @dataclass(frozen=True)
 class RouteSetConstraintsConfig:
-    """Route-generation constraints."""
+    """Separate interzonal simple-path and intrazonal-cycle policies."""
 
-    allow_duplicates: bool
-    allow_loops: bool
-    allow_auto_routes: bool
+    interzonal: RouteSetInterzonalConstraintsConfig
+    intrazonal: RouteSetIntrazonalConstraintsConfig
 
     def __post_init__(self) -> None:
-        _validate_bool("allow_duplicates", self.allow_duplicates)
-        _validate_bool("allow_loops", self.allow_loops)
-        _validate_bool("allow_auto_routes", self.allow_auto_routes)
+        _validate_dataclass("interzonal", self.interzonal, RouteSetInterzonalConstraintsConfig)
+        _validate_dataclass("intrazonal", self.intrazonal, RouteSetIntrazonalConstraintsConfig)
+
+    # Compatibility accessors for callers that only support the old flat
+    # schema. New code should use .interzonal and .intrazonal explicitly.
+    @property
+    def allow_duplicates(self) -> bool:
+        return self.interzonal.allow_duplicates
+
+    @property
+    def allow_loops(self) -> bool:
+        return self.interzonal.allow_loops
+
+    @property
+    def allow_auto_routes(self) -> bool:
+        return self.intrazonal.enabled
 
 
 @dataclass(frozen=True)
@@ -228,11 +285,9 @@ class AssignmentSetBehaviorModelConfig:
     """Behavior model recipe for assignment-set assets."""
 
     name: str
-    theta: float
 
     def __post_init__(self) -> None:
         _validate_non_empty_string("name", self.name)
-        _validate_positive_finite_float("theta", self.theta)
 
 
 @dataclass(frozen=True)
@@ -265,6 +320,7 @@ class AssignmentSetSpecConfig:
 
     id: str
     asset_type: str
+    base_config: str
     requires: RouteSetRequirementConfig
     behavior_model: AssignmentSetBehaviorModelConfig
     solver: AssignmentSetSolverConfig
@@ -273,6 +329,7 @@ class AssignmentSetSpecConfig:
     def __post_init__(self) -> None:
         _validate_non_empty_string("id", self.id)
         _validate_non_empty_string("asset_type", self.asset_type)
+        _validate_non_empty_string("base_config", self.base_config)
         if self.asset_type != "assignment_set":
             raise ValueError("assignment_set specs must declare asset_type='assignment_set'.")
         _validate_dataclass("requires", self.requires, RouteSetRequirementConfig)
@@ -305,24 +362,24 @@ def load_dataset_availability(data: Mapping[str, Any]) -> DatasetAvailabilityCon
     _require_exact_keys(
         mapping,
         required={
-            "has_complete_od_ground_truth",
+            "has_full_od_ground_truth",
+            "has_ground_truth_link_flows",
             "has_observed_link_flows",
-            "has_ground_truth_assignment",
         },
         context="dataset availability",
     )
     return DatasetAvailabilityConfig(
-        has_complete_od_ground_truth=_to_bool(
-            "dataset availability.has_complete_od_ground_truth",
-            mapping["has_complete_od_ground_truth"],
+        has_full_od_ground_truth=_to_bool(
+            "dataset availability.has_full_od_ground_truth",
+            mapping["has_full_od_ground_truth"],
+        ),
+        has_ground_truth_link_flows=_to_bool(
+            "dataset availability.has_ground_truth_link_flows",
+            mapping["has_ground_truth_link_flows"],
         ),
         has_observed_link_flows=_to_bool(
             "dataset availability.has_observed_link_flows",
             mapping["has_observed_link_flows"],
-        ),
-        has_ground_truth_assignment=_to_bool(
-            "dataset availability.has_ground_truth_assignment",
-            mapping["has_ground_truth_assignment"],
         ),
     )
 
@@ -347,23 +404,35 @@ def load_route_set_spec(data: Mapping[str, Any]) -> RouteSetSpecConfig:
         required={
             "id",
             "asset_type",
-            "builder",
-            "constraints",
-            "connectors",
-            "ordering",
+            "routes_recompute",
             "compatibility",
             "storage",
         },
         context="route_set spec",
     )
 
+    routes_recompute = mapping["routes_recompute"]
     return RouteSetSpecConfig(
         id=_to_str("route_set spec.id", mapping["id"]),
         asset_type=_to_str("route_set spec.asset_type", mapping["asset_type"]),
-        builder=_load_route_set_builder(mapping["builder"]),
-        constraints=_load_route_set_constraints(mapping["constraints"]),
-        connectors=_load_route_set_connectors(mapping["connectors"]),
-        ordering=_load_route_set_ordering(mapping["ordering"]),
+        builder=_load_route_set_builder(
+            {
+                key: routes_recompute[key]
+                for key in (
+                    "engine",
+                    "weight",
+                    "k_generate",
+                    "parallel",
+                    "parallel_workers",
+                    "od_batch_size",
+                    "show_progress",
+                )
+                if key in routes_recompute
+            }
+        ),
+        constraints=_load_route_set_constraints(routes_recompute["constraints"]),
+        connectors=_load_route_set_connectors(routes_recompute["connectors"]),
+        ordering=_load_route_set_ordering(routes_recompute["ordering"]),
         compatibility=_load_route_set_compatibility(mapping["compatibility"]),
         storage=_load_route_set_storage(mapping["storage"]),
     )
@@ -375,17 +444,21 @@ def load_assignment_set_spec(data: Mapping[str, Any]) -> AssignmentSetSpecConfig
     mapping = _to_plain_mapping(data, context="assignment_set spec")
     _require_exact_keys(
         mapping,
-        required={"id", "asset_type", "requires", "behavior_model", "solver", "vdf"},
+        required={"id", "asset_type", "flow_recompute"},
         context="assignment_set spec",
     )
 
     return AssignmentSetSpecConfig(
         id=_to_str("assignment_set spec.id", mapping["id"]),
         asset_type=_to_str("assignment_set spec.asset_type", mapping["asset_type"]),
-        requires=_load_route_set_requirement(mapping["requires"]),
-        behavior_model=_load_assignment_behavior_model(mapping["behavior_model"]),
-        solver=_load_assignment_solver(mapping["solver"]),
-        vdf=_load_assignment_vdf(mapping["vdf"]),
+        base_config=_to_str(
+            "assignment_set spec.flow_recompute.base_config",
+            mapping["flow_recompute"]["base_config"],
+        ),
+        requires=_load_route_set_requirement(mapping["flow_recompute"]["requires"]),
+        behavior_model=_load_assignment_behavior_model(mapping["flow_recompute"]["behavior_model"]),
+        solver=_load_assignment_solver(mapping["flow_recompute"]["solver"]),
+        vdf=_load_assignment_vdf(mapping["flow_recompute"]["vdf"]),
     )
 
 
@@ -424,10 +497,21 @@ def _load_asset_requirements(data: Mapping[str, Any]) -> AssetRequirementsConfig
 
 def _load_route_set_requirement(data: Mapping[str, Any]) -> RouteSetRequirementConfig:
     mapping = _to_plain_mapping(data, context="assets.requirements.route_set")
-    _require_exact_keys(mapping, required={"spec_id", "k_active"}, context="assets.requirements.route_set")
+    _require_allowed_keys(
+        mapping,
+        allowed={"spec_id", "k_active", "weight_column"},
+        context="assets.requirements.route_set",
+    )
+    if "spec_id" not in mapping or "k_active" not in mapping:
+        raise KeyError("assets.requirements.route_set requires 'spec_id' and 'k_active'.")
     return RouteSetRequirementConfig(
         spec_id=_to_str("assets.requirements.route_set.spec_id", mapping["spec_id"]),
         k_active=_to_positive_int("assets.requirements.route_set.k_active", mapping["k_active"]),
+        weight_column=(
+            None
+            if mapping.get("weight_column") is None
+            else _to_str("assets.requirements.route_set.weight_column", mapping["weight_column"])
+        ),
     )
 
 
@@ -441,25 +525,93 @@ def _load_assignment_set_requirement(data: Mapping[str, Any]) -> AssignmentSetRe
 
 def _load_route_set_builder(data: Mapping[str, Any]) -> RouteSetBuilderConfig:
     mapping = _to_plain_mapping(data, context="route_set spec.builder")
-    _require_exact_keys(mapping, required={"engine", "weight", "k_generate"}, context="route_set spec.builder")
+    _require_allowed_keys(
+        mapping,
+        allowed={
+            "engine",
+            "weight",
+            "k_generate",
+            "parallel",
+            "parallel_workers",
+            "od_batch_size",
+            "show_progress",
+        },
+        context="route_set spec.builder",
+    )
     return RouteSetBuilderConfig(
         engine=_to_str("route_set spec.builder.engine", mapping["engine"]),
         weight=_to_str("route_set spec.builder.weight", mapping["weight"]),
         k_generate=_to_positive_int("route_set spec.builder.k_generate", mapping["k_generate"]),
+        parallel=_to_bool("route_set spec.builder.parallel", mapping.get("parallel", True)),
+        parallel_workers=(
+            None
+            if mapping.get("parallel_workers") is None
+            else _to_positive_int(
+                "route_set spec.builder.parallel_workers",
+                mapping["parallel_workers"],
+            )
+        ),
+        od_batch_size=_to_positive_int(
+            "route_set spec.builder.od_batch_size",
+            mapping.get("od_batch_size", 32),
+        ),
+        show_progress=_to_bool(
+            "route_set spec.builder.show_progress",
+            mapping.get("show_progress", True),
+        ),
     )
 
 
 def _load_route_set_constraints(data: Mapping[str, Any]) -> RouteSetConstraintsConfig:
     mapping = _to_plain_mapping(data, context="route_set spec.constraints")
+    if "interzonal" not in mapping and "intrazonal" not in mapping:
+        _require_exact_keys(
+            mapping,
+            required={"allow_duplicates", "allow_loops", "allow_auto_routes"},
+            context="route_set spec.constraints",
+        )
+        allow_duplicates = _to_bool("route_set spec.constraints.allow_duplicates", mapping["allow_duplicates"])
+        allow_loops = _to_bool("route_set spec.constraints.allow_loops", mapping["allow_loops"])
+        allow_auto_routes = _to_bool("route_set spec.constraints.allow_auto_routes", mapping["allow_auto_routes"])
+        return RouteSetConstraintsConfig(
+            interzonal=RouteSetInterzonalConstraintsConfig(allow_duplicates, allow_loops),
+            intrazonal=RouteSetIntrazonalConstraintsConfig(
+                enabled=allow_auto_routes,
+                policy="cycle" if allow_auto_routes else "skip",
+                allow_duplicates=allow_duplicates,
+                allow_loops=allow_loops,
+            ),
+        )
+
     _require_exact_keys(
         mapping,
-        required={"allow_duplicates", "allow_loops", "allow_auto_routes"},
+        required={"interzonal", "intrazonal"},
         context="route_set spec.constraints",
     )
+    interzonal = _to_plain_mapping(mapping["interzonal"], context="route_set spec.constraints.interzonal")
+    _require_exact_keys(
+        interzonal,
+        required={"allow_duplicates", "allow_loops"},
+        context="route_set spec.constraints.interzonal",
+    )
+    intrazonal = _to_plain_mapping(mapping["intrazonal"], context="route_set spec.constraints.intrazonal")
+    _require_exact_keys(
+        intrazonal,
+        required={"enabled", "policy", "allow_duplicates", "allow_loops", "k_generate"},
+        context="route_set spec.constraints.intrazonal",
+    )
     return RouteSetConstraintsConfig(
-        allow_duplicates=_to_bool("route_set spec.constraints.allow_duplicates", mapping["allow_duplicates"]),
-        allow_loops=_to_bool("route_set spec.constraints.allow_loops", mapping["allow_loops"]),
-        allow_auto_routes=_to_bool("route_set spec.constraints.allow_auto_routes", mapping["allow_auto_routes"]),
+        interzonal=RouteSetInterzonalConstraintsConfig(
+            allow_duplicates=_to_bool("route_set spec.constraints.interzonal.allow_duplicates", interzonal["allow_duplicates"]),
+            allow_loops=_to_bool("route_set spec.constraints.interzonal.allow_loops", interzonal["allow_loops"]),
+        ),
+        intrazonal=RouteSetIntrazonalConstraintsConfig(
+            enabled=_to_bool("route_set spec.constraints.intrazonal.enabled", intrazonal["enabled"]),
+            policy=_to_str("route_set spec.constraints.intrazonal.policy", intrazonal["policy"]),
+            allow_duplicates=_to_bool("route_set spec.constraints.intrazonal.allow_duplicates", intrazonal["allow_duplicates"]),
+            allow_loops=_to_bool("route_set spec.constraints.intrazonal.allow_loops", intrazonal["allow_loops"]),
+            k_generate=None if intrazonal["k_generate"] is None else _to_positive_int("route_set spec.constraints.intrazonal.k_generate", intrazonal["k_generate"]),
+        ),
     )
 
 
@@ -525,17 +677,9 @@ def _load_route_set_storage(data: Mapping[str, Any]) -> RouteSetStorageConfig:
 
 def _load_assignment_behavior_model(data: Mapping[str, Any]) -> AssignmentSetBehaviorModelConfig:
     mapping = _to_plain_mapping(data, context="assignment_set spec.behavior_model")
-    _require_exact_keys(
-        mapping,
-        required={"name", "theta"},
-        context="assignment_set spec.behavior_model",
-    )
+    _require_exact_keys(mapping, required={"name"}, context="assignment_set spec.behavior_model")
     return AssignmentSetBehaviorModelConfig(
         name=_to_str("assignment_set spec.behavior_model.name", mapping["name"]),
-        theta=_to_positive_finite_float(
-            "assignment_set spec.behavior_model.theta",
-            mapping["theta"],
-        ),
     )
 
 

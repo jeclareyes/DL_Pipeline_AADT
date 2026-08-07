@@ -23,18 +23,25 @@ def _canonicalize(value: Any) -> Any:
     if isinstance(value, (str, int, bool)):
         return value
     if isinstance(value, float):
-        if not np.isfinite(value):
-            raise ValueError("Fingerprints cannot be computed from non-finite float values.")
+        if np.isnan(value):
+            return "NaN"
+        if np.isposinf(value):
+            return "Infinity"
+        if np.isneginf(value):
+            return "-Infinity"
         return float(value)
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, np.integer):
         return int(value)
     if isinstance(value, np.floating):
-        number = float(value)
-        if not np.isfinite(number):
-            raise ValueError("Fingerprints cannot be computed from non-finite float values.")
-        return number
+        if np.isnan(value):
+            return "NaN"
+        if np.isposinf(value):
+            return "Infinity"
+        if np.isneginf(value):
+            return "-Infinity"
+        return float(value)
     if isinstance(value, np.ndarray):
         return {
             "__type__": "ndarray",

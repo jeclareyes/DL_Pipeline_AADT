@@ -13,11 +13,20 @@ from .route_set_builder import RouteSetBuilder, RouteSetBuildResult
 class AssetMaterializer:
     """Materialize assets from a base artifact."""
 
-    def __init__(self, base_artifact: Mapping[str, Any], output_root: str | Path):
+    def __init__(
+        self,
+        base_artifact: Mapping[str, Any],
+        output_root: str | Path,
+        creation_artifact: Mapping[str, Any] | str | Path | None = None,
+    ):
         self.base_artifact = dict(base_artifact)
         self.output_root = Path(output_root)
         self.route_set_builder = RouteSetBuilder(self.base_artifact, self.output_root)
-        self.assignment_set_builder = AssignmentSetBuilder(self.base_artifact, self.output_root)
+        self.assignment_set_builder = (
+            AssignmentSetBuilder(self.base_artifact, self.output_root, creation_artifact)
+            if creation_artifact is not None
+            else None
+        )
 
     def build_route_set(
         self,
@@ -31,5 +40,8 @@ class AssetMaterializer:
         spec: AssignmentSetSpecConfig,
         route_set_entry: Mapping[str, Any],
     ) -> AssignmentSetBuildResult:
+        if self.assignment_set_builder is None:
+            raise ValueError(
+                "Cannot materialize an assignment set without the dataset creation artifact."
+            )
         return self.assignment_set_builder.build(spec=spec, route_set_entry=route_set_entry)
-
