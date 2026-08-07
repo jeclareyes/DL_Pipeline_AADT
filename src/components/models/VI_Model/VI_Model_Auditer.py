@@ -78,6 +78,9 @@ class VIDiagnostician:
             "mode": [],
             "max_grad": [],
             "od_logits_grad": [],
+            "demand_grad_norm": [],
+            "supply_grad_norm": [],
+            "equilibrium_grad_norm": [],
             "grad_norms": {},
             "alerts": [],
             "learned_theta": [],
@@ -89,6 +92,7 @@ class VIDiagnostician:
         }
 
         self.gradient_detailed_rows = []
+        self.gradient_control_rows = []
         self.link_type_epoch_rows = []
         self.flow_comparison_rows = []
         self.demand_comparison_rows = []
@@ -106,6 +110,92 @@ class VIDiagnostician:
         self.mass_conservation_rows = []
         # Threshold for node-level mass conservation checks (absolute error).
         self.mass_conservation_tolerance = 1e-2
+
+    def record_gradient_control(self, epoch: int, stats: Optional[Dict] = None):
+        """Store trainer-provided pre/post clipping health for VI analysis."""
+        if not self.enabled:
+            return
+        stats = stats or {}
+        pre = self._to_float(stats.get("pre_clip_grad_norm"), default=float("nan"))
+        post = self._to_float(stats.get("post_clip_grad_norm"), default=float("nan"))
+        ratio = post / pre if np.isfinite(pre) and pre > 0.0 and np.isfinite(post) else float("nan")
+        self.gradient_control_rows.append(
+            {
+                "epoch": int(epoch),
+                "pre_clip_grad_norm": pre,
+                "post_clip_grad_norm": post,
+                "clip_ratio": ratio,
+                "clip_applied": int(bool(stats.get("clip_applied", False))),
+                "non_finite_gradients": int(stats.get("non_finite_gradients", 0) or 0),
+                "skipped_update": int(bool(stats.get("skipped_update", False))),
+                "skip_reason": str(stats.get("skip_reason") or ""),
+            }
+        )
+
+    @staticmethod
+    def _pair_array(value, name: str) -> np.ndarray:
+        """Normalize an ordered pair collection for exact alignment checks."""
+        if torch.is_tensor(value):
+            value = value.detach().cpu().numpy()
+        array = np.asarray(value)
+        if array.ndim != 2 or array.shape[1] != 2:
+            raise ValueError(f"{name} must have shape [N, 2], got {array.shape}")
+        return array.astype(np.int64, copy=False)
+
+    def run_index_alignment_audit(self, model: nn.Module, targets: Dict) -> Dict:
+        """Verify ordered link/OD identities and incidence dimensions."""
+        static_info = getattr(model, "_diagnostic_static_info", {}) or {}
+        model_links = self._pair_array(
+            static_info.get("link_pair_indices"),
+            "model link_pair_indices",
+        )
+        target_links = self._pair_array(
+            targets.get("_diagnostic_flow_target_link_pair_indices"),
+            "target flow link_pair_indices",
+        )
+        model_od = self._pair_array(
+            static_info.get("od_pairs"),
+            "model od_pairs",
+        )
+        target_od = self._pair_array(
+            targets.get("_diagnostic_target_od_pairs"),
+            "target od_pairs",
+        )
+
+        link_mismatch = np.where(np.any(model_links != target_links, axis=1))[0].tolist() \
+            if model_links.shape == target_links.shape else list(range(min(len(model_links), len(target_links))))
+        od_mismatch = np.where(np.any(model_od != target_od, axis=1))[0].tolist() \
+            if model_od.shape == target_od.shape else list(range(min(len(model_od), len(target_od))))
+
+        solver = getattr(model, "equilibrium_solver", None)
+        delta_shape = list(solver.delta_matrix.shape) if solver is not None else None
+        route_shape = list(solver.route_validity_mask.shape) if solver is not None else None
+        expected_routes = int(model_od.shape[0] * getattr(solver, "k_paths", 0)) if solver is not None else None
+
+        checks = {
+            "link_pair_order_exact": bool(model_links.shape == target_links.shape and not link_mismatch),
+            "od_pair_order_exact": bool(model_od.shape == target_od.shape and not od_mismatch),
+            "flow_vector_length_matches_links": int(targets["flows"].reshape(-1).numel()) == int(model_links.shape[0]),
+            "od_vector_length_matches_pairs": int(targets["od"].reshape(-1).numel()) == int(model_od.shape[0]),
+            "delta_rows_match_links": bool(delta_shape is not None and delta_shape[0] == model_links.shape[0]),
+            "delta_columns_match_route_slots": bool(delta_shape is not None and expected_routes is not None and delta_shape[1] == expected_routes),
+            "route_mask_matches_od_and_k": bool(route_shape is not None and route_shape == [model_od.shape[0], getattr(solver, "k_paths", 0)]),
+        }
+
+        return {
+            "status": "ok" if all(checks.values()) else "error",
+            "checks": checks,
+            "model_link_count": int(model_links.shape[0]),
+            "target_link_count": int(target_links.shape[0]),
+            "model_od_count": int(model_od.shape[0]),
+            "target_od_count": int(target_od.shape[0]),
+            "delta_shape": delta_shape,
+            "route_validity_shape": route_shape,
+            "link_mismatch_count": len(link_mismatch),
+            "od_mismatch_count": len(od_mismatch),
+            "link_mismatch_positions_sample": link_mismatch[:20],
+            "od_mismatch_positions_sample": od_mismatch[:20],
+        }
 
     def attach_tensorboard(self, tb_logger, val_freq: int):
         """
@@ -552,11 +642,13 @@ class VIDiagnostician:
             return
         key_modules = {
             "supply_net": getattr(model, "supply_net", None),
+            "demand_net": getattr(model, "demand_net", None),
             "equilibrium_solver": getattr(model, "equilibrium_solver", None),
         }
 
         max_grad = 0.0
-        is_heavy_log_epoch = (epoch + 1) % self.val_freq == 0  
+        module_norms = {}
+        is_heavy_log_epoch = epoch % self.val_freq == 0
               
         for name, module in key_modules.items():
             if module is None:
@@ -566,7 +658,7 @@ class VIDiagnostician:
             if len(named_params) == 0:
                 self.gradient_detailed_rows.append(
                     {
-                        "epoch": int(epoch) + 1,
+                        "epoch": int(epoch),
                         "module": str(name),
                         "param_name": "__no_trainable_params__",
                         "norm2": 0.0,
@@ -578,7 +670,7 @@ class VIDiagnostician:
                 )
             for param_name, p in named_params:
                 row = self._build_gradient_row(
-                    epoch=int(epoch) + 1,
+                    epoch=int(epoch),
                     module=name,
                     param_name=f"{name}.{param_name}",
                     grad=(p.grad.detach() if p.grad is not None else None),
@@ -590,6 +682,7 @@ class VIDiagnostician:
                     total_norm_sq += g * g
             total_norm = total_norm_sq ** 0.5
             self.full_history["grad_norms"].setdefault(name, []).append(total_norm)
+            module_norms[name] = total_norm
             max_grad = max(max_grad, total_norm)
 
         od_logits_grad = 0.0
@@ -599,7 +692,7 @@ class VIDiagnostician:
                 od_logits_grad = float(grad.detach().norm(2).item())
             self.gradient_detailed_rows.append(
                 self._build_gradient_row(
-                    epoch=int(epoch) + 1,
+                epoch=int(epoch),
                     module="od_logits",
                     param_name="od_logits",
                     grad=(grad.detach() if grad is not None else None),
@@ -607,14 +700,18 @@ class VIDiagnostician:
             )
 
             if self.tb_logger is not None and is_heavy_log_epoch and grad is not None:
-                self.tb_logger.log_histogram("Gradients/od_logits", grad, epoch + 1)
+                self.tb_logger.log_histogram("Gradients/od_logits", grad, epoch)
 
         self.full_history["max_grad"].append(float(max_grad))
         self.full_history["od_logits_grad"].append(float(od_logits_grad))
+        self.full_history["demand_grad_norm"].append(float(module_norms.get("demand_net", 0.0)))
+        self.full_history["supply_grad_norm"].append(float(module_norms.get("supply_net", 0.0)))
+        self.full_history["equilibrium_grad_norm"].append(float(module_norms.get("equilibrium_solver", 0.0)))
         self._push_window("max_grad", float(max_grad))
 
-        if epoch >= 2 and od_logits_grad < self.od_grad_low_threshold:
-            self.full_history["alerts"].append((int(epoch), "od_logits_low_grad", float(od_logits_grad)))
+        demand_grad = float(module_norms.get("demand_net", 0.0))
+        if epoch >= 2 and demand_grad < self.od_grad_low_threshold:
+            self.full_history["alerts"].append((int(epoch), "demand_net_low_grad", demand_grad))
 
     def _record_alerts(self, epoch: int):
         """
@@ -1050,6 +1147,9 @@ class VIDiagnostician:
                 "iterations_mean": float(np.mean(self.full_history.get("iterations", [0.0]))),
                 "final_gap_mean": float(np.mean(self.full_history.get("final_gap", [0.0]))),
                 "od_logits_grad_mean": float(np.mean(self.full_history.get("od_logits_grad", [0.0]))),
+                "demand_grad_norm_mean": float(np.mean(self.full_history.get("demand_grad_norm", [0.0]))),
+                "supply_grad_norm_mean": float(np.mean(self.full_history.get("supply_grad_norm", [0.0]))),
+                "equilibrium_grad_norm_mean": float(np.mean(self.full_history.get("equilibrium_grad_norm", [0.0]))),
             },
             "alerts": {
                 "total": len(alerts),
@@ -1059,10 +1159,32 @@ class VIDiagnostician:
                     for epoch, kind, value in alerts[-10:]
                 ],
             },
+            "gradient_control": {
+                "epochs": len(self.gradient_control_rows),
+                "clip_applied_epochs": int(sum(row["clip_applied"] for row in self.gradient_control_rows)),
+                "skipped_update_epochs": int(sum(row["skipped_update"] for row in self.gradient_control_rows)),
+                "max_pre_clip_grad_norm": float(np.nanmax([row["pre_clip_grad_norm"] for row in self.gradient_control_rows])) if self.gradient_control_rows else 0.0,
+                "max_post_clip_grad_norm": float(np.nanmax([row["post_clip_grad_norm"] for row in self.gradient_control_rows])) if self.gradient_control_rows else 0.0,
+            },
         }
 
         with open(filename, "w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2)
+
+        self._write_csv(
+            os.path.join(out_dir, "gradient_control_history.csv"),
+            fieldnames=[
+                "epoch",
+                "pre_clip_grad_norm",
+                "post_clip_grad_norm",
+                "clip_ratio",
+                "clip_applied",
+                "non_finite_gradients",
+                "skipped_update",
+                "skip_reason",
+            ],
+            rows=self.gradient_control_rows,
+        )
 
         # Export detailed gradient history in CGAME_PhysicsMirrorDescent style.
         if self.enable_gradient_history:

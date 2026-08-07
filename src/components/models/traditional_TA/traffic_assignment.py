@@ -15,7 +15,7 @@ from scipy import sparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from data_ingestion.data_processing import DataManager
+from data_handling import DataManager
 from models.frank_wolfe import FrankWolfeAssignment
 
 

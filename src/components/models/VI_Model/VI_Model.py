@@ -17,6 +17,7 @@ convergence and forward/backward consistency in IMD mode.
 
 
 from typing import Dict, List, Optional, Tuple
+import math
 import logging
 
 import numpy as np
@@ -76,12 +77,14 @@ class ODDemandCompletionNet(nn.Module):
         dropout: float = 0.0,
         hard_anchor_known_od: bool = True,
         known_anchor_weight: float = 0.95,
+        unknown_od_init_value: float = 0.1,
     ):
         super().__init__()
 
         self.num_od_pairs = int(num_od_pairs)
         self.od_scale = float(od_scale)
         self.hard_anchor_known_od = bool(hard_anchor_known_od)
+        self.unknown_od_init_value = float(max(unknown_od_init_value, 0.0))
 
         # Used only in flexible-anchor mode.
         # 1.0 means fully trust known OD values.
@@ -112,6 +115,16 @@ class ODDemandCompletionNet(nn.Module):
         layers.append(nn.Linear(current_dim, output_dim))
 
         self.net = nn.Sequential(*layers)
+
+        # Avoid the default softplus(0) initialization. With Linköping's
+        # od_scale this would start every unknown OD pair near 52 vehicles.
+        output_layer = self.net[-1]
+        if not isinstance(output_layer, nn.Linear):
+            raise TypeError("OD demand completion output layer must be nn.Linear.")
+        target_norm = max(self.unknown_od_init_value / max(self.od_scale, 1e-6), 1e-6)
+        inverse_softplus = math.log(math.expm1(target_norm)) if target_norm < 20.0 else target_norm
+        nn.init.zeros_(output_layer.weight)
+        nn.init.constant_(output_layer.bias, inverse_softplus)
 
     def _ensure_2d(self, x: torch.Tensor) -> torch.Tensor:
         """Ensure a tensor has shape [B, OD]."""
@@ -1279,17 +1292,13 @@ class ImplicitEquilibriumLayer(nn.Module):
         if cap_mult.dim() == 1: 
             cap_mult = cap_mult.unsqueeze(0)
 
-        # Capacity in the network table is interpreted as per-lane capacity.
-        # Therefore, the physical link capacity must be expanded by the number
-        # of lanes before applying the learnable correction multiplier.
+        # The model-ready artifact supplies effective_capacity, i.e. total
+        # capacity after lane expansion. Multiplying by lanes again would
+        # double-count the lane capacity.
         base_capacity = self.capacity.unsqueeze(0)  # [1, Links]
-        lane_count = self.lanes.unsqueeze(0).clamp(min=1.0)  # [1, Links]
+        effective_capacity = base_capacity
 
-        effective_capacity = base_capacity * lane_count
-
-        # Apply the learnable correction multiplier after the physical lane expansion.
-        # This preserves the distinction between fixed infrastructure attributes
-        # and model-calibrated capacity correction.
+        # Apply the learnable correction multiplier to effective capacity.
         adj_capacity = (effective_capacity * cap_mult).clamp(min=self.eps)
         
         # v_over_c: The degree of saturation. 
@@ -1581,6 +1590,12 @@ class VariationalInequalityModel(nn.Module):
             dropout=float(demand_completion_cfg.get("dropout", 0.0)),
             hard_anchor_known_od=bool(demand_completion_cfg.get("hard_anchor_known_od", True)),
             known_anchor_weight=float(demand_completion_cfg.get("known_anchor_weight", 0.95)),
+            unknown_od_init_value=float(
+                demand_completion_cfg.get(
+                    "unknown_od_init_value",
+                    kwargs.get("unknown_od_init_value", 0.1),
+                )
+            ),
         )
 
         # 6. LOSS FUNCTION
@@ -1607,6 +1622,135 @@ class VariationalInequalityModel(nn.Module):
                 if key not in {"_target_"}
             }
             self.diagnostician = VIDiagnostician(**diag_cfg)
+
+        # Model-owned diagnostic context.  The trainer only invokes the
+        # generic lifecycle hooks below; it does not know any VI-specific
+        # tensors, audits, or output formats.
+        diagnostic_link_types = kwargs.get("link_types_vis", kwargs.get("link_types"))
+        if isinstance(diagnostic_link_types, dict):
+            diagnostic_link_types = [
+                diagnostic_link_types.get(i, diagnostic_link_types.get(str(i), "unknown"))
+                for i in range(self.num_links)
+            ]
+
+        self._diagnostic_static_info = {
+            "capacity": self.capacity,
+            "link_types": diagnostic_link_types,
+            "link_pair_indices": kwargs.get("link_pair_indices"),
+            "od_pairs": kwargs.get("od_pairs"),
+            "od_pair_indices": self.od_pair_indices,
+            "od_pair_node_labels": kwargs.get("od_pair_node_labels"),
+        }
+        self._diagnostic_last_targets = None
+
+    def on_training_epoch_end(
+        self,
+        outputs: Dict,
+        targets: Dict,
+        epoch: int,
+        is_final: bool = False,
+        gradient_stats: Optional[Dict] = None,
+    ) -> None:
+        """Consume one completed training step through the model-owned auditor."""
+        if self.diagnostician is None:
+            return
+
+        self.diagnostician.update(
+            outputs=outputs,
+            targets=targets,
+            model=self,
+            epoch=int(epoch),
+            is_final=bool(is_final),
+            loss_dict=outputs.get("loss"),
+            static_info=self._diagnostic_static_info,
+        )
+        self.diagnostician.record_gradient_control(
+            epoch=int(epoch),
+            stats=gradient_stats,
+        )
+        self._diagnostic_last_targets = {
+            key: value.detach() if torch.is_tensor(value) else value
+            for key, value in targets.items()
+        }
+        # Gradients are still available here: the generic trainer invokes this
+        # hook immediately after optimizer.step() and before the next zero_grad.
+        self.diagnostician.capture_gradient_history(self, epoch=int(epoch))
+
+    def on_training_finished(
+        self,
+        diagnostics_dir: str,
+        last_epoch: int,
+        stopped_early: bool = False,
+    ) -> None:
+        """Persist the VI diagnostic bundle at the end of a training task."""
+        if self.diagnostician is None:
+            return
+
+        from pathlib import Path
+
+        output_dir = Path(diagnostics_dir) / "training"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        summary_path = output_dir / "vi_model_diagnostics.json"
+        self.diagnostician.save_summary(str(summary_path))
+
+        assignment_path = output_dir / "vi_assignment_audit.json"
+        assignment_payload = {"status": "skipped", "reason": "no training targets captured"}
+        if self._diagnostic_last_targets is not None:
+            try:
+                assignment_payload = {
+                    "status": "ok",
+                    "last_epoch": int(last_epoch),
+                    "metrics": self.diagnostician.run_assignment_audit(
+                        model=self,
+                        observed_flows=self._diagnostic_last_targets["flows"],
+                        flow_mask=self._diagnostic_last_targets["mask"],
+                        true_od_demand=self._diagnostic_last_targets.get("od"),
+                        od_mask=self._diagnostic_last_targets.get("od_mask"),
+                    ),
+                }
+            except Exception as exc:  # diagnostics must not invalidate a checkpoint
+                assignment_payload = {
+                    "status": "error",
+                    "last_epoch": int(last_epoch),
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+                logging.getLogger(__name__).exception(
+                    "VI assignment audit failed after training"
+                )
+
+        import json
+
+        with assignment_path.open("w", encoding="utf-8") as handle:
+            json.dump(assignment_payload, handle, indent=2)
+
+        alignment_path = output_dir / "vi_index_alignment_audit.json"
+        alignment_payload = {"status": "skipped", "reason": "no training targets captured"}
+        if self._diagnostic_last_targets is not None:
+            try:
+                alignment_payload = self.diagnostician.run_index_alignment_audit(
+                    model=self,
+                    targets=self._diagnostic_last_targets,
+                )
+            except Exception as exc:
+                alignment_payload = {
+                    "status": "error",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+                logging.getLogger(__name__).exception(
+                    "VI index alignment audit failed after training"
+                )
+
+        with alignment_path.open("w", encoding="utf-8") as handle:
+            json.dump(alignment_payload, handle, indent=2)
+
+        logging.getLogger(__name__).info(
+            "VI diagnostics saved | epochs=%d | stopped_early=%s | summary=%s | assignment_audit=%s | alignment_audit=%s",
+            int(last_epoch),
+            bool(stopped_early),
+            str(summary_path),
+            str(assignment_path),
+            str(alignment_path),
+        )
 
     # TEMPORAL ##############################################################
 
@@ -2633,11 +2777,9 @@ class VariationalInequalityModel(nn.Module):
             "learned_alpha": bpr_params["alpha"],
             "learned_beta": bpr_params["beta"],
             "learned_capacity_multiplier": bpr_params["capacity_multiplier"],
-            "effective_capacity": (
-                self.capacity * self.lanes.clamp(min=1.0)),
+            "effective_capacity": self.capacity,
             "adjusted_capacity": (
                 self.capacity
-                * self.lanes.clamp(min=1.0)
                 * bpr_params["capacity_multiplier"].detach()
             )
         }
