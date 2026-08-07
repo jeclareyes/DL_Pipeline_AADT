@@ -44,7 +44,7 @@ def build_experiment_artifact_identity(
     cfg_container = _to_plain_container(cfg)
     dataset_name = _require_nested_value(cfg_container, ("dataset", "name"))
     base_manifest_path = resolve_path(
-        _require_nested_value(cfg_container, ("dataset", "manifests", "processed_default"))
+        _require_nested_value(cfg_container, ("dataset", "paths", "manifests", "base"))
     )
 
     if not base_manifest_path.exists():

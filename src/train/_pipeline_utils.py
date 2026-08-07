@@ -139,7 +139,9 @@ def compute_initial_demand_mean(
 
 def vi_od_initialization_hook(cfg, model_params: dict, context: dict | None = None) -> dict:
     """Model hook for VI OD initialization policy without model-name branching in pipeline."""
-    _ = model_params  # kept for hook signature consistency
+    # These values are constructor kwargs for the active VI model. Previously
+    # the hook returned them as metadata, but ODDemandCompletionNet ignored
+    # them, so unknown cells started at softplus(0) * od_scale.
     _ = context
     od_init_cfg = cfg.training.get('od_initialization', {})
     od_init_mode = str(od_init_cfg.get('mode', 'known_mean')).lower()
@@ -151,7 +153,10 @@ def vi_od_initialization_hook(cfg, model_params: dict, context: dict | None = No
             'unknown_od_init_value': low_unknown_val,
         }
     if od_init_mode == 'known_mean':
-        return {'init_unknown_od_low': False}
+        return {
+            'init_unknown_od_low': False,
+            'unknown_od_init_value': float(model_params.get('od_known_mean', 1.0)),
+        }
 
     raise ConfigurationContractError(
         f"Unknown training.od_initialization.mode='{od_init_mode}'. "

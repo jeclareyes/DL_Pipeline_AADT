@@ -690,6 +690,12 @@ class TrainingInputPreparer:
             "od": global_inputs.od_target_t,
             "mask": self._to_float_tensor(train_mask_np),
             "od_mask": global_inputs.od_train_supervision_mask_t,
+            # Read-only alignment metadata consumed by optional model-owned
+            # diagnostics. These keys are not passed to model.forward().
+            "_diagnostic_flow_target_link_pair_indices": global_inputs.targets[
+                "flow_target_link_pair_indices"
+            ],
+            "_diagnostic_target_od_pairs": global_inputs.targets["od_pairs"],
         }
 
         val_tensors = {

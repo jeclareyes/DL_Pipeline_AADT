@@ -36,7 +36,14 @@ Design principles
 import copy
 import logging
 from pathlib import Path
+import sys
 from typing import Any, Dict, List, Optional, Tuple
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+SRC_ROOT = PROJECT_ROOT / "src"
+for import_root in (PROJECT_ROOT, SRC_ROOT):
+    if str(import_root) not in sys.path:
+        sys.path.insert(0, str(import_root))
 
 import hydra
 import numpy as np
@@ -51,10 +58,10 @@ from src.contracts.runtime_contracts import (
     ModelInputContractError,
 )
 from src.components.artifacts.asset_pipeline import AssetPipeline
-from src.data_ingestion.artifact_loaders.training_artifact_loader import (
+from data_handling.data_processing.artifact_loaders.training_artifact_loader import (
     TrainingArtifactLoader,
 )
-from src.utils.experiment_identity import build_experiment_artifact_identity
+from src.utils.experiment_overlay import resolve_experiment_overlay
 from src.train._pipeline_utils import (
     generate_training_tasks,
     persist_pipeline_summary,
@@ -461,7 +468,7 @@ def materialize_experiment_assets(cfg: DictConfig) -> None:
     if route_set_requirement is None and assignment_set_requirement is None:
         return
 
-    manifest_path = resolve_path(_cfg_get(cfg, "dataset.manifests.processed_default"))
+    manifest_path = resolve_path(_cfg_get(cfg, "dataset.paths.manifests.base"))
     base_artifact_path = resolve_base_artifact_path(cfg)
     experiment_name = _cfg_get(cfg, "experiment.name")
     experiment_hash = _cfg_get(cfg, "experiment.identity.hash")
@@ -488,123 +495,13 @@ def resolve_base_artifact_path(cfg: DictConfig) -> Path:
     Resolve the base artifact path from the data-processing configuration.
     """
 
-    data_processing_cfg = _cfg_get(cfg, "data_ingestion.data_processing")
-    output_routes = _cfg_get(data_processing_cfg, "output_routes")
-    processed_route = output_routes["processed_route"]
-    artifact_filename = output_routes["artifact_filename"]
-    if not processed_route or not artifact_filename:
+    artifact_path = _cfg_get(cfg, "dataset.paths.artifacts.base")
+    if not artifact_path:
         raise ConfigurationContractError(
-            "Could not resolve base artifact path. Please define data_ingestion.data_processing.output_routes."
+            "Could not resolve base artifact path. Please define dataset.paths.artifacts.base."
         )
 
-    return resolve_path(Path(str(processed_route)) / str(artifact_filename))
-
-
-def resolve_experiment_overlay(cfg: DictConfig) -> DictConfig:
-    """
-    Merge an experiment overlay into the root configuration when requested.
-
-    Hydra currently passes `+experiment=NAME` as a selector, not as the merged
-    experiment payload. The overlay file is therefore loaded explicitly so the
-    rest of the pipeline can consume the declared assets and experiment fields.
-    """
-
-    root_container = OmegaConf.to_container(cfg, resolve=False)
-    if not isinstance(root_container, dict):
-        return cfg
-
-    experiment_name = "default"
-    experiment_selector = "default"
-    experiment_source: str | None = None
-    overlay_container: dict[str, Any] = {}
-
-    if "experiment" in cfg:
-        experiment_ref = cfg.experiment
-        if isinstance(experiment_ref, DictConfig):
-            overlay = _strip_hydra_defaults(experiment_ref)
-            overlay_candidate = OmegaConf.to_container(overlay, resolve=False)
-            if isinstance(overlay_candidate, dict):
-                overlay_container = overlay_candidate
-                if "name" in overlay_candidate:
-                    experiment_name = str(overlay_candidate["name"])
-                    experiment_selector = experiment_name
-        elif isinstance(experiment_ref, (str, Path)):
-            experiment_selector = str(experiment_ref)
-            experiment_name = Path(experiment_selector).stem
-            project_root = Path(__file__).resolve().parents[2]
-            candidate_path = Path(experiment_selector)
-            if not candidate_path.suffix:
-                candidate_path = project_root / "configs" / "experiments" / f"{experiment_selector}.yaml"
-            elif not candidate_path.is_absolute():
-                candidate_path = (project_root / candidate_path).resolve(strict=False)
-
-            if not candidate_path.exists():
-                raise FileNotFoundError(f"Experiment overlay not found: {candidate_path}")
-
-            overlay = _strip_hydra_defaults(OmegaConf.load(candidate_path))
-            overlay_candidate = OmegaConf.to_container(overlay, resolve=False)
-            if isinstance(overlay_candidate, dict):
-                overlay_container = overlay_candidate
-            experiment_source = str(candidate_path)
-        else:
-            raise TypeError("cfg.experiment must be a DictConfig, string selector, or Path.")
-
-    merged_container = _deep_merge_dicts(root_container, overlay_container)
-    merged_cfg = OmegaConf.create(merged_container)
-
-    if "experiment" not in merged_container or not isinstance(merged_container["experiment"], dict):
-        merged_container["experiment"] = {}
-
-    experiment_section = dict(merged_container["experiment"])
-    identity = build_experiment_artifact_identity(
-        merged_cfg,
-        experiment_name=experiment_name,
-        experiment_selector=experiment_selector,
-        experiment_source=experiment_source,
-        experiment_overlay=overlay_container,
-    )
-
-    experiment_section.update(
-        {
-            "name": identity.name,
-            "selector": identity.selector,
-            "source": identity.source,
-            "identity": {
-                "hash": identity.hash,
-                "artifact_dir": identity.artifact_dir,
-                "artifact_path": identity.artifact_path,
-                "manifest_path": identity.manifest_path,
-                "base_manifest_path": identity.base_manifest_path,
-            },
-        }
-    )
-    merged_container["experiment"] = experiment_section
-    return OmegaConf.create(merged_container)
-
-
-def _strip_hydra_defaults(config: DictConfig) -> DictConfig:
-    """Remove Hydra's `defaults` node before merging an experiment overlay."""
-
-    if "defaults" not in config:
-        return config
-
-    container = OmegaConf.to_container(config, resolve=False)
-    if not isinstance(container, dict):
-        return config
-    container.pop("defaults", None)
-    return OmegaConf.create(container)
-
-
-def _deep_merge_dicts(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
-    """Recursively merge two plain dictionaries."""
-
-    merged = dict(base)
-    for key, value in overlay.items():
-        if key in merged and isinstance(merged[key], dict) and isinstance(value, dict):
-            merged[key] = _deep_merge_dicts(merged[key], value)
-        else:
-            merged[key] = value
-    return merged
+    return resolve_path(artifact_path)
 
 
 def resolve_training_artifact_path(cfg: DictConfig) -> Path:

@@ -369,11 +369,7 @@ class TrainingRunContextBuilder:
         dataset_name = _safe_get(
             self.cfg,
             "dataset.name",
-            default=_safe_get(
-                self.cfg,
-                "data_ingestion.data_processing.dataset_name",
-                default="dataset",
-            ),
+            default="dataset",
         )
 
         if run_dir_template:

@@ -318,6 +318,7 @@ class GeneralTrainer:
                 train_mask_t=train_mask_t,
                 train_od_t=train_od_t,
                 train_od_mask_t=train_od_mask_t,
+                diagnostic_targets=train_tensors,
                 epoch_idx=epoch_idx,
             )
 
@@ -436,6 +437,14 @@ class GeneralTrainer:
 
         self._save_eval_container(eval_container)
 
+        finish_hook = getattr(model, "on_training_finished", None)
+        if callable(finish_hook):
+            finish_hook(
+                diagnostics_dir=str(self.diagnostics_dir),
+                last_epoch=int(last_epoch),
+                stopped_early=bool(stopped_early),
+            )
+
         result = TrainingFitResult(
             score=float(final_score),
             best_epoch=int(best_epoch),
@@ -483,6 +492,7 @@ class GeneralTrainer:
         train_mask_t: torch.Tensor,
         train_od_t: torch.Tensor,
         train_od_mask_t: torch.Tensor,
+        diagnostic_targets: Optional[Dict[str, Any]],
         epoch_idx: int,
     ) -> Dict[str, Any]:
         """
@@ -578,6 +588,27 @@ class GeneralTrainer:
                 str(total_loss.detach().cpu()),
             )
 
+            self._notify_model_epoch_end(
+                model=model,
+                outputs=outputs,
+                train_tensors={
+                    "flows": train_flows_t,
+                    "mask": train_mask_t,
+                    "od": train_od_t,
+                    "od_mask": train_od_mask_t,
+                },
+                epoch_idx=epoch_idx,
+                is_final=epoch_idx >= int(self.cfg.training.epochs),
+                diagnostic_metadata=diagnostic_targets,
+                gradient_stats={
+                    "pre_clip_grad_norm": float("nan"),
+                    "post_clip_grad_norm": float("nan"),
+                    "clip_applied": False,
+                    "non_finite_gradients": 0,
+                    "skipped_update": True,
+                    "skip_reason": "non_finite_loss",
+                },
+            )
             optimizer.zero_grad(set_to_none=True)
 
             return {
@@ -639,6 +670,27 @@ class GeneralTrainer:
                 non_finite_gradients=non_finite_gradients,
             )
 
+            self._notify_model_epoch_end(
+                model=model,
+                outputs=outputs,
+                train_tensors={
+                    "flows": train_flows_t,
+                    "mask": train_mask_t,
+                    "od": train_od_t,
+                    "od_mask": train_od_mask_t,
+                },
+                epoch_idx=epoch_idx,
+                is_final=epoch_idx >= int(self.cfg.training.epochs),
+                diagnostic_metadata=diagnostic_targets,
+                gradient_stats={
+                    "pre_clip_grad_norm": float(pre_clip_grad_norm),
+                    "post_clip_grad_norm": float("nan"),
+                    "clip_applied": False,
+                    "non_finite_gradients": int(non_finite_gradients),
+                    "skipped_update": True,
+                    "skip_reason": str(skip_reason),
+                },
+            )
             optimizer.zero_grad(set_to_none=True)
 
             return {
@@ -678,6 +730,27 @@ class GeneralTrainer:
                 non_finite_gradients=0,
             )
 
+            self._notify_model_epoch_end(
+                model=model,
+                outputs=outputs,
+                train_tensors={
+                    "flows": train_flows_t,
+                    "mask": train_mask_t,
+                    "od": train_od_t,
+                    "od_mask": train_od_mask_t,
+                },
+                epoch_idx=epoch_idx,
+                is_final=epoch_idx >= int(self.cfg.training.epochs),
+                diagnostic_metadata=diagnostic_targets,
+                gradient_stats={
+                    "pre_clip_grad_norm": float(pre_clip_grad_norm),
+                    "post_clip_grad_norm": float(post_clip_grad_norm),
+                    "clip_applied": bool(clip_result["clip_applied"]),
+                    "non_finite_gradients": int(non_finite_gradients),
+                    "skipped_update": True,
+                    "skip_reason": f"post_clip_{skip_reason}",
+                },
+            )
             optimizer.zero_grad(set_to_none=True)
 
             return {
@@ -698,6 +771,28 @@ class GeneralTrainer:
             }
 
         optimizer.step()
+
+        self._notify_model_epoch_end(
+            model=model,
+            outputs=outputs,
+            train_tensors={
+                "flows": train_flows_t,
+                "mask": train_mask_t,
+                "od": train_od_t,
+                "od_mask": train_od_mask_t,
+            },
+            epoch_idx=epoch_idx,
+            is_final=epoch_idx >= int(self.cfg.training.epochs),
+            diagnostic_metadata=diagnostic_targets,
+            gradient_stats={
+                "pre_clip_grad_norm": float(pre_clip_grad_norm),
+                "post_clip_grad_norm": float(post_clip_grad_norm),
+                "clip_applied": bool(clip_result["clip_applied"]),
+                "non_finite_gradients": int(non_finite_gradients),
+                "skipped_update": False,
+                "skip_reason": None,
+            },
+        )
 
         ###########################################################################
 
@@ -736,6 +831,36 @@ class GeneralTrainer:
             "loss_gradient_audit": loss_gradient_audit,
             "forward_physics_audit": forward_physics_audit,
         }
+
+    @staticmethod
+    def _notify_model_epoch_end(
+        model: torch.nn.Module,
+        outputs: Dict[str, Any],
+        train_tensors: Dict[str, torch.Tensor],
+        epoch_idx: int,
+        is_final: bool,
+        diagnostic_metadata: Optional[Dict[str, Any]] = None,
+        gradient_stats: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Notify models that expose an optional epoch-end observability hook.
+
+        The trainer deliberately knows nothing about model-specific diagnostics.
+        A model may implement ``on_training_epoch_end`` to consume the already
+        computed outputs and tensors. Models without the hook are unaffected.
+        """
+        hook = getattr(model, "on_training_epoch_end", None)
+        if callable(hook):
+            hook_targets = dict(train_tensors)
+            for key, value in (diagnostic_metadata or {}).items():
+                if str(key).startswith("_diagnostic_"):
+                    hook_targets[key] = value
+            hook(
+                outputs=outputs,
+                targets=hook_targets,
+                epoch=int(epoch_idx),
+                is_final=bool(is_final),
+                gradient_stats=gradient_stats or {},
+            )
 
         ##############################################################################
 

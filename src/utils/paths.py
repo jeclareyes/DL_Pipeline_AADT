@@ -51,7 +51,13 @@ throughout the codebase.
 
 import os
 from pathlib import Path
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+except ModuleNotFoundError:  # Optional at runtime when PROJECT_ROOT is already set or discoverable.
+    def load_dotenv() -> bool:
+        """Keep path resolution usable in minimal environments."""
+
+        return False
 
 load_dotenv()
 
