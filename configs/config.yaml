@@ -4,11 +4,11 @@ defaults:
   - _self_ # Permit overrides in this file
 
   # 1. Dataset (Ahora buscará en configs/dataset/Linköping.yaml)
-  - dataset: Synthetic05 # 'Linköping' | 'SiouxFalls' | 'Synthetic01' | 'Synthetic03'
+  - dataset: Synthetic05 # 'Linköping' | 'Synthetic05'
 
 
   # 2. Data Processing (Rutas anidadas según tu estructura)
-  - data_ingestion/data_processing: data_processing
+  - data_ingestion/data_processing@data_handling.data_processing: data_processing
   - data_ingestion/data_preprocessing: preprocessing_from_pkl
 
   # 3. Model (Busca en configs/model/CGAME_MLP_SUE.yaml)
@@ -31,23 +31,25 @@ defaults:
   # 7. VDF (Busca en configs/vdf/bpr.yaml)
   - vdf: bpr # 'bpr_modified' | 'bpr' | 'akcelik' | 'conical'
 
+  # 8. Experiment overlay (optional: runs without an experiment flag are valid).
+  #    Use `+experiment=NAME` on the CLI to pass a scalar selector. The overlay
+  #    is loaded from configs/experiments/ and merged by resolve_experiment_overlay
+  #    inside training_pipeline.py after Hydra finishes composing the base config.
+
+#%%
+
 # Global project variables
 project_name: "DL_Pipeline_AADT"
 
-# Flow Control (Orchestration)
-# Definition of the steps to be executed in the pipeline
-stages:
-  - preprocessing
-  - processing
-  - training
-  - testing
+device: "cuda" # cpu | cuda
+
+global_random_seed: 42
 
 # Base route (relative to project root) so modules know where to storage/read data
 paths:
   root_dir: ${oc.env:PROJECT_ROOT,${hydra:runtime.cwd}}
   logs: ${paths.root_dir}/logs
   data_raw: ${paths.root_dir}/data/raw
-  data_interim: ${paths.root_dir}/data/interim
   data_processed: ${paths.root_dir}/data/processed
   trained_models: ${paths.root_dir}/models
   outputs: ${paths.root_dir}/outputs
@@ -55,4 +57,3 @@ paths:
 runs:
   dir: outputs/runs/${model.model_name}
   # /_Epochs_${training.epochs}_VDF_${network.cost_function}_Learning_Rate_${training.lr}_Flow_Sampling_Rate_${sampling.flow_rate}_Sampling_Strategy_${sampling.strategy}_Sampling_Basis_${sampling.sampling_basis}
-

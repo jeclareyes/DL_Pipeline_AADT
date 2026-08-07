@@ -2,9 +2,18 @@
 root: outputs/runs
 model_to_test: "VI_Model" # "CGAME_MLP_SUE" | "CGME_MLP_SUE" | "CGAME_DataDriven" | "CRAME_DataDriven" | "CRAME_DLayer" | "VI_Model"
 
+# Run identifier to test. The route below is derived automatically from this hash.
+run_hash: "262642eb"
+
+# Models directory is resolved automatically from `run_hash` during testing.
+testing_route: auto
+
 eval_mode:
   single_model: true  # true | false
-  instance_to_test: "eval_Epochs_300_VDF_bpr_Learning_Rate_0.0004_Flow_Rate_0.8_Strat_spatial_LHS_Basis_traffic_counts_based.pt"
+  # Use -1 for the last available epoch in the checkpoint.
+  epoch_to_test: -1
+  # Auto-resolved checkpoint path. Override only for manual ad-hoc testing.
+  instance_to_test: auto
 
 # Capability selection by model (runtime dispatch is capability-driven only).
 capabilities:
@@ -38,16 +47,38 @@ capabilities:
     - link_distributions
     - od_scatter
     - export_csvs
+    - temporal_history
+    - assignment_recalc
 
 # Capability -> task-function mapping (task names must exist in src.test.evaluation_tasks).
 capability_dispatch:
   flow_metrics:
     - plot_standard_metrics
+    - export_global_link_metrics
+    - export_link_results_table
   link_distributions:
-    - plot_link_distributions
+    - plot_link_scatter_global
+    - plot_link_scatter_by_link_group
+    - plot_link_density_global
+    - plot_link_density_by_group
+    - plot_link_histogram_global
+    - plot_link_histogram_by_group
+    - plot_vc_density_global
+    - plot_vc_density_by_group
+    - plot_vc_histogram_global
   od_scatter:
-    - plot_od_scatter
+    - plot_od_scatter_global
+    - plot_od_density_global
+    - export_od_metrics
+    - export_od_results_table
   export_csvs:
-    - export_standard_csvs
-  cgame_penalty:
-    - plot_cgame_penalty
+    - export_grouped_link_metrics
+    - export_od_link_contributions
+    - export_route_link_contributions
+    - export_route_flow_table
+  temporal_history:
+    - plot_training_history
+    - plot_alpha_beta_history
+    - export_alpha_beta_table
+  assignment_recalc:
+    - run_assignment_testing

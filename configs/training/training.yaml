@@ -28,7 +28,7 @@
 # ---------
 # The training pipeline should NOT read TNTP files, build graphs, adapt routes,
 # construct targets, or search for flow columns. Those responsibilities belong
-# to the data_ingestion / data_processing block.
+# to the data_handling / data_processing block.
 # =============================================================================
 
 
@@ -59,6 +59,37 @@ artifact:
   # Usually false. The artifact is portable when saved on CPU.
   # The TrainingInputPreparer moves only the required tensors to the training device.
   move_to_device_on_load: false
+
+  # Validation contract for the training_artifact produced by the asset
+  # pipeline. These checks do not belong to data_processing.yaml because the
+  # base_artifact does not yet contain an experiment route_set, assignment
+  # ground truth or model-ready tensors.
+  validation:
+    # Disable only for diagnostics. Normal asset materialization must validate.
+    enabled: true
+
+    # Invalid model-ready artifacts stop asset materialization when true.
+    strict: true
+
+    # Validate all model-ready tensor values for finite/non-negative physical
+    # values where the artifact contract requires them.
+    check_tensor_values: true
+
+    # Validate target shapes and binary observation masks. NaN is allowed only
+    # in raw source arrays; model-ready target arrays must be finite and use
+    # their masks to represent missing source values.
+    check_target_masks: true
+
+    # Validate travel-time, capacity, lanes and other physical network tensors.
+    check_physical_tensors: true
+
+    # Validate that the selected experiment route_set is aligned with the
+    # processed graph. This is separate from base validation of the primary
+    # source route set.
+    check_route_graph_compatibility: true
+
+    # Maximum number of examples retained in validation diagnostics.
+    max_reported_items: 20
 
 
 # Backward-compatible shortcut used by training_pipeline.py as a fallback.

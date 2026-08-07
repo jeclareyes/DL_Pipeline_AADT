@@ -1,4 +1,4 @@
-# configs/data_ingestion/data_preprocessing/preprocessing_from_pkl.yaml
+# configs/data_handling/data_preprocessing/preprocessing_from_pkl.yaml
 # =============================================================================
 
 # NOTA: Eliminamos 'dataset: Linköping' porque ya está definido globalmente.
