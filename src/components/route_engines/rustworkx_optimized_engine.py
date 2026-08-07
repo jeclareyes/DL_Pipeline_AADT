@@ -4,6 +4,7 @@ from itertools import count
 from typing import List, Tuple, Dict, Set, Optional, Any
 
 import networkx as nx
+import rustworkx as rx
 
 from .base_engine import RouteEngine, Route
 
@@ -12,17 +13,16 @@ logger = logging.getLogger(__name__)
 class RustworkXOptimizedEngine(RouteEngine):
     def __init__(self, graph: nx.DiGraph):
         self.nx_graph = graph
-        
+
         # Bi-directional mappings
         self.node_to_rx = {}
         self.rx_to_node = {}
-        
+
         for rx_idx, node in enumerate(graph.nodes()):
             node_id = int(node)
             self.node_to_rx[node_id] = rx_idx
             self.rx_to_node[rx_idx] = node_id
 
-        self.adj = {}
         self.edge_lookup = {}
         self.edge_weight = {}
         self.edge_link_type = {}
@@ -34,17 +34,36 @@ class RustworkXOptimizedEngine(RouteEngine):
             v_rx = self.node_to_rx[int(v)]
             self.edge_lookup[(u_rx, v_rx)] = edge_id
             self.edge_pair_by_id[edge_id] = (u_rx, v_rx)
-            
+
             link_type = int(data.get("link_type", -1))
             self.edge_link_type[edge_id] = link_type
             self.raw_edge_attrs[edge_id] = data
 
-        self.adj = {rx_idx: [] for rx_idx in self.rx_to_node}
+        # Adjacency for path validation (outgoing edges)
+        self.adj: dict[int, list[tuple[int, int, float, int]]] = {
+            rx_idx: [] for rx_idx in self.rx_to_node
+        }
+        # Reverse adjacency for computing forbidden incident edges (incoming)
+        self._reverse_adj: dict[int, list[tuple[int, int, float, int]]] = {
+            rx_idx: [] for rx_idx in self.rx_to_node
+        }
+
+        # Native rustworkx graph for fast Dijkstra
+        self.rx_graph = rx.PyDiGraph(multigraph=False)
+        for rx_idx in range(len(self.rx_to_node)):
+            self.rx_graph.add_node(self.rx_to_node[rx_idx])
+        self._rx_edge_data: dict[int, dict] = {}
+
         for edge_id, (u_rx, v_rx) in self.edge_pair_by_id.items():
             link_type = self.edge_link_type[edge_id]
             self.adj[u_rx].append((v_rx, edge_id, 1.0, link_type))
+            self._reverse_adj[v_rx].append((u_rx, edge_id, 1.0, link_type))
+            rx_edge_data: dict = {"edge_id": edge_id, "weight": 1.0}
+            self.rx_graph.add_edge(u_rx, v_rx, rx_edge_data)
+            self._rx_edge_data[edge_id] = rx_edge_data
 
-        self._current_weight_attr = None
+        self._current_weight_attr: str | None = None
+        self._current_forbidden_edges: set[int] = set()
 
         logger.info(
             "RustworkXOptimizedEngine initialized: converted %d nodes and %d edges.",
@@ -54,7 +73,8 @@ class RustworkXOptimizedEngine(RouteEngine):
 
     def _prepare_weight_and_adj(self, weight: str) -> None:
         """
-        Prepares self.edge_weight and self.adj dynamically for a specific weight key.
+        Prepares self.edge_weight, self.adj and self._reverse_adj dynamically
+        for a specific weight key, and updates the rustworkx graph edge data in-place.
         Raises ValueError if any weight is negative or missing.
         """
         self.edge_weight = {}
@@ -67,10 +87,13 @@ class RustworkXOptimizedEngine(RouteEngine):
             self.edge_weight[edge_id] = val
 
         self.adj = {rx_idx: [] for rx_idx in self.rx_to_node}
+        self._reverse_adj = {rx_idx: [] for rx_idx in self.rx_to_node}
         for edge_id, (u_rx, v_rx) in self.edge_pair_by_id.items():
             weight_val = self.edge_weight[edge_id]
             link_type = self.edge_link_type[edge_id]
             self.adj[u_rx].append((v_rx, edge_id, weight_val, link_type))
+            self._reverse_adj[v_rx].append((u_rx, edge_id, weight_val, link_type))
+            self._rx_edge_data[edge_id]["weight"] = weight_val
 
         self._current_weight_attr = weight
 
@@ -125,56 +148,92 @@ class RustworkXOptimizedEngine(RouteEngine):
             dest = target_rx
         return self._is_valid_connector_usage(full_path, orig, dest, connector_link_types)
 
+    def _edge_weight_fn(self, edge_data: dict) -> float:
+        if edge_data["edge_id"] in self._current_forbidden_edges:
+            return float("inf")
+        return float(edge_data.get("weight", 1.0))
+
     def _dijkstra_filtered(
         self,
         source_rx: int,
         target_rx: int,
         forbidden_nodes: Set[int],
-        forbidden_edges: Set[int]
+        forbidden_edges: Set[int],
+        connector_link_types: Optional[Set[int]] = None,
+        connector_origin_rx: Optional[int] = None,
+        connector_destination_rx: Optional[int] = None,
     ) -> Optional[List[int]]:
         """
-        Runs Dijkstra directly on self.adj using heapq, filtering out forbidden nodes/edges on the fly.
+        Runs Dijkstra via rustworkx (Rust native) using weight poisoning:
+        forbidden edges are assigned infinite weight.
+
+        When ``connector_link_types`` is provided, any connector edge whose
+        *tail* node is not the complete route origin and whose *head* node is
+        not the complete route destination is treated as forbidden.  This is
+        the key invariant for real networks: connector links are only legal at
+        the very first and very last step of a route.  The complete endpoints
+        are passed separately because Yen also invokes Dijkstra from spur
+        nodes.
         """
         if source_rx == target_rx:
             return [source_rx]
 
-        distances = {source_rx: 0.0}
-        predecessors = {}
-        queue = [(0.0, source_rx)]
+        # Yen invokes Dijkstra from spur nodes, but connector legality is
+        # defined by the complete OD route, not by the current spur.  If these
+        # are omitted, every intermediate connector hub becomes a new
+        # temporary origin and produces an unbounded stream of invalid paths.
+        connector_origin_rx = (
+            source_rx if connector_origin_rx is None else connector_origin_rx
+        )
+        connector_destination_rx = (
+            target_rx
+            if connector_destination_rx is None
+            else connector_destination_rx
+        )
 
-        while queue:
-            dist, u = heapq.heappop(queue)
+        # Collect forbidden edges from forbidden nodes
+        all_forbidden = set(forbidden_edges)
+        for node in forbidden_nodes:
+            for v, eid, w, lt in self.adj.get(node, []):
+                all_forbidden.add(eid)
+            for u, eid, w, lt in self._reverse_adj.get(node, []):
+                all_forbidden.add(eid)
 
-            if dist > distances.get(u, float('inf')):
-                continue
+        # Pre-exclude connector edges that are not incident to source or target.
+        # This guarantees Dijkstra can only produce paths that satisfy the
+        # connector-usage constraint, so every candidate handed to Yen's loop
+        # is already valid.  Without this, on real networks with central
+        # connector hubs, the algorithm enters a near-infinite loop because
+        # virtually every short path passes through an intermediate connector.
+        if connector_link_types:
+            for edge_id, (u_rx, v_rx) in self.edge_pair_by_id.items():
+                if self.edge_link_type[edge_id] in connector_link_types:
+                    if (
+                        u_rx != connector_origin_rx
+                        and v_rx != connector_destination_rx
+                    ):
+                        all_forbidden.add(edge_id)
 
-            if u == target_rx:
-                break
+        self._current_forbidden_edges = all_forbidden
 
-            for v, edge_id, weight_val, link_type in self.adj.get(u, []):
-                if v in forbidden_nodes:
-                    continue
-                if edge_id in forbidden_edges:
-                    continue
+        paths = rx.dijkstra_shortest_paths(
+            self.rx_graph,
+            source=source_rx,
+            target=target_rx,
+            weight_fn=self._edge_weight_fn,
+        )
 
-                new_dist = dist + weight_val
-                if new_dist < distances.get(v, float('inf')):
-                    distances[v] = new_dist
-                    predecessors[v] = u
-                    heapq.heappush(queue, (new_dist, v))
-
-        if target_rx not in predecessors:
-            return None
-
-        # Reconstruct path
-        path = []
-        curr = target_rx
-        while curr != source_rx:
-            path.append(curr)
-            curr = predecessors[curr]
-        path.append(source_rx)
-        path.reverse()
-        return path
+        if target_rx in paths:
+            candidate_path = list(paths[target_rx])
+            # rustworkx may still return a path containing an edge whose
+            # callback weight is ``inf`` when no finite alternative exists.
+            # Such a path is not a valid filtered result: returning it would
+            # make Yen reject it later and keep expanding invalid candidates.
+            candidate_edge_ids = self._path_to_edge_ids(candidate_path)
+            if any(edge_id in all_forbidden for edge_id in candidate_edge_ids):
+                return None
+            return candidate_path
+        return None
 
     def _yen_k_shortest_paths_rx(
         self,
@@ -186,9 +245,24 @@ class RustworkXOptimizedEngine(RouteEngine):
     ) -> List[List[int]]:
         """
         Calculates K shortest simple paths from source_rx to target_rx.
-        Checks for path validity on the fly using connector link types.
+
+        Connector constraints are enforced *inside* each Dijkstra call so
+        that only topologically-valid spur paths are ever generated.  This
+        prevents the algorithm from spending exponential time exploring
+        intermediate-connector paths that would only be discarded later.
         """
-        first_path = self._dijkstra_filtered(source_rx, target_rx, set(), set())
+        connector_origin_rx = cycle_origin_rx if cycle_origin_rx is not None else source_rx
+        connector_destination_rx = cycle_origin_rx if cycle_origin_rx is not None else target_rx
+
+        first_path = self._dijkstra_filtered(
+            source_rx,
+            target_rx,
+            set(),
+            set(),
+            connector_link_types,
+            connector_origin_rx,
+            connector_destination_rx,
+        )
         if not first_path:
             return []
 
@@ -199,8 +273,8 @@ class RustworkXOptimizedEngine(RouteEngine):
         if self._is_path_valid(first_path, source_rx, target_rx, connector_link_types, cycle_origin_rx):
             valid_routes.append(first_path)
 
-        B = []
-        candidate_set = set()
+        B: List = []
+        candidate_set: Set[tuple] = set()
         tie_breaker = count()
 
         current_branch_path_idx = 0
@@ -215,7 +289,7 @@ class RustworkXOptimizedEngine(RouteEngine):
                     root_path = prev_path[:i + 1]
 
                     forbidden_nodes = set(root_path[:-1])
-                    forbidden_edges = set()
+                    forbidden_edges: Set[int] = set()
 
                     for p in A:
                         if len(p) > i + 1 and p[:i + 1] == root_path:
@@ -224,7 +298,15 @@ class RustworkXOptimizedEngine(RouteEngine):
                             if edge_id is not None:
                                 forbidden_edges.add(edge_id)
 
-                    spur_path = self._dijkstra_filtered(spur_node, target_rx, forbidden_nodes, forbidden_edges)
+                    # Pass connector_link_types so spur Dijkstra never routes
+                    # through intermediate connector hubs.
+                    spur_path = self._dijkstra_filtered(
+                        spur_node, target_rx,
+                        forbidden_nodes, forbidden_edges,
+                        connector_link_types,
+                        connector_origin_rx,
+                        connector_destination_rx,
+                    )
                     if spur_path:
                         total_path = root_path[:-1] + spur_path
                         total_tuple = tuple(total_path)

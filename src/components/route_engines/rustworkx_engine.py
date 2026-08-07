@@ -51,7 +51,10 @@ class RustworkXEngine(RouteEngine):
         target_rx: int,
         weight_fn,
         forbidden_nodes: Set[int],
-        forbidden_edges: Set[Tuple[int, int]]
+        forbidden_edges: Set[Tuple[int, int]],
+        connector_link_types: Optional[Set[int]] = None,
+        connector_origin_rx: Optional[int] = None,
+        connector_destination_rx: Optional[int] = None,
     ) -> Optional[List[int]]:
         """
         Runs Dijkstra on a subgraph ignoring forbidden nodes and edges.
@@ -66,6 +69,12 @@ class RustworkXEngine(RouteEngine):
             # source_idx and target_idx are already rx indices
             return (source_idx, target_idx) not in forbidden_edges
 
+        connector_link_types = connector_link_types or set()
+        if connector_origin_rx is None:
+            connector_origin_rx = source_rx
+        if connector_destination_rx is None:
+            connector_destination_rx = target_rx
+
         # Create a filtered subgraph view (only works on rx >= 0.12 roughly via subgraph)
         # However, building a temporary graph is safer if filtering functions are not fully supported
         # for all path algorithms. But `rx.dijkstra_shortest_paths` supports custom weight functions.
@@ -79,6 +88,14 @@ class RustworkXEngine(RouteEngine):
 
         # Building a temporary graph is safest and respects the requirements strictly
         temp_graph = graph.copy()
+
+        # Connector legality belongs to the complete OD, not the current Yen
+        # spur.  Remove intermediate connectors before Dijkstra so invalid
+        # zero-cost hub paths never enter Yen's candidate heap.
+        for (u_rx, v_rx), edge_data in self.edge_data_map.items():
+            if int(edge_data.get("link_type", -1)) in connector_link_types:
+                if u_rx != connector_origin_rx and v_rx != connector_destination_rx:
+                    forbidden_edges.add((u_rx, v_rx))
         
         # Remove forbidden edges.
         # `edge_indices_from_endpoints()` returns integer edge IDs, while
@@ -114,7 +131,10 @@ class RustworkXEngine(RouteEngine):
         source: int,
         target: int,
         k: int,
-        weight: str
+        weight: str,
+        connector_link_types: Optional[Set[int]] = None,
+        connector_origin: Optional[int] = None,
+        connector_destination: Optional[int] = None,
     ) -> List[List[int]]:
         """
         Strict implementation of Yen's algorithm.
@@ -124,13 +144,30 @@ class RustworkXEngine(RouteEngine):
 
         source_rx = self.node_to_rx[source]
         target_rx = self.node_to_rx[target]
+        connector_link_types = connector_link_types or set()
+        connector_origin_rx = self.node_to_rx.get(
+            source if connector_origin is None else int(connector_origin)
+        )
+        connector_destination_rx = self.node_to_rx.get(
+            target if connector_destination is None else int(connector_destination)
+        )
+        if connector_origin_rx is None or connector_destination_rx is None:
+            return []
 
         def weight_fn(edge_data):
             return float(edge_data.get(weight, 1.0))
 
         # 1. Find shortest path A^1
         first_path_rx = self._dijkstra_shortest_path(
-            self.rx_graph, source_rx, target_rx, weight_fn, set(), set()
+            self.rx_graph,
+            source_rx,
+            target_rx,
+            weight_fn,
+            set(),
+            set(),
+            connector_link_types,
+            connector_origin_rx,
+            connector_destination_rx,
         )
 
         if not first_path_rx:
@@ -154,7 +191,15 @@ class RustworkXEngine(RouteEngine):
                 forbidden_nodes = set(root_path_rx[:-1])
 
                 spur_path_rx = self._dijkstra_shortest_path(
-                    self.rx_graph, spur_node_rx, target_rx, weight_fn, forbidden_nodes, forbidden_edges
+                    self.rx_graph,
+                    spur_node_rx,
+                    target_rx,
+                    weight_fn,
+                    forbidden_nodes,
+                    forbidden_edges,
+                    connector_link_types,
+                    connector_origin_rx,
+                    connector_destination_rx,
                 )
 
                 if spur_path_rx:
@@ -295,7 +340,15 @@ class RustworkXEngine(RouteEngine):
             successor = int(successor)
             
             # Precompute k paths for this successor to origin using Yen
-            paths = self._yen_k_shortest_paths(successor, origin_id, k_routes, weight)
+            paths = self._yen_k_shortest_paths(
+                successor,
+                origin_id,
+                k_routes,
+                weight,
+                connector_link_types=connector_link_types,
+                connector_origin=origin_id,
+                connector_destination=origin_id,
+            )
             
             # Create a simple iterator over these paths
             generator = iter(paths)
@@ -371,8 +424,11 @@ class RustworkXEngine(RouteEngine):
             candidate_paths = self._yen_k_shortest_paths(
                 source=origin_id,
                 target=destination_id,
-                k=k * 3, # Generate extra to account for filtering
-                weight=weight
+                k=k,
+                weight=weight,
+                connector_link_types=connector_link_types,
+                connector_origin=origin_id,
+                connector_destination=destination_id,
             )
 
             for path in candidate_paths:

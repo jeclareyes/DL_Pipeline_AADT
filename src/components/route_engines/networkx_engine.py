@@ -13,6 +13,35 @@ class NetworkXEngine(RouteEngine):
     def __init__(self, graph: nx.DiGraph):
         self.graph = graph
 
+    def _filtered_graph(
+        self,
+        origin_id: int,
+        destination_id: int,
+        connector_link_types: Set[int],
+    ) -> nx.DiGraph:
+        """Return a view that excludes intermediate connector edges.
+
+        Connector validity is an OD-level constraint.  Filtering only after
+        ``shortest_simple_paths`` is unsafe on real networks because zero-cost
+        connector hubs can yield an effectively unbounded stream of rejected
+        candidates.
+        """
+        if not connector_link_types:
+            return self.graph
+
+        origin_id = int(origin_id)
+        destination_id = int(destination_id)
+
+        def edge_allowed(u: int, v: int) -> bool:
+            link_type = int(self.graph[int(u)][int(v)].get("link_type", -1))
+            return (
+                link_type not in connector_link_types
+                or int(u) == origin_id
+                or int(v) == destination_id
+            )
+
+        return nx.subgraph_view(self.graph, filter_edge=edge_allowed)
+
     def get_k_routes(
         self,
         origin_id: int,
@@ -31,14 +60,18 @@ class NetworkXEngine(RouteEngine):
                 k_routes=k,
                 weight=weight,
                 allow_loops=constraints.get("allow_loops", False),
+                connector_link_types=connector_link_types,
             )
 
         routes: List[Route] = []
         seen_routes: Set[Tuple[int, ...]] = set()
 
         try:
+            routing_graph = self._filtered_graph(
+                origin_id, destination_id, connector_link_types
+            )
             candidate_paths = nx.shortest_simple_paths(
-                self.graph,
+                routing_graph,
                 source=origin_id,
                 target=destination_id,
                 weight=weight,
@@ -141,6 +174,7 @@ class NetworkXEngine(RouteEngine):
         k_routes: int,
         weight: str,
         allow_loops: bool = False,
+        connector_link_types: Optional[Set[int]] = None,
     ) -> List[List[int]]:
         origin_id = int(origin_id)
         if not self.graph.has_node(origin_id):
@@ -149,10 +183,14 @@ class NetworkXEngine(RouteEngine):
         heap = []
         tie_breaker = count()
         generators = {}
-        for successor in self.graph.successors(origin_id):
+        connector_link_types = connector_link_types or set()
+        routing_graph = self._filtered_graph(
+            origin_id, origin_id, connector_link_types
+        )
+        for successor in routing_graph.successors(origin_id):
             successor = int(successor)
             try:
-                generator = nx.shortest_simple_paths(self.graph, source=successor, target=origin_id, weight=weight)
+                generator = nx.shortest_simple_paths(routing_graph, source=successor, target=origin_id, weight=weight)
                 route = self._get_next_valid_intrazonal_route_from_generator(origin_id, successor, generator, weight, allow_loops)
                 if route is None:
                     continue
