@@ -7,7 +7,10 @@ before performing any computation.
 """
 
 from src.components.assignment_motors.assignment_runner import prepare_and_run_assignment
+import copy
+import json
 import os
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 import numpy as np
@@ -93,6 +96,20 @@ def _resolve_assignment_testing_config(
         if isinstance(assignment_config, Mapping):
             return dict(assignment_config)
 
+    fallback_path = Path(__file__).resolve().parents[2] / "configs" / "assignment" / "assignment.yaml"
+    if fallback_path.exists():
+        try:
+            fallback_cfg = OmegaConf.to_container(OmegaConf.load(fallback_path), resolve=True)
+            if isinstance(fallback_cfg, dict) and fallback_cfg:
+                logging.info(
+                    f"[{model_name}] Using fallback assignment config from {fallback_path}"
+                )
+                return fallback_cfg
+        except Exception as exc:
+            logging.warning(
+                f"[{model_name}] Could not load fallback assignment config from {fallback_path}: {exc}"
+            )
+
     return None
 
 def run_assignment_testing(*, artifacts: Dict[str, Any], static: Dict[str, Any], masks: Dict[str, Any], output_dir: str, model_name: str) -> None:
@@ -129,6 +146,14 @@ def run_assignment_testing(*, artifacts: Dict[str, Any], static: Dict[str, Any],
             "AssignmentTesting.assignment_config is missing or empty."
         )
         return
+
+    assign_cfg_dict = copy.deepcopy(assign_cfg_dict)
+    assign_cfg_dict = _inject_synthetic_theta_fallback_if_needed(
+        assign_cfg_dict=assign_cfg_dict,
+        artifacts=artifacts,
+        static=static,
+        model_name=model_name,
+    )
 
     try:
         bundle = prepare_and_run_assignment(
@@ -167,6 +192,13 @@ def run_assignment_testing(*, artifacts: Dict[str, Any], static: Dict[str, Any],
         model_name=model_name,
     )
 
+    _compare_od_matrix_to_ground_truth(
+        assignment_matrix=bundle.assignment_matrix,
+        static=static,
+        output_dir=output_dir,
+        model_name=model_name,
+    )
+
     plot_scatter_comparison(
         pred=assigned_flows,
         target=true_flows,
@@ -189,6 +221,126 @@ def run_assignment_testing(*, artifacts: Dict[str, Any], static: Dict[str, Any],
     )
 
     logging.info(f"[{model_name}] Finished re-assignment testing.")
+
+
+def _inject_synthetic_theta_fallback_if_needed(
+    *,
+    assign_cfg_dict: Dict[str, Any],
+    artifacts: Dict[str, Any],
+    static: Dict[str, Any],
+    model_name: str,
+) -> Dict[str, Any]:
+    """Switch SUE theta from artifact to explicit when the checkpoint lacks it.
+
+    Synthetic datasets often store the reference theta in the scenario manifest
+    even when the saved checkpoint does not expose learned_theta. In that case
+    we use the manifest value so route-based assignment can still be executed
+    deterministically for comparison against the known ground truth.
+    """
+    if not isinstance(assign_cfg_dict, dict):
+        return assign_cfg_dict
+
+    sue_cfg = assign_cfg_dict.get("stochastic_user_equilibrium")
+    if not isinstance(sue_cfg, dict):
+        return assign_cfg_dict
+
+    logit_cfg = sue_cfg.get("logit")
+    if not isinstance(logit_cfg, dict):
+        return assign_cfg_dict
+
+    theta_source = str(logit_cfg.get("theta_source", "")).strip().lower()
+    theta_artifact_key = logit_cfg.get("theta_artifact_key")
+    if theta_source != "artifact":
+        return assign_cfg_dict
+    if not theta_artifact_key or theta_artifact_key in artifacts:
+        return assign_cfg_dict
+
+    theta_value = _resolve_synthetic_theta_from_manifest(static=static, model_name=model_name)
+    if theta_value is None:
+        logging.warning(
+            f"[{model_name}] SUE theta artifact '{theta_artifact_key}' is missing and no synthetic fallback theta was found."
+        )
+        return assign_cfg_dict
+
+    logging.info(
+        f"[{model_name}] SUE theta artifact '{theta_artifact_key}' is missing; "
+        f"using synthetic manifest theta={theta_value} as explicit fallback."
+    )
+    logit_cfg["theta_source"] = "explicit"
+    logit_cfg["theta_value"] = float(theta_value)
+    logit_cfg["theta_artifact_key"] = None
+    return assign_cfg_dict
+
+
+def _resolve_synthetic_theta_from_manifest(*, static: Dict[str, Any], model_name: str) -> float | None:
+    """Resolve synthetic assignment theta from the dataset creation manifest."""
+    raw_data = static.get("raw_data", {})
+    if not isinstance(raw_data, dict):
+        return None
+
+    source_file = None
+    candidate_sources = [
+        ("raw", "metadata", "flows", "source_file"),
+        ("raw", "metadata", "routes", "source_file"),
+        ("paths", "manifest_path"),
+        ("metadata", "flows", "source_file"),
+    ]
+    for path in candidate_sources:
+        current: Any = raw_data
+        ok = True
+        for key in path:
+            if not isinstance(current, dict) or key not in current:
+                ok = False
+                break
+            current = current[key]
+        if ok and current:
+            source_file = current
+            break
+
+    if not source_file:
+        return None
+
+    try:
+        source_path = Path(str(source_file)).resolve()
+    except Exception:
+        return None
+
+    manifest_path = source_path.parent / "info" / "dataset_manifest.json"
+    if not manifest_path.exists():
+        return None
+
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logging.warning(f"[{model_name}] Could not read synthetic manifest {manifest_path}: {exc}")
+        return None
+
+    candidate_paths = [
+        ("metadata", "flows", "assignment_theta"),
+        ("metadata", "flows", "assignment_metadata", "theta"),
+        ("metadata", "flows", "assignment_config", "stochastic_user_equilibrium", "logit", "theta_value"),
+        ("config", "AssignmentParameters", "SUE_Parameters", "theta"),
+        ("assignment_theta",),
+    ]
+
+    for path in candidate_paths:
+        current: Any = manifest
+        ok = True
+        for key in path:
+            if not isinstance(current, dict) or key not in current:
+                ok = False
+                break
+            current = current[key]
+        if not ok:
+            continue
+        try:
+            theta = float(current)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(theta) and theta > 0.0:
+            return theta
+
+    return None
 
 
 def _unpack_assignment_runner_output(bundle: Any, model_name: str) -> tuple[Any, pd.DataFrame]:
@@ -431,6 +583,148 @@ def _resolve_od_known_mask(static: Dict[str, Any], masks: Dict[str, Any]) -> np.
     if "mask_od_known" in static:
         return _to_numpy_1d(static["mask_od_known"], "mask_od_known").astype(bool)
     return None
+
+
+def _normalize_epochs_history(epochs_history: Any) -> list[dict[str, Any]]:
+    """Convert checkpoint epoch history to a list of row dictionaries."""
+    if epochs_history is None:
+        return []
+
+    if isinstance(epochs_history, list):
+        rows = [row for row in epochs_history if isinstance(row, dict)]
+        return rows
+
+    if isinstance(epochs_history, dict):
+        rows: list[dict[str, Any]] = []
+        for epoch_key, payload in sorted(epochs_history.items(), key=lambda item: int(item[0])):
+            if not isinstance(payload, dict):
+                continue
+            row = dict(payload)
+            row.setdefault("epoch", int(epoch_key))
+            rows.append(row)
+        return rows
+
+    return []
+
+
+def _extract_dataset_availability(static: Dict[str, Any]) -> Dict[str, bool]:
+    """Resolve dataset availability flags from the saved model config."""
+    model_cfg = static.get("model_config")
+    if model_cfg is None:
+        return {}
+
+    from collections.abc import Mapping
+
+    dataset_cfg = None
+    if isinstance(model_cfg, Mapping):
+        dataset_cfg = model_cfg.get("dataset")
+    else:
+        dataset_cfg = getattr(model_cfg, "dataset", None)
+
+    if dataset_cfg is None:
+        return {}
+
+    availability = None
+    if isinstance(dataset_cfg, Mapping):
+        availability = dataset_cfg.get("data_availability")
+    else:
+        availability = getattr(dataset_cfg, "data_availability", None)
+
+    if availability is None:
+        return {}
+
+    if isinstance(availability, Mapping):
+        return {str(k): bool(v) for k, v in availability.items()}
+
+    return {
+        key: bool(getattr(availability, key))
+        for key in [
+            "has_complete_od_ground_truth",
+            "has_observed_link_flows",
+            "has_ground_truth_assignment",
+        ]
+        if hasattr(availability, key)
+    }
+
+
+def _compare_od_matrix_to_ground_truth(
+    *,
+    assignment_matrix: np.ndarray,
+    static: Dict[str, Any],
+    output_dir: str,
+    model_name: str,
+) -> None:
+    """Export a matrix-level OD comparison when complete ground truth exists."""
+    raw_data = static.get("raw_data", {})
+    if not isinstance(raw_data, dict):
+        return
+
+    availability = _extract_dataset_availability(static)
+    if not availability.get("has_complete_od_ground_truth", False):
+        return
+
+    gt_od = raw_data.get("od_matrix")
+    if gt_od is None:
+        return
+
+    if hasattr(gt_od, "toarray"):
+        gt_od = gt_od.toarray()
+    else:
+        gt_od = np.asarray(gt_od)
+
+    pred_od = np.asarray(assignment_matrix)
+    if pred_od.shape != gt_od.shape:
+        raise ArtifactSchemaError(
+            f"[{model_name}] Predicted OD matrix shape {pred_od.shape} does not match ground truth {gt_od.shape}."
+        )
+
+    gt_vec = gt_od.reshape(-1)
+    pred_vec = pred_od.reshape(-1)
+
+    rel_err = np.zeros_like(gt_vec, dtype=float)
+    np.divide(
+        pred_vec - gt_vec,
+        gt_vec,
+        out=rel_err,
+        where=gt_vec != 0,
+    )
+
+    rows = np.repeat(np.arange(gt_od.shape[0]), gt_od.shape[1])
+    cols = np.tile(np.arange(gt_od.shape[1]), gt_od.shape[0])
+    df = pd.DataFrame(
+        {
+            "origin_index": rows,
+            "destination_index": cols,
+            "predicted_od": pred_vec,
+            "ground_truth_od": gt_vec,
+            "absolute_error": np.abs(pred_vec - gt_vec),
+            "relative_error": rel_err,
+            "is_intrazonal": rows == cols,
+        }
+    )
+
+    df.to_csv(os.path.join(output_dir, f"{model_name}_od_matrix_comparison.csv"), index=False)
+
+    summary = pd.DataFrame(
+        [
+            {
+                "model": model_name,
+                "pred_total_od": float(np.nansum(pred_vec)),
+                "ground_truth_total_od": float(np.nansum(gt_vec)),
+                "absolute_total_gap": float(abs(np.nansum(pred_vec) - np.nansum(gt_vec))),
+                "relative_total_gap": float(
+                    abs(np.nansum(pred_vec) - np.nansum(gt_vec))
+                    / max(abs(np.nansum(gt_vec)), 1e-12)
+                ),
+                "mae": float(np.mean(np.abs(pred_vec - gt_vec))),
+                "rmse": float(np.sqrt(np.mean((pred_vec - gt_vec) ** 2))),
+            }
+        ]
+    )
+    summary.to_csv(
+        os.path.join(output_dir, f"{model_name}_od_matrix_comparison_summary.csv"),
+        index=False,
+    )
 
 
 def plot_standard_metrics(*, artifacts: Dict[str, Any], static: Dict[str, Any], masks: Dict[str, Any], output_dir: str, model_name: str) -> None:
@@ -956,8 +1250,8 @@ def plot_training_history(*, artifacts: Dict[str, Any], static: Dict[str, Any], 
     from src.test.plots.epoch_plots import plot_loss_curves, plot_lr_curve, plot_loss_and_score
     _require_keys(artifacts, ["epochs_history"], "artifacts for plot_training_history")
     
-    epochs_history = artifacts["epochs_history"]
-    if not isinstance(epochs_history, list) or not epochs_history:
+    epochs_history = _normalize_epochs_history(artifacts["epochs_history"])
+    if not epochs_history:
         return
         
     plot_loss_curves(epochs_history, os.path.join(output_dir, f"{model_name}_loss_curves.png"))
@@ -968,8 +1262,8 @@ def plot_alpha_beta_history(*, artifacts: Dict[str, Any], static: Dict[str, Any]
     from src.test.plots.epoch_plots import plot_alpha_beta_evolution
     _require_keys(artifacts, ["epochs_history"], "artifacts for plot_alpha_beta_history")
     
-    epochs_history = artifacts["epochs_history"]
-    if not isinstance(epochs_history, list) or not epochs_history:
+    epochs_history = _normalize_epochs_history(artifacts["epochs_history"])
+    if not epochs_history:
         return
         
     plot_alpha_beta_evolution(epochs_history, os.path.join(output_dir, f"{model_name}_alpha_beta_history.png"))

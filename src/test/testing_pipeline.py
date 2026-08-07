@@ -7,15 +7,136 @@ functions in _testing_functions.py using capability-based task dispatch.
 import logging
 import os
 from glob import glob
+from collections.abc import Mapping
+from pathlib import Path
 import torch
 
 import hydra
 from omegaconf import DictConfig
 
-from src.contracts.runtime_contracts import ContractError, resolve_testing_dispatch_plan
+from src.contracts.runtime_contracts import resolve_testing_dispatch_plan
 
 # Importamos la función orquestadora desde tu archivo de funciones
 from src.test._testing_functions import process_evaluation
+
+
+def _cfg_get(container, key, default=None):
+    if container is None:
+        return default
+    if isinstance(container, dict):
+        return container.get(key, default)
+    return getattr(container, key, default)
+
+
+def _resolve_models_dir(cfg: DictConfig) -> str:
+    run_hash = str(cfg.testing.run_hash)
+    model_name = str(cfg.model.model_name)
+    project_root = Path(__file__).resolve().parents[2]
+    candidate_roots: list[Path] = []
+
+    for raw_root in (
+        project_root / "outputs" / "runs" / model_name,
+        Path(str(cfg.paths.outputs)) / "runs" / model_name,
+    ):
+        if raw_root.exists() and raw_root not in candidate_roots:
+            candidate_roots.append(raw_root)
+
+    def _pick_best_match(pattern: str) -> str | None:
+        matches: list[Path] = []
+        for root in candidate_roots:
+            matches.extend(sorted(root.rglob(pattern)))
+        matches = [path for path in matches if path.name == pattern]
+        if not matches:
+            return None
+        dataset_name = str(_cfg_get(cfg.dataset, "name", "")).strip()
+        if dataset_name:
+            preferred = [path for path in matches if f"{dataset_name}_{run_hash}" in str(path)]
+            if preferred:
+                matches = preferred
+        matches = sorted(matches)
+        if len(matches) > 1:
+            logging.info(
+                "Multiple checkpoint candidates found for run_hash=%s | pattern=%s | chosen=%s | all=%s",
+                run_hash,
+                pattern,
+                matches[0],
+                matches,
+            )
+        return str(matches[0])
+
+    exact_file = _pick_best_match(f"{model_name}_{run_hash}.pt")
+    if exact_file:
+        return str(Path(exact_file).parent)
+
+    best_file = _pick_best_match(f"{model_name}_{run_hash}_best.pt")
+    if best_file:
+        return str(Path(best_file).parent)
+
+    for root in candidate_roots:
+        fallback_dir = root / f"{str(_cfg_get(cfg.dataset, 'name', 'unknown'))}_{run_hash}" / "models"
+        if fallback_dir.exists():
+            return str(fallback_dir)
+
+    raise FileNotFoundError(
+        f"Could not resolve a checkpoint directory for model={model_name} run_hash={run_hash}."
+    )
+
+
+def _resolve_checkpoint_path(cfg: DictConfig, model_dir: str) -> str:
+    instance = _cfg_get(cfg.testing.eval_mode, "instance_to_test", "auto")
+
+    if instance in (None, "", "auto"):
+        return os.path.join(model_dir, f"{cfg.model.model_name}_{cfg.testing.run_hash}.pt")
+
+    instance = str(instance)
+    if os.path.isabs(instance):
+        return instance
+
+    if instance.endswith(".pt"):
+        return os.path.join(model_dir, instance)
+
+    return os.path.join(model_dir, f"{instance}.pt")
+
+
+def _nested_get(container, dotted_key, default=None):
+    current = container
+    for part in dotted_key.split("."):
+        if current is None:
+            return default
+        if isinstance(current, Mapping):
+            if part not in current:
+                return default
+            current = current[part]
+        else:
+            if not hasattr(current, part):
+                return default
+            current = getattr(current, part)
+    return current
+
+
+def _resolve_training_artifact_path_from_checkpoint_config(checkpoint_cfg) -> str:
+    """Resolve the training artifact path from a saved checkpoint config."""
+    candidate_keys = [
+        "training.artifact.path",
+        "training.training_artifact_path",
+        "experiment.identity.artifact_path",
+        "artifact.path",
+    ]
+
+    for key in candidate_keys:
+        value = _nested_get(checkpoint_cfg, key, None)
+        if value:
+            return str(value)
+
+    dataset_artifact_path = _nested_get(checkpoint_cfg, "dataset.paths.artifacts.base", None)
+    if dataset_artifact_path and os.path.exists(str(dataset_artifact_path)):
+        return str(dataset_artifact_path)
+
+    raise ValueError(
+        "Could not resolve the training artifact path from checkpoint config. "
+        "Expected one of: training.artifact.path, training.training_artifact_path, "
+        "experiment.identity.artifact_path, artifact.path, dataset.paths.artifacts.base."
+    )
 
 
 @hydra.main(version_base=None, config_path="../../configs", config_name="config")
@@ -28,7 +149,7 @@ def main(cfg: DictConfig):
 
     # 1. Configuración de Rutas
     # outputs/models/[run_id]
-    model_dir = cfg.testing.testing_route
+    model_dir = _resolve_models_dir(cfg)
 
     # Carpeta donde guardaremos los reportes (dentro de la carpeta del modelo)
     results_dir = os.path.join(model_dir, "test_results")
@@ -74,21 +195,11 @@ def main(cfg: DictConfig):
 
     # 2. Lógica de Selección de Archivos
     if cfg.testing.eval_mode.single_model:
-        instance = cfg.testing.eval_mode.instance_to_test
-        if instance == "auto":
-            pattern = os.path.join(model_dir, "*_best.pt")
-            found = sorted(glob(pattern))
-            if found:
-                target_files.append(found[0])
-                logging.info(f"[MATCH] Modo auto encontró: {os.path.basename(found[0])}")
-            else:
-                logging.error(f"[ERROR] No se encontraron archivos '*_best.pt' en {model_dir}")
+        file_path = _resolve_checkpoint_path(cfg, model_dir)
+        if os.path.exists(file_path):
+            target_files.append(file_path)
         else:
-            file_path = os.path.join(model_dir, instance if instance.endswith(".pt") else f"{instance}.pt")
-            if os.path.exists(file_path):
-                target_files.append(file_path)
-            else:
-                logging.error(f"[ERROR] No se encontró el archivo específico: {file_path}")
+            logging.error(f"[ERROR] No se encontró el archivo específico: {file_path}")
     else:
         pattern = os.path.join(model_dir, "*_best.pt")
         target_files = sorted(glob(pattern))
@@ -100,7 +211,7 @@ def main(cfg: DictConfig):
 
     # 3. Ejecución del Test con Logging de Proceso
     # --- MODIFIED SECTION START ---
-    from src.data_ingestion.artifact_loaders.training_artifact_loader import TrainingArtifactLoader
+    from data_handling.data_processing.artifact_loaders.training_artifact_loader import TrainingArtifactLoader
 
     if not target_files:
         logging.warning("No files found in target_files. Aborting execution.")
@@ -112,18 +223,12 @@ def main(cfg: DictConfig):
     
     # Handle config format (dict vs OmegaConf)
     original_cfg = first_bundle.get("config", {})
-    
-    if hasattr(original_cfg, "artifact") and getattr(original_cfg.artifact, "path", None):
-        data_base_path = original_cfg.artifact.path
-    elif isinstance(original_cfg, dict) and "artifact" in original_cfg and "path" in original_cfg["artifact"]:
-        data_base_path = original_cfg["artifact"]["path"]
-    elif hasattr(original_cfg, "data"):
-        data_base_path = original_cfg.data.base_path
-    elif isinstance(original_cfg, dict) and "data" in original_cfg:
-        data_base_path = original_cfg["data"].get("base_path")
-    else:
-        logging.error("Could not locate 'data.base_path' or 'artifact.path' in the saved checkpoint config.")
-        raise ValueError("Missing data_base_path in model checkpoint.")
+    if not original_cfg:
+        raise ValueError("Missing config in model checkpoint.")
+
+    # Resolve the artifact path using the saved training/experiment metadata.
+    data_base_path = _resolve_training_artifact_path_from_checkpoint_config(original_cfg)
+    logging.info("Resolved training artifact path from checkpoint config: %s", data_base_path)
 
     # 2. Instantiate Loader and load raw_data once for all testing tasks
     loader = TrainingArtifactLoader(data_base_path)

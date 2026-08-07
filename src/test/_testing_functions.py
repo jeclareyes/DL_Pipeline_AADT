@@ -10,6 +10,7 @@ import os
 import json
 import logging
 from datetime import datetime, timezone
+from collections.abc import Mapping
 from typing import Any, Dict, Optional
 
 from omegaconf import OmegaConf, DictConfig
@@ -260,6 +261,102 @@ def get_latest_epoch_data(bundle: Dict[str, Any]) -> tuple:
 
     logging.info(f"Usando datos de la época {latest_epoch} para el análisis.")
     return int(latest_epoch), history[latest_epoch]
+
+
+def _cfg_get(container: Any, key: str, default: Any = None) -> Any:
+    """Read a key from dict-like or attribute-like config objects."""
+    if container is None:
+        return default
+    if isinstance(container, Mapping):
+        return container.get(key, default)
+    return getattr(container, key, default)
+
+
+def _resolve_requested_epoch(testing_cfg: Any) -> int:
+    """Return the epoch requested by testing config.
+
+    A value of -1 means "use the latest epoch exposed by the checkpoint".
+    """
+    eval_mode = _cfg_get(testing_cfg, "eval_mode", testing_cfg)
+    requested = _cfg_get(eval_mode, "epoch_to_test", -1)
+
+    try:
+        return int(requested)
+    except Exception as exc:
+        raise ValueError(f"Invalid testing.eval_mode.epoch_to_test value: {requested!r}") from exc
+
+
+def _select_checkpoint_state(
+    *,
+    bundle: Dict[str, Any],
+    checkpoint_path: str,
+    requested_epoch: int,
+) -> tuple[int | None, Dict[str, Any], str]:
+    """Select the state dict for the requested epoch.
+
+    Current training checkpoints only persist the latest model weights at the
+    top level. This helper also supports future checkpoints that may store
+    per-epoch weights inside `metadata.epochs_history`.
+    """
+    top_level_epoch = bundle.get("epoch")
+    top_level_state = bundle.get("model_state_dict") or bundle.get("state_dict")
+
+    if requested_epoch == -1:
+        if top_level_state is None:
+            raise ValueError(
+                f"Checkpoint '{checkpoint_path}' does not contain a top-level model_state_dict."
+            )
+        return (
+            int(top_level_epoch) if top_level_epoch is not None else None,
+            top_level_state,
+            "top_level_latest",
+        )
+
+    if top_level_epoch is not None and int(top_level_epoch) == requested_epoch:
+        if top_level_state is None:
+            raise ValueError(
+                f"Checkpoint '{checkpoint_path}' matches epoch {requested_epoch} but has no model_state_dict."
+            )
+        return int(top_level_epoch), top_level_state, "top_level_requested_epoch"
+
+    history_sources: list[Mapping[str, Any]] = []
+
+    metadata = bundle.get("metadata", {})
+    if isinstance(metadata, Mapping):
+        metadata_history = metadata.get("epochs_history", {})
+        if isinstance(metadata_history, Mapping):
+            history_sources.append(metadata_history)
+
+    bundle_history = bundle.get("epochs_history", {})
+    if isinstance(bundle_history, Mapping):
+        history_sources.append(bundle_history)
+
+    for history in history_sources:
+        epoch_record = history.get(requested_epoch)
+        if epoch_record is None:
+            epoch_record = history.get(str(requested_epoch))
+        if not isinstance(epoch_record, Mapping):
+            continue
+
+        state_dict = epoch_record.get("model_state_dict") or epoch_record.get("state_dict")
+        if state_dict is None:
+            continue
+
+        return requested_epoch, state_dict, "epochs_history"
+
+    available_epochs: list[str] = []
+    for history in history_sources:
+        available_epochs.extend(str(key) for key in history.keys())
+
+    available_epochs = sorted(set(available_epochs), key=lambda value: int(value))
+
+    raise ValueError(
+        "Requested epoch "
+        f"{requested_epoch} is not available in checkpoint '{checkpoint_path}'. "
+        "This checkpoint only exposes the latest weights at the top level, and "
+        "the stored epochs_history does not contain per-epoch model_state_dict entries. "
+        f"Available recorded epochs: {available_epochs}"
+    )
 
 
 def plot_scatter_comparison(
@@ -563,6 +660,32 @@ def process_evaluation(
     model_name = os.path.basename(file_path).replace("_best", "").replace(".pt", "")    
     logging.info(f"  -> Cargando checkpoint desde disco...")
     bundle = torch.load(file_path, map_location='cpu', weights_only=False)
+    requested_epoch = _resolve_requested_epoch(testing_cfg)
+    selected_epoch, selected_state_dict, state_source = _select_checkpoint_state(
+        bundle=bundle,
+        checkpoint_path=file_path,
+        requested_epoch=requested_epoch,
+    )
+
+    if selected_epoch is None:
+        epoch_folder = "epoch_latest"
+    else:
+        epoch_folder = f"epoch_{int(selected_epoch):04d}"
+
+    output_dir = os.path.join(output_dir, model_name, epoch_folder)
+    os.makedirs(output_dir, exist_ok=True)
+
+    selection_manifest = {
+        "model_name": model_name,
+        "checkpoint_path": file_path,
+        "requested_epoch": requested_epoch,
+        "selected_epoch": selected_epoch,
+        "state_source": state_source,
+        "output_dir": output_dir,
+        "selected_at_utc": datetime.now(timezone.utc).isoformat(),
+    }
+    with open(os.path.join(output_dir, "evaluation_selection.json"), "w", encoding="utf-8") as fh:
+        json.dump(selection_manifest, fh, indent=2, ensure_ascii=False)
     
     ckpt_cfg = bundle.get("config")
     
@@ -619,7 +742,7 @@ def process_evaluation(
         _recursive_=False,
     )"""
     
-    model.load_state_dict(bundle["model_state_dict"])
+    model.load_state_dict(selected_state_dict)
     model.to(device)
     model.eval()
 
@@ -725,7 +848,13 @@ def process_evaluation(
     logging.info(f"  -> Llaves presentes en artifacts: {list(artifacts.keys())}")
 
     task_names = list(dict.fromkeys(resolved_task_names or []))
-    logging.info(f"  -> Ejecutando {len(task_names)} tareas de evaluación...")
+    logging.info(
+        "  -> Ejecutando %d tareas de evaluación | requested_epoch=%s | selected_epoch=%s | output_dir=%s",
+        len(task_names),
+        requested_epoch,
+        selected_epoch,
+        output_dir,
+    )
 
 
     valid_task_count = 0

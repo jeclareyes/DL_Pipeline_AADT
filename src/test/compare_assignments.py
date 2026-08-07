@@ -19,11 +19,10 @@ import sys
 from pathlib import Path
 import time
 import pandas as pd
-import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from data_ingestion.data_processing import DataManager
+from data_handling import DataManager
 from models.traffic_assignment import solve_traffic_assignment
 from models.traffic_assignment_congestion import solve_traffic_assignment_with_congestion
 
@@ -225,7 +224,7 @@ def compare_assignments():
     print(f"   ✓ Comparación de flujos guardada: {output_path}")
 
     # Guardar grafo con ambas soluciones
-    from data_ingestion.processing_modules.graph_network_creator import save_graph
+    from data_handling import save_graph
     graph_path = save_graph(graph, 'data/processed/barcelona_network_both_solutions.gpickle')
     print(f"   ✓ Grafo con ambas soluciones guardado: {graph_path}")
 
