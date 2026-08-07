@@ -38,6 +38,8 @@ def build_flows(config: DatasetConfig, data: dict[str, Any], metadata: dict[str,
     assign_cfg = OmegaConf.to_container(OmegaConf.load(assign_cfg_path), resolve=True)
 
     assignment_params = config.AssignmentParameters
+    demand_year = int(config.DemandParameters.Year)
+    reference_assignment_column = f"RA_{demand_year}"
     paradigm = str(assignment_params.Paradigm)
     method = str(assignment_params.Method)
     theta = float(assignment_params.SUE_Parameters.theta)
@@ -137,14 +139,15 @@ def build_flows(config: DatasetConfig, data: dict[str, Any], metadata: dict[str,
     assignment_metadata["solver"] = solver_name
 
     data["network"] = data["network"].copy()
-    data["network"]["assigned_flow"] = assigned_flows
+    data["network"][reference_assignment_column] = assigned_flows
     data["network"]["travel_time"] = assignment_metadata["final_travel_times"]
     data["network"]["v/c"] = (
-        data["network"]["assigned_flow"] / data["network"]["effective_capacity"].astype(float)
+        data["network"][reference_assignment_column]
+        / data["network"]["effective_capacity"].astype(float)
     )
 
     flows_tntp = data["network"][["init_node", "term_node"]].copy()
-    flows_tntp["Volume"] = np.asarray(assigned_flows, dtype=float)
+    flows_tntp[reference_assignment_column] = np.asarray(assigned_flows, dtype=float)
     flows_tntp = flows_tntp.rename(
         columns={
             "init_node": "From",
@@ -162,6 +165,9 @@ def build_flows(config: DatasetConfig, data: dict[str, Any], metadata: dict[str,
     metadata: dict[str, Any] = {
         "flows_path": str(flows_path),
         "flows_columns": flows_tntp.columns.tolist(),
+        "flow_column_type": "reference_assignment",
+        "flow_column": reference_assignment_column,
+        "demand_year": demand_year,
         "assignment_method": method,
         "assignment_paradigm": paradigm,
         "assignment_theta": theta,

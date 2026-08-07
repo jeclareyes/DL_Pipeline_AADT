@@ -58,7 +58,6 @@ paths:
     trips: "${name}_trips.tntp"
     routes: "${name}_routes.tntp"
     flows: "${name}_flows.tntp"
-    info: "scenario_manifest.json"
 
   export_dirs:
     generated_dataset: ${paths.root_dir}/data/${paths.folder_names.raw}/${name}
@@ -70,7 +69,6 @@ paths:
     trips: "${paths.export_dirs.generated_dataset}/${paths.file_names.trips}"
     routes: "${paths.export_dirs.generated_dataset}/${paths.file_names.routes}"
     flows: "${paths.export_dirs.generated_dataset}/${paths.file_names.flows}"
-    info: "${paths.export_dirs.info_dataset}/${paths.file_names.info}"
 
 
 # ============================================

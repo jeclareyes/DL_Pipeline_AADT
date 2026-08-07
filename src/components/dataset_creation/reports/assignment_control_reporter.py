@@ -58,11 +58,16 @@ def run_assignment_control(data: dict[str, Any], config, metadata: dict[str, Any
         )
 
     flows = data["flows"].copy()
+    assignment_column = metadata["flows"].get("flow_column")
+    if not isinstance(assignment_column, str) or assignment_column not in flows.columns:
+        raise KeyError(
+            "Assignment flow metadata must declare the generated reference-assignment column."
+        )
     flows["From"] = flows["From"].astype(int)
     flows["To"] = flows["To"].astype(int)
-    flows["Volume"] = flows["Volume"].astype(float)
-    outflow_by_node = flows.groupby("From")["Volume"].sum()
-    inflow_by_node = flows.groupby("To")["Volume"].sum()
+    flows[assignment_column] = flows[assignment_column].astype(float)
+    outflow_by_node = flows.groupby("From")[assignment_column].sum()
+    inflow_by_node = flows.groupby("To")[assignment_column].sum()
 
     for _, node in nodes_df.iterrows():
         node_id = int(node["node_id"])

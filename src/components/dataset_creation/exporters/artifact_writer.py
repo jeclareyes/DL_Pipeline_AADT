@@ -69,6 +69,7 @@ class DatasetManifestBuilder:
                 "data_fingerprint": "v1", # TODO: Implement real fingerprint if needed
             },
             "config": resolved_config,
+            "flow_columns": clean_metadata.get("flow_columns", {}),
             "data": data_summary,
             "metadata": clean_metadata,
             "validations": validations or {},
@@ -147,6 +148,7 @@ def save_master_artifact(
         "config_hash": manifest_artifact["reproducibility"]["config_hash"],
         "data_fingerprint": manifest_artifact["reproducibility"]["data_fingerprint"],
         "config": manifest_artifact["config"],
+        "flow_columns": manifest_artifact["flow_columns"],
         "data": data,
         "metadata": manifest_artifact["metadata"],
         "validations": manifest_artifact["validations"],

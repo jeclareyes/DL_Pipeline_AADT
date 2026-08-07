@@ -69,12 +69,7 @@ def _build_routes_dataframe(
 
 
 def build_routes(config: DatasetConfig, data: dict[str, Any], metadata: dict[str, Any]) -> tuple[dict[tuple[int, int], list[list[int]]], dict[str, Any]]:
-    from src.components.route_engines import get_route_engine
-
-    try:
-        import networkx as nx
-    except ModuleNotFoundError:
-        nx = None
+    from src.components.route_engines.base_engine import generate_routes_by_od
 
     if data["graph"] is None:
         raise ValueError("Scenario graph is missing. Run network generation before routes.")
@@ -90,52 +85,49 @@ def build_routes(config: DatasetConfig, data: dict[str, Any], metadata: dict[str
         "allow_auto_routes": bool(route_cfg.allow_auto_routes),
     }
     connector_link_types = set(int(v) for v in metadata["network"].get("connector_link_types", []))
-    engine_name = str(getattr(route_cfg, "Engine", "networkx"))
+    engine_name = str(getattr(route_cfg, "Engine", "igraph_native"))
 
     zone_ids = metadata["trips"]["zone_ids"]
-    routes_by_od: dict[tuple[int, int], list[list[int]]] = {}
-    engine = get_route_engine(engine_name, data["graph"])
+    od_pairs = [
+        (int(origin_id), int(destination_id))
+        for origin_id in zone_ids
+        for destination_id in zone_ids
+        if int(origin_id) != int(destination_id) or constraints["allow_auto_routes"]
+    ]
+    routes_by_od = generate_routes_by_od(
+        graph=data["graph"],
+        od_pairs=od_pairs,
+        engine_name=engine_name,
+        k=k_routes,
+        weight=weight,
+        constraints=constraints,
+        connector_link_types=connector_link_types,
+        parallel=True,
+        show_progress=True,
+    )
 
-    for origin_id in zone_ids:
-        for destination_id in zone_ids:
-            origin_id = int(origin_id)
-            destination_id = int(destination_id)
-            if origin_id == destination_id and not constraints["allow_auto_routes"]:
+    for od_pair, candidate_routes in routes_by_od.items():
+        origin_id, destination_id = od_pair
+        filtered_routes: list[list[int]] = []
+        seen_routes: set[tuple[int, ...]] = set()
+        for route in candidate_routes:
+            route = [int(node) for node in route]
+            route_key = tuple(route)
+            if route_key in seen_routes and not constraints["allow_duplicates"]:
                 continue
-
-            try:
-                candidate_routes = engine.get_k_routes(
-                    origin_id=origin_id,
-                    destination_id=destination_id,
-                    k=k_routes,
-                    weight=weight,
-                    constraints=constraints,
-                    connector_link_types=connector_link_types,
-                )
-            except Exception:
-                candidate_routes = []
-
-            filtered_routes: list[list[int]] = []
-            seen_routes: set[tuple[int, ...]] = set()
-            for route in candidate_routes:
-                route = [int(node) for node in route]
-                route_key = tuple(route)
-                if route_key in seen_routes and not constraints["allow_duplicates"]:
-                    continue
-                if _path_has_repeated_links(route) and not constraints["allow_loops"]:
-                    continue
-                if _path_uses_invalid_connector(
-                    graph=data["graph"],
-                    path=route,
-                    origin_id=origin_id,
-                    destination_id=destination_id,
-                    connector_link_types=connector_link_types,
-                ):
-                    continue
-                filtered_routes.append(route)
-                seen_routes.add(route_key)
-
-            routes_by_od[(origin_id, destination_id)] = filtered_routes
+            if _path_has_repeated_links(route) and not constraints["allow_loops"]:
+                continue
+            if _path_uses_invalid_connector(
+                graph=data["graph"],
+                path=route,
+                origin_id=origin_id,
+                destination_id=destination_id,
+                connector_link_types=connector_link_types,
+            ):
+                continue
+            filtered_routes.append(route)
+            seen_routes.add(route_key)
+        routes_by_od[od_pair] = filtered_routes
 
     routes_path = save_routes_as_tntp(routes_by_od, config.paths.export_filepaths.routes)
     routes_df = _build_routes_dataframe(graph=data["graph"], routes_by_od=routes_by_od, weight=weight)

@@ -25,7 +25,6 @@ class TNTPFileNamesConfig:
     trips: str = MISSING
     routes: str = MISSING
     flows: str = MISSING
-    info: str = MISSING
 
 @dataclass
 class FolderNamesConfig:
@@ -47,7 +46,6 @@ class ExportFilePaths:
     trips: str = MISSING
     routes: str = MISSING
     flows: str = MISSING
-    info: str = MISSING
 
 @dataclass
 class PathsConfig:
@@ -115,6 +113,7 @@ class DemandTabularConfig:
 class DemandParametersConfig:
     """Orchestrates temporal profiles, day intervals, and volume magnitude limits."""
     Num_Days: int = MISSING
+    Year: int = MISSING
     Start_Date: str = MISSING
     Time_Interval: str = MISSING
     Accept_IntraZonal_Demand: bool = MISSING

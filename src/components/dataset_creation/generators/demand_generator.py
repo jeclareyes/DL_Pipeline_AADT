@@ -39,6 +39,7 @@ def _generate_trips_array(
 
 def build_trips(config: DatasetConfig, data: dict[str, Any], metadata: dict[str, Any]) -> tuple[np.ndarray, dict[str, Any]]:
     trips_cfg = config.DemandParameters
+    demand_year = int(trips_cfg.Year)
     num_days = int(trips_cfg.Num_Days)
     start_date = datetime.strptime(trips_cfg.Start_Date, "%Y-%m-%d")
     include_intrazonal = bool(trips_cfg.Accept_IntraZonal_Demand)
@@ -84,6 +85,7 @@ def build_trips(config: DatasetConfig, data: dict[str, Any], metadata: dict[str,
         "zone_id_to_idx": zone_id_to_idx,
         "idx_to_zone_id": idx_to_zone_id,
         "start_date": start_date.strftime("%Y-%m-%d"),
+        "demand_year": demand_year,
         "num_days": num_days,
         "hours": list(range(24)),
         # Esta metadata desde aquí, hasta donde menciono abajo, la he comentado puesto que no creo que sea de relevancia

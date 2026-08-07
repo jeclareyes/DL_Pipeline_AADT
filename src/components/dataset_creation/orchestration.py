@@ -62,6 +62,11 @@ def dataset_creation_orchestration(config: DatasetConfig) -> tuple[dict[str, Any
     flows_df, flows_metadata = build_flows(config, data, metadata)
     data["flows"] = flows_df
     metadata["flows"] = flows_metadata
+    metadata["flow_columns"] = {
+        "traffic_counts": [],
+        "reference_assignment": flows_metadata["flow_column"],
+        "estimated_flows": None,
+    }
     LOGGER.info("Completed flow generation.")
 
     reports: dict[str, Any] = {}
