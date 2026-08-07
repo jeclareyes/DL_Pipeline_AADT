@@ -2,16 +2,47 @@ __pycache__/
 *.md
 *.iml
 .DS_Store
+
+
+
+# Data
+data/raw/
+data/external/
+data/processed/
+
+# Outputs
 /outputs/
 /multirun/
-/src/data_ingestion/outputs/
+
+/src/data_handling/data_processing/outputs/
+/src/data_handling/data_processing/tests/
+
+
 /src/components/dataset_creation/outputs/
-/src/train/outputs/
-/configs/experiments/
 src/components/dataset_creation/.temporal/
-src/components/dataset_creation/TEMPORAL/
-data/processed/
-data/external/
-data/raw/Synthetic*/
+
+/src/train/outputs/
+
+
+# Miscellaneous
+
+# Configs
+
+configs/assignment_bank/
+!config/assignment_bank/_template.yaml
+
+configs/dataset/
+!configs/dataset/_template.yaml
+
+configs/experiments/
+!configs/experiments/_template.yaml
+
+configs/hydra/
+
+configs/route_bank/
+!configs/route_bank/_template.yaml
+
+src/components/dataset_creation/config/datasets/
+!src/components/dataset_creation/config/datasets/synthetic_sample.yaml
 
 
